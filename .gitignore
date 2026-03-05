@@ -1,0 +1,8 @@
+/target
+
+*.tiff
+*.dcm
+*.tif
+*.svs
+
+.DS_Store
