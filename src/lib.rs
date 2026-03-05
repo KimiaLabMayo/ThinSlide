@@ -71,6 +71,20 @@ enum ColorSpace {
     Unknown,
 }
 
+// implement std::fmt::Display for ColorSpace {
+impl std::fmt::Display for ColorSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let s = match self {
+            ColorSpace::RGB => "RGB",
+            ColorSpace::YCbCr => "YCbCr",
+            ColorSpace::Grayscale => "Grayscale",
+            ColorSpace::Unknown => "Unknown",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+
 fn find_app14_marker(data: &[u8]) -> Option<u8> {
     // APP14 Adobe structure:
     //   +0,1:  marker 0xFF 0xEE
@@ -97,6 +111,7 @@ fn find_app14_marker(data: &[u8]) -> Option<u8> {
 fn infer_color_space(dcm: &dicom::object::DefaultDicomObject) -> ColorSpace {
     // 1. DICOM PhotometricInterpretation tag (most reliable)
     if let Ok(elem) = dcm.element_by_name("PhotometricInterpretation") {
+        println!("  PhotometricInterpretation: {}", elem.to_str().unwrap_or_default());
         if let Ok(s) = elem.to_str() {
             match s.trim() {
                 "RGB" => return ColorSpace::RGB,
@@ -115,6 +130,7 @@ fn infer_color_space(dcm: &dicom::object::DefaultDicomObject) -> ColorSpace {
         if let Some(fragments) = px.fragments() {
             if let Some(first) = fragments.iter().next() {
                 if let Some(ct) = find_app14_marker(first) {
+                    println!("  APP14 Color Transform: {}", ct);
                     return if ct == 0 { ColorSpace::RGB } else { ColorSpace::YCbCr };
                 }
             }
@@ -131,6 +147,7 @@ fn infer_color_space(dcm: &dicom::object::DefaultDicomObject) -> ColorSpace {
     }
 
     // JPEG default for 3-component data is YCbCr
+    println!("  Warning: couldn't determine color space, defaulting to YCbCr");
     ColorSpace::YCbCr
 }
 
@@ -289,6 +306,7 @@ fn calc_downsampling_factors(list: &[DcmMetadata]) -> Vec<u32> {
 
 /// Decode a single DICOM frame and encode it as a JPEG byte stream.
 /// Returns (jpeg_bytes, width, height).
+/// Only used for SVS thumbnail/label/overview IFDs, which require a self-contained JPEG stream (no raw tiles).
 fn decode_frame_as_jpeg(dcm_path: &str, frame: u32, quality: u8) -> Option<(Vec<u8>, u32, u32)> {
     let dcm = dicom::object::open_file(dcm_path).ok()?;
     let decoded = dcm.decode_pixel_data_frame(frame).ok()?;
@@ -308,14 +326,20 @@ fn decode_frame_as_jpeg(dcm_path: &str, frame: u32, quality: u8) -> Option<(Vec<
 pub struct Args {
     pub input_dir: String,
     pub output_dir: String,
+    pub ome: bool,
 }
 
 impl Args {
-    pub fn build(mut args: impl Iterator<Item = String>) -> Result<Args, &'static str> {
-        args.next();
-        let input_dir  = args.next().ok_or("Didn't get an input directory path")?;
-        let output_dir = args.next().ok_or("Didn't get an output directory path")?;
-        Ok(Args { input_dir, output_dir })
+    pub fn build(args: impl Iterator<Item = String>) -> Result<Args, &'static str> {
+        let all: Vec<String> = args.collect();
+        let ome = all.iter().any(|a| a == "--ome");
+        let positional: Vec<&str> = all[1..].iter()
+            .filter(|a| !a.starts_with("--"))
+            .map(|s| s.as_str())
+            .collect();
+        let input_dir  = positional.get(0).ok_or("Didn't get an input directory path")?.to_string();
+        let output_dir = positional.get(1).ok_or("Didn't get an output directory path")?.to_string();
+        Ok(Args { input_dir, output_dir, ome })
     }
 }
 
@@ -552,6 +576,375 @@ fn write_flat_multipage_tiff(
     }
 }
 
+/// Generate a deterministic UUID (version 4 format) from a DICOM UID string.
+fn uid_to_uuid(uid: &str) -> String {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    uid.hash(&mut h);
+    let a = h.finish();
+
+    let mut h2 = DefaultHasher::new();
+    a.hash(&mut h2);
+    uid.len().hash(&mut h2);
+    let b = h2.finish();
+
+    format!(
+        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
+        (a >> 32) as u32,
+        (a >> 16) as u16,
+        a as u16 & 0x0FFF,
+        ((b >> 48) as u16 & 0x3FFF) | 0x8000,
+        b & 0x0000_FFFF_FFFF_FFFF_u64,
+    )
+}
+
+/// Build a conforming OME-XML string (schema 2016-06) for the full-resolution image.
+///
+/// The returned XML is placed in the ImageDescription tag of IFD 0.  BioFormats
+/// identifies a file as OME-TIFF by the presence of this block and uses it to
+/// determine pixel dimensions, physical pixel size, and channel layout.
+///
+/// Structure decisions
+/// -------------------
+/// * A single `<Image>` / `<Pixels>` block describes the full-resolution plane
+///   (IFD 0, `TiffData IFD="0"`).
+/// * Reduced-resolution pyramid IFDs carry `SUBFILETYPE=REDUCEDIMAGE`; BioFormats
+///   detects those automatically without additional `<Image>` entries.
+/// * For RGB/YCbCr images one `<Channel SamplesPerPixel="3">` is emitted with
+///   `Interleaved="true"`, matching the JPEG interleaved storage layout.
+/// * Physical pixel size is expressed in µm (OME default unit).
+#[allow(non_snake_case)]
+fn generate_OME_XML(metadata_list: &[DcmMetadata]) -> String {
+    let base   = &metadata_list[0];
+    let width  = base.px_columns.unwrap_or(0);
+    let height = base.px_rows.unwrap_or(0);
+    let mpp_x  = base.mpp_x.unwrap_or(0.25);
+    let mpp_y  = base.mpp_y.unwrap_or(mpp_x);
+    let uuid   = uid_to_uuid(&base.series_instance_uid);
+    let name   = &base.series_instance_uid;
+
+    // Read SamplesPerPixel and BitsAllocated from the DICOM file so that the
+    // XML is accurate for both RGB and grayscale slides.
+    let dcm = dicom::object::open_file(&base.file_path).ok();
+    let spp: u32 = dcm.as_ref()
+        .and_then(|d| d.element_by_name("SamplesPerPixel").ok())
+        .and_then(|e| e.to_str().ok().and_then(|s| s.trim().parse().ok()))
+        .unwrap_or(3);
+    let bps: u32 = dcm.as_ref()
+        .and_then(|d| d.element_by_name("BitsAllocated").ok())
+        .and_then(|e| e.to_str().ok().and_then(|s| s.trim().parse().ok()))
+        .unwrap_or(8);
+
+    // OME pixel type string
+    let pixel_type = match (bps, spp) {
+        (8,  _) => "uint8",
+        (16, _) => "uint16",
+        (32, _) => "uint32",
+        _       => "uint8",
+    };
+
+    // For interleaved colour (RGB / YCbCr) the OME convention used by BioFormats
+    // is: SizeC = SamplesPerPixel, one <Channel> element with SamplesPerPixel,
+    // Interleaved="true".  For grayscale: SizeC=1, SamplesPerPixel=1, no interleave.
+    let (size_c, channel_spp, interleaved) = if spp >= 3 {
+        (spp, spp, "true")
+    } else {
+        (1u32, 1u32, "false")
+    };
+
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"
+     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+     xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd"
+     UUID="urn:uuid:{uuid}">
+  <Image ID="Image:0" Name="{name}">
+    <Pixels ID="Pixels:0"
+            DimensionOrder="XYZCT"
+            Type="{pixel_type}"
+            SizeX="{width}"
+            SizeY="{height}"
+            SizeZ="1"
+            SizeC="{size_c}"
+            SizeT="1"
+            PhysicalSizeX="{mpp_x:.6}"
+            PhysicalSizeXUnit="µm"
+            PhysicalSizeY="{mpp_y:.6}"
+            PhysicalSizeYUnit="µm"
+            Interleaved="{interleaved}">
+      <Channel ID="Channel:0:0" SamplesPerPixel="{channel_spp}">
+        <LightPath/>
+      </Channel>
+      <TiffData FirstC="0" FirstT="0" FirstZ="0" IFD="0" PlaneCount="1"/>
+    </Pixels>
+  </Image>
+</OME>"#
+    )
+}
+
+
+// ─── compression tag from transfer syntax ─────────────────────────────────────
+
+fn tiff_compression_tag(ts_uid: &str) -> u32 {
+    match map_transfer_syntax_to_compression(ts_uid) {
+        CompressionType::JpegBaseline                        => 7,
+        CompressionType::JpegExtended                        => 7,
+        CompressionType::JpegLossless                        => 7,
+        CompressionType::JpegLosslessNonHierarchical         => 7,
+        CompressionType::JpegLSLossless                      => 34892,
+        CompressionType::JpegLSNearLossless                  => 34892,
+        CompressionType::Jpeg2000Lossless                    => 34712,
+        CompressionType::Jpeg2000                            => 34712,
+        CompressionType::Jpeg2000Part2MulticomponentLossless => 34712,
+        CompressionType::Jpeg2000Part2Multicomponent         => 34712,
+        CompressionType::Unknown                             => 34712,
+    }
+}
+
+// ─── OME-TIFF writer ─────────────────────────────────────────────────────────
+//
+// IFD layout
+// ----------
+//   IFD 0  (main chain)   Full resolution; OME-XML in ImageDescription;
+//                          TIFFTAG_SUBIFD lists N sub-resolution offsets;
+//                          SubFileType = 0.
+//   SubIFDs 0 … N-1       Pyramid sub-resolutions chained from IFD 0 via
+//                          TIFFTAG_SUBIFD.  libtiff routes the next N calls
+//                          to TIFFWriteDirectory() into this chain automatically.
+//                          SubFileType = REDUCEDIMAGE.
+//   IFD 1+ (main chain)   Optional thumbnail / label / overview images
+//                          (stripped JPEG, SubFileType = REDUCEDIMAGE).
+//
+// Pixel data is copied verbatim from DICOM fragments — no re-encoding.
+// The OME-XML conforms to the OME 2016-06 schema and is parsed by BioFormats.
+fn write_ome_tiff(
+    slide_level_metadata_list: &[DcmMetadata],
+    thumbnail_meta: Option<&DcmMetadata>,
+    overview_meta: Option<&DcmMetadata>,
+    label_meta: Option<&DcmMetadata>,
+    output_path: &str,
+) {
+    // Group consecutive DcmMetadata entries that share the same total pixel
+    // matrix dimensions into a single pyramid level (multi-file SOP instances).
+    let mut groups: Vec<Vec<&DcmMetadata>> = Vec::new();
+    for meta in slide_level_metadata_list {
+        if let Some(last) = groups.last_mut() {
+            if last[0].px_columns == meta.px_columns && last[0].px_rows == meta.px_rows {
+                last.push(meta);
+                continue;
+            }
+        }
+        groups.push(vec![meta]);
+    }
+
+    let ome_xml      = generate_OME_XML(slide_level_metadata_list);
+    let image_desc_c = CString::new(ome_xml).unwrap();
+
+    // Number of sub-resolution levels that will be stored as SubIFDs.
+    let n_subifds = groups.len().saturating_sub(1);
+
+    unsafe {
+        let tiff = TIFFOpen(
+            CString::new(output_path).unwrap().as_ptr(),
+            CString::new("w8").unwrap().as_ptr(), // BigTIFF
+        );
+
+        // ── IFD 0: Full resolution (main chain) ───────────────────────────
+        {
+            let group     = &groups[0];
+            let metadata  = group[0];
+            let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
+
+            let ifd_width  = metadata.px_columns.unwrap_or(0);
+            let ifd_height = metadata.px_rows.unwrap_or(0);
+            let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
+
+            let color_space = infer_color_space(&first_dcm);
+            let photometric = match color_space {
+                ColorSpace::RGB       => PHOTOMETRIC_RGB,
+                ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
+                ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
+                ColorSpace::Unknown   => PHOTOMETRIC_RGB,
+            };
+            let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
+
+            let ts_uid    = first_dcm.meta().transfer_syntax();
+            let compr     = tiff_compression_tag(ts_uid);
+            let mpp       = metadata.mpp_x.unwrap_or(0.25);
+            let res       = 1e4 / mpp;
+
+            // Declare the SubIFD chain BEFORE calling TIFFWriteDirectory.
+            // libtiff copies the offset array; we only need it alive until
+            // TIFFSetField returns.  The actual offsets are back-patched by
+            // libtiff when it writes each SubIFD.
+            if n_subifds > 0 {
+                let subifd_offsets: Vec<u64> = vec![0u64; n_subifds];
+                TIFFSetField(tiff, TIFFTAG_SUBIFD,
+                    n_subifds as u32, subifd_offsets.as_ptr());
+            }
+
+            TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     0u32);
+            TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      ifd_width);
+            TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     ifd_height);
+            TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_w);
+            TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_h);
+            TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     compr);
+            TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
+            TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
+            TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
+            TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
+            TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
+            TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
+            TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
+            TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     res);
+            TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     res);
+            // OME-XML in ImageDescription marks this as an OME-TIFF.
+            TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, image_desc_c.as_ptr());
+
+            // Mirror actual YCbCr chroma subsampling from the JPEG stream.
+            if matches!(color_space, ColorSpace::YCbCr) {
+                let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
+                let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
+                if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
+                    if let Some((h, v)) = detect_jpeg_subsampling(frag) {
+                        TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
+                    }
+                }
+            }
+            drop(first_dcm);
+
+            for dcm_meta in group.iter() {
+                let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+                let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
+                let px_elem      = dicom_obj.element_by_name("PixelData").expect("No PixelData");
+                let fragments    = px_elem.fragments().expect("Not encapsulated pixel data");
+                for (fi, fragment) in fragments.iter().enumerate() {
+                    if !fragment.is_empty() {
+                        let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
+                        TIFFWriteRawTile(tiff, tile_num,
+                            fragment.as_ptr() as *mut c_void, fragment.len() as i64);
+                    }
+                }
+            }
+
+            // Finalise IFD 0.  libtiff now knows to route the next n_subifds
+            // TIFFWriteDirectory calls into the SubIFD chain.
+            TIFFWriteDirectory(tiff);
+            println!("  [OME-TIFF] IFD 0 (full res): {}x{} ({} DICOM file(s))",
+                ifd_width, ifd_height, group.len());
+        }
+
+        // ── SubIFDs: pyramid sub-resolutions (chained from IFD 0) ─────────
+        // libtiff automatically routes the next n_subifds WriteDirectory calls
+        // to the SubIFD chain declared above.  No special API call needed here.
+        for (sub_idx, group) in groups[1..].iter().enumerate() {
+            let metadata  = group[0];
+            let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
+
+            let ifd_width  = metadata.px_columns.unwrap_or(0);
+            let ifd_height = metadata.px_rows.unwrap_or(0);
+            let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
+
+            let color_space = infer_color_space(&first_dcm);
+            let photometric = match color_space {
+                ColorSpace::RGB       => PHOTOMETRIC_RGB,
+                ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
+                ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
+                ColorSpace::Unknown   => PHOTOMETRIC_RGB,
+            };
+            let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
+
+            let ts_uid = first_dcm.meta().transfer_syntax();
+            let compr  = tiff_compression_tag(ts_uid);
+            let mpp    = metadata.mpp_x.unwrap_or(0.25);
+            let res    = 1e4 / mpp;
+
+            // SubFileType = REDUCEDIMAGE signals a lower-resolution version.
+            TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     FILETYPE_REDUCEDIMAGE);
+            TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      ifd_width);
+            TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     ifd_height);
+            TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_w);
+            TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_h);
+            TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     compr);
+            TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
+            TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
+            TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
+            TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
+            TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
+            TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
+            TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
+            TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     res);
+            TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     res);
+
+            if matches!(color_space, ColorSpace::YCbCr) {
+                let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
+                let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
+                if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
+                    if let Some((h, v)) = detect_jpeg_subsampling(frag) {
+                        TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
+                    }
+                }
+            }
+            drop(first_dcm);
+
+            for dcm_meta in group.iter() {
+                let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+                let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
+                let px_elem      = dicom_obj.element_by_name("PixelData").expect("No PixelData");
+                let fragments    = px_elem.fragments().expect("Not encapsulated pixel data");
+                for (fi, fragment) in fragments.iter().enumerate() {
+                    if !fragment.is_empty() {
+                        let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
+                        TIFFWriteRawTile(tiff, tile_num,
+                            fragment.as_ptr() as *mut c_void, fragment.len() as i64);
+                    }
+                }
+            }
+
+            // This call writes into the SubIFD chain while n_subifds > 0,
+            // then returns to the main IFD chain.
+            TIFFWriteDirectory(tiff);
+            println!("  [OME-TIFF] SubIFD {} (level {}): {}x{} ({} DICOM file(s))",
+                sub_idx, sub_idx + 1, ifd_width, ifd_height, group.len());
+        }
+
+        // ── Optional associated images (main chain, after SubIFD chain) ────
+        // Thumbnail / label / overview are appended to the main IFD sequence.
+        // BioFormats skips these for pixel reading; slide viewers can use them.
+        // if let Some(m) = thumbnail_meta {
+        //     if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
+        //         write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE);
+        //         TIFFWriteDirectory(tiff);
+        //         println!("  [OME-TIFF] Thumbnail: {}x{}", w, h);
+        //     } else {
+        //         println!("  [OME-TIFF] Thumbnail: decode failed, skipped");
+        //     }
+        // }
+        // if let Some(m) = label_meta {
+        //     if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
+        //         write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE);
+        //         TIFFWriteDirectory(tiff);
+        //         println!("  [OME-TIFF] Label: {}x{}", w, h);
+        //     } else {
+        //         println!("  [OME-TIFF] Label: decode failed, skipped");
+        //     }
+        // }
+        // if let Some(m) = overview_meta {
+        //     if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
+        //         write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE);
+        //         TIFFWriteDirectory(tiff);
+        //         println!("  [OME-TIFF] Overview: {}x{}", w, h);
+        //     } else {
+        //         println!("  [OME-TIFF] Overview: decode failed, skipped");
+        //     }
+        // }
+
+        TIFFClose(tiff);
+    }
+}
+
 // ─── SVS writer (JPEG 2000-compressed DICOM → Aperio SVS) ───────────────────
 //
 // SVS IFD order (required by OpenSlide):
@@ -763,9 +1156,13 @@ fn write_svs(
 pub fn run(args: Args) {
     println!("Input:  {}", args.input_dir);
     println!("Output: {}", args.output_dir);
+    println!("Scanning for DICOM files...");
+    let start_time = std::time::Instant::now();
 
     let dicom_files = search_dicom_files(&args.input_dir);
-    println!("Found {} DICOM files", dicom_files.len());
+    let elapsed = start_time.elapsed();
+    // println!("Scan completed in {:.2?}", elapsed);
+    println!("Found {} DICOM files in {} seconds", dicom_files.len(), elapsed.as_millis() as f64 / 1000.0);
 
     let metadata_list: Vec<DcmMetadata> = dicom_files.iter()
         .map(|p| extract_metadata(p))
@@ -784,6 +1181,7 @@ pub fn run(args: Args) {
     for series_id in unique_series {
         println!("──────────────────────────────────────────");
         println!("Series: {}", series_id);
+        let convert_start = std::time::Instant::now();
 
         let series_meta: Vec<&DcmMetadata> = metadata_list.iter()
             .filter(|m| m.series_instance_uid == series_id)
@@ -819,7 +1217,18 @@ pub fn run(args: Args) {
         let ts_uid = &slide_levels_owned[0].transfer_syntax_uid;
         let comp = map_transfer_syntax_to_compression(ts_uid);
 
-        if is_jpeg2000(&comp) {
+        if args.ome {
+            // --ome: always write OME-TIFF regardless of compression type.
+            let output_path = format!("{}/{}.ome.tiff", args.output_dir, series_id);
+            println!("  → Writing OME-TIFF: {}", output_path);
+            write_ome_tiff(
+                &slide_levels_owned,
+                thumbnail_meta.as_ref(),
+                overview_meta.as_ref(),
+                label_meta.as_ref(),
+                &output_path,
+            );
+        } else if is_jpeg2000(&comp) {
             let output_path = format!("{}/{}.svs", args.output_dir, series_id);
             println!("  → Writing SVS (JPEG 2000): {}", output_path);
             write_svs(
@@ -829,12 +1238,12 @@ pub fn run(args: Args) {
                 overview_meta.as_ref(),
                 &output_path,
             );
-            println!("  Done: {}", output_path);
         } else {
             let output_path = format!("{}/{}.tiff", args.output_dir, series_id);
             println!("  → Writing pyramidal TIFF (JPEG): {}", output_path);
             write_flat_multipage_tiff(&slide_levels_owned, &output_path);
-            println!("  Done: {}", output_path);
         }
+        let convert_elapsed = convert_start.elapsed();
+        println!("  Done. Time elapsed: {:.2?} sec", convert_elapsed.as_millis() as f64 / 1000.0);
     }
 }
