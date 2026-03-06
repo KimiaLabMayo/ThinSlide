@@ -5,6 +5,7 @@ edition = "2024"
 links = "tiff"
 
 [dependencies]
+rayon = "1"
 dicom = "0.9.0"
 dicom-core = "0.9.0"
 dicom-dictionary-std = "0.9.0"

@@ -11,6 +11,7 @@ use bindings::*;
 
 use std::ffi::CString;
 use std::os::raw::c_void;
+use rayon::prelude::*;
 use walkdir::WalkDir;
 use dicom_pixeldata::PixelDecoder;
 
@@ -1155,6 +1156,12 @@ fn write_svs(
 pub fn run(args: Args) {
     println!("Input:  {}", args.input_dir);
     println!("Output: {}", args.output_dir);
+
+    // if output directory doesn't exist, create it
+    if !Path::new(&args.output_dir).exists() {
+        std::fs::create_dir_all(&args.output_dir).expect("Failed to create output directory");
+    }
+
     println!("Scanning for DICOM files...");
     let start_time = std::time::Instant::now();
 
@@ -1163,7 +1170,7 @@ pub fn run(args: Args) {
     // println!("Scan completed in {:.2?}", elapsed);
     println!("Found {} DICOM files in {} seconds", dicom_files.len(), elapsed.as_millis() as f64 / 1000.0);
 
-    let metadata_list: Vec<DcmMetadata> = dicom_files.iter()
+    let metadata_list: Vec<DcmMetadata> = dicom_files.par_iter()
         .map(|p| extract_metadata(p))
         .collect();
 
@@ -1177,13 +1184,13 @@ pub fn run(args: Args) {
 
     println!("Found {} unique WSI series", unique_series.len());
 
-    for series_id in unique_series {
+    unique_series.par_iter().for_each(|series_id| {
         println!("──────────────────────────────────────────");
         println!("Series: {}", series_id);
         let convert_start = std::time::Instant::now();
 
         let series_meta: Vec<&DcmMetadata> = metadata_list.iter()
-            .filter(|m| m.series_instance_uid == series_id)
+            .filter(|m| m.series_instance_uid == *series_id)
             .collect();
 
         let thumbnail_meta = get_thumbnail_obj(
@@ -1202,7 +1209,7 @@ pub fn run(args: Args) {
             Some(v) => v.into_iter().cloned().collect::<Vec<_>>(),
             None => {
                 println!("  No VOLUME images found, skipping.");
-                continue;
+                return;
             }
         };
 
@@ -1247,5 +1254,5 @@ pub fn run(args: Args) {
         }
         let convert_elapsed = convert_start.elapsed();
         println!("  Done. Time elapsed: {:.2?} sec", convert_elapsed.as_millis() as f64 / 1000.0);
-    }
+    });
 }
