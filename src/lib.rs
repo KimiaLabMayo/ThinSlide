@@ -1,7 +1,6 @@
 // WSI dicom to tiff/svs converter
-// Convert the whole slide image dicom files to a single pyramidal tiff/svs file (OpenSlide compatible)
-// For JPEG-compressed DICOM: outputs generic pyramidal BigTIFF
-// For JPEG 2000-compressed DICOM: outputs Aperio SVS format (OpenSlide handles J2K in SVS)
+// Convert the whole slide image dicom files to a single pyramidal OME-TIFF (default) or
+// legacy format (SVS / generic BigTIFF) when --legacy is passed.
 // No re-encoding: compressed pixel data is written directly to the output file
 
 #[allow(non_upper_case_globals)]
@@ -326,20 +325,20 @@ fn decode_frame_as_jpeg(dcm_path: &str, frame: u32, quality: u8) -> Option<(Vec<
 pub struct Args {
     pub input_dir: String,
     pub output_dir: String,
-    pub ome: bool,
+    pub legacy: bool,
 }
 
 impl Args {
     pub fn build(args: impl Iterator<Item = String>) -> Result<Args, &'static str> {
         let all: Vec<String> = args.collect();
-        let ome = all.iter().any(|a| a == "--ome");
+        let legacy = all.iter().any(|a| a == "--legacy");
         let positional: Vec<&str> = all[1..].iter()
             .filter(|a| !a.starts_with("--"))
             .map(|s| s.as_str())
             .collect();
         let input_dir  = positional.get(0).ok_or("Didn't get an input directory path")?.to_string();
         let output_dir = positional.get(1).ok_or("Didn't get an output directory path")?.to_string();
-        Ok(Args { input_dir, output_dir, ome })
+        Ok(Args { input_dir, output_dir, legacy })
     }
 }
 
@@ -1213,12 +1212,29 @@ pub fn run(args: Args) {
                 i, lv.px_columns.unwrap_or(0), lv.px_rows.unwrap_or(0), lv.mpp_x);
         }
 
-        // Determine output format from transfer syntax of full-res level
+        // Determine output format
         let ts_uid = &slide_levels_owned[0].transfer_syntax_uid;
         let comp = map_transfer_syntax_to_compression(ts_uid);
 
-        if args.ome {
-            // --ome: always write OME-TIFF regardless of compression type.
+        if args.legacy {
+            // --legacy: SVS for JPEG 2000, generic pyramidal TIFF for JPEG
+            if is_jpeg2000(&comp) {
+                let output_path = format!("{}/{}.svs", args.output_dir, series_id);
+                println!("  → Writing SVS (JPEG 2000): {}", output_path);
+                write_svs(
+                    &slide_levels_owned,
+                    thumbnail_meta.as_ref(),
+                    label_meta.as_ref(),
+                    overview_meta.as_ref(),
+                    &output_path,
+                );
+            } else {
+                let output_path = format!("{}/{}.tiff", args.output_dir, series_id);
+                println!("  → Writing pyramidal TIFF (JPEG): {}", output_path);
+                write_flat_multipage_tiff(&slide_levels_owned, &output_path);
+            }
+        } else {
+            // Default: OME-TIFF regardless of compression type
             let output_path = format!("{}/{}.ome.tiff", args.output_dir, series_id);
             println!("  → Writing OME-TIFF: {}", output_path);
             write_ome_tiff(
@@ -1228,20 +1244,6 @@ pub fn run(args: Args) {
                 label_meta.as_ref(),
                 &output_path,
             );
-        } else if is_jpeg2000(&comp) {
-            let output_path = format!("{}/{}.svs", args.output_dir, series_id);
-            println!("  → Writing SVS (JPEG 2000): {}", output_path);
-            write_svs(
-                &slide_levels_owned,
-                thumbnail_meta.as_ref(),
-                label_meta.as_ref(),
-                overview_meta.as_ref(),
-                &output_path,
-            );
-        } else {
-            let output_path = format!("{}/{}.tiff", args.output_dir, series_id);
-            println!("  → Writing pyramidal TIFF (JPEG): {}", output_path);
-            write_flat_multipage_tiff(&slide_levels_owned, &output_path);
         }
         let convert_elapsed = convert_start.elapsed();
         println!("  Done. Time elapsed: {:.2?} sec", convert_elapsed.as_millis() as f64 / 1000.0);

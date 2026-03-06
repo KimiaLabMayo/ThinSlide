@@ -1,19 +1,19 @@
 # dcm2tiff
 
-A command-line tool written in Rust that converts Whole Slide Image (WSI) DICOM files into pyramidal TIFF, OME-TIFF, or Aperio SVS files — without re-encoding the pixel data.
+A command-line tool written in Rust that converts Whole Slide Image (WSI) DICOM files into OME-TIFF (default) or legacy pyramidal TIFF / Aperio SVS files — without re-encoding the pixel data.
 
 ## Overview
 
 Digital pathology scanners often store WSI data as multi-file DICOM sets. This tool reads those files and assembles them into a single pyramidal image file suitable for use with OpenSlide, QuPath, BioFormats, or other WSI viewers.
 
-The output format depends on the DICOM transfer syntax and the `--ome` flag:
+By default the output is always OME-TIFF. Pass `--legacy` to get the format-specific output based on the DICOM transfer syntax:
 
-| DICOM compression | Default output | With `--ome` |
+| DICOM compression | Default output | With `--legacy` |
 |---|---|---|
-| JPEG (Baseline, Extended, Lossless, LS) | Pyramidal BigTIFF (`.tiff`) | OME-TIFF (`.ome.tiff`) |
-| JPEG 2000 (all variants) | Aperio SVS (`.svs`) | OME-TIFF (`.ome.tiff`) |
+| JPEG (Baseline, Extended, Lossless, LS) | OME-TIFF (`.ome.tiff`) | Pyramidal BigTIFF (`.tiff`) |
+| JPEG 2000 (all variants) | OME-TIFF (`.ome.tiff`) | Aperio SVS (`.svs`) |
 
-Note that OpenSlide does not support JPEG 2000-compressed tiles in BigTIFF, so the default for JPEG 2000 input is SVS. OME-TIFF is always BigTIFF and works with any compression type.
+OME-TIFF is always BigTIFF and works with any compression type. In legacy mode, SVS is used for JPEG 2000 input because OpenSlide does not support JPEG 2000-compressed tiles in generic BigTIFF.
 
 Pixel data is written directly to the output file without decoding or re-encoding, preserving the original compressed data.
 
@@ -53,43 +53,34 @@ The `bindings.rs` file contains pre-generated bindgen bindings for `tiffio.h`. I
 ## Usage
 
 ```
-dcm2tiff <input_dir> <output_dir> [--ome]
+dcm2tiff <input_dir> <output_dir> [--legacy]
 ```
 
 - `<input_dir>`: Directory (searched recursively) containing `.dcm` files
 - `<output_dir>`: Directory where output files will be written (must exist)
-- `--ome`: Write OME-TIFF instead of the default format (BigTIFF or SVS)
+- `--legacy`: Write SVS or generic BigTIFF instead of OME-TIFF (format chosen by compression type)
 
 Output files are named after the DICOM Series Instance UID:
 
-- `<SeriesInstanceUID>.tiff` — JPEG-compressed input, default
-- `<SeriesInstanceUID>.svs` — JPEG 2000-compressed input, default
-- `<SeriesInstanceUID>.ome.tiff` — any compression, when `--ome` is specified
+- `<SeriesInstanceUID>.ome.tiff` — any compression, default
+- `<SeriesInstanceUID>.tiff` — JPEG-compressed input, with `--legacy`
+- `<SeriesInstanceUID>.svs` — JPEG 2000-compressed input, with `--legacy`
 
 ### Examples
 
 ```sh
-# Default: auto-select TIFF or SVS based on compression
+# Default: OME-TIFF (BioFormats / QuPath compatible pyramid)
 ./target/release/dcm2tiff /data/wsi_dicoms /data/output
 
-# OME-TIFF output (BioFormats / QuPath compatible pyramid)
-./target/release/dcm2tiff /data/wsi_dicoms /data/output --ome
+# Legacy: auto-select BigTIFF or SVS based on compression type
+./target/release/dcm2tiff /data/wsi_dicoms /data/output --legacy
 ```
 
 ## IFD Structure
 
-### Generic pyramidal BigTIFF / OME-TIFF
+### OME-TIFF (default)
 
-For JPEG-compressed input (default) the IFDs are laid out as a flat sequence:
-
-| IFD | Content | SubFileType |
-|---|---|---|
-| 0 | Full resolution, tiled | 0 |
-| 1..N | Reduced pyramid levels (descending size), tiled | 1 |
-
-#### OME-TIFF (`--ome`)
-
-When `--ome` is specified the pyramid uses the TIFF `SubIFD` tag so that BioFormats can navigate sub-resolutions natively:
+The default output uses the TIFF `SubIFD` tag so that BioFormats can navigate sub-resolutions natively:
 
 | Location | Content | SubFileType |
 |---|---|---|
@@ -97,7 +88,7 @@ When `--ome` is specified the pyramid uses the TIFF `SubIFD` tag so that BioForm
 | SubIFD 0…N-1 (chained from IFD 0) | Reduced pyramid levels (descending), tiled | 1 |
 | IFD 1+ (main chain, optional) | Thumbnail / label / overview, stripped JPEG | 1 |
 
-The OME-XML embedded in `ImageDescription` conforms to the [OME 2016-06 schema](https://www.openmicroscopy.org/Schemas/OME/2016-06). Key attributes written:
+The OME-XML embedded in `ImageDescription` conforms to the [OME 2016-06 schema](https://www.openmicroscopy.org/Schemas/OME/2016-06). Key attributes:
 
 - `DimensionOrder="XYZCT"`, `SizeZ/T=1`
 - `SizeC` and `SamplesPerPixel` from DICOM `SamplesPerPixel` / `BitsAllocated`
@@ -105,7 +96,14 @@ The OME-XML embedded in `ImageDescription` conforms to the [OME 2016-06 schema](
 - `Interleaved="true"` for colour images
 - `TiffData IFD="0"` referencing the full-resolution IFD
 
-### SVS (Aperio)
+### Generic pyramidal BigTIFF (`--legacy`, JPEG input)
+
+| IFD | Content | SubFileType |
+|---|---|---|
+| 0 | Full resolution, tiled | 0 |
+| 1..N | Reduced pyramid levels (descending size), tiled | 1 |
+
+### SVS (Aperio) (`--legacy`, JPEG 2000 input)
 
 The Aperio SVS format requires IFDs in a specific order for OpenSlide compatibility:
 
