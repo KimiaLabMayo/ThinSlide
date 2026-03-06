@@ -14,6 +14,8 @@ use std::os::raw::c_void;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 use dicom_pixeldata::PixelDecoder;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::path::Path;
 
 const PWSI_CLASS_UID: &str = "1.2.840.10008.5.1.4.1.1.77.1.6";
 
@@ -111,7 +113,6 @@ fn find_app14_marker(data: &[u8]) -> Option<u8> {
 fn infer_color_space(dcm: &dicom::object::DefaultDicomObject) -> ColorSpace {
     // 1. DICOM PhotometricInterpretation tag (most reliable)
     if let Ok(elem) = dcm.element_by_name("PhotometricInterpretation") {
-        println!("  PhotometricInterpretation: {}", elem.to_str().unwrap_or_default());
         if let Ok(s) = elem.to_str() {
             match s.trim() {
                 "RGB" => return ColorSpace::RGB,
@@ -130,7 +131,6 @@ fn infer_color_space(dcm: &dicom::object::DefaultDicomObject) -> ColorSpace {
         if let Some(fragments) = px.fragments() {
             if let Some(first) = fragments.iter().next() {
                 if let Some(ct) = find_app14_marker(first) {
-                    println!("  APP14 Color Transform: {}", ct);
                     return if ct == 0 { ColorSpace::RGB } else { ColorSpace::YCbCr };
                 }
             }
@@ -147,7 +147,6 @@ fn infer_color_space(dcm: &dicom::object::DefaultDicomObject) -> ColorSpace {
     }
 
     // JPEG default for 3-component data is YCbCr
-    println!("  Warning: couldn't determine color space, defaulting to YCbCr");
     ColorSpace::YCbCr
 }
 
@@ -324,22 +323,24 @@ fn decode_frame_as_jpeg(dcm_path: &str, frame: u32, quality: u8) -> Option<(Vec<
 // ─── Args ────────────────────────────────────────────────────────────────────
 
 pub struct Args {
-    pub input_dir: String,
+    pub input_dir:  String,
     pub output_dir: String,
-    pub legacy: bool,
+    pub legacy:     bool,
+    pub verbose:    bool,
 }
 
 impl Args {
     pub fn build(args: impl Iterator<Item = String>) -> Result<Args, &'static str> {
         let all: Vec<String> = args.collect();
-        let legacy = all.iter().any(|a| a == "--legacy");
+        let legacy  = all.iter().any(|a| a == "--legacy");
+        let verbose = all.iter().any(|a| a == "-v" || a == "--verbose");
         let positional: Vec<&str> = all[1..].iter()
-            .filter(|a| !a.starts_with("--"))
+            .filter(|a| !a.starts_with('-'))
             .map(|s| s.as_str())
             .collect();
         let input_dir  = positional.get(0).ok_or("Didn't get an input directory path")?.to_string();
         let output_dir = positional.get(1).ok_or("Didn't get an output directory path")?.to_string();
-        Ok(Args { input_dir, output_dir, legacy })
+        Ok(Args { input_dir, output_dir, legacy, verbose })
     }
 }
 
@@ -461,6 +462,7 @@ fn frame_to_tile_indices(
 fn write_flat_multipage_tiff(
     slide_level_metadata_list: &[DcmMetadata],
     output_path: &str,
+    pb: Option<&ProgressBar>,
 ) {
     // A single resolution level may be split across multiple DICOM SOP instances
     // (common for large slides). Group consecutive entries that share the same
@@ -475,6 +477,7 @@ fn write_flat_multipage_tiff(
         }
         groups.push(vec![meta]);
     }
+    if let Some(p) = pb { p.set_length(groups.len() as u64); }
 
     unsafe {
         let tiff = TIFFOpen(
@@ -569,8 +572,7 @@ fn write_flat_multipage_tiff(
             }
 
             TIFFWriteDirectory(tiff);
-            println!("  [TIFF] level {}: {}x{} ({} DICOM file(s))",
-                group_idx, ifd_width, ifd_height, group.len());
+            if let Some(p) = pb { p.inc(1); }
         }
         TIFFClose(tiff);
     }
@@ -725,6 +727,7 @@ fn write_ome_tiff(
     overview_meta: Option<&DcmMetadata>,
     label_meta: Option<&DcmMetadata>,
     output_path: &str,
+    pb: Option<&ProgressBar>,
 ) {
     // Group consecutive DcmMetadata entries that share the same total pixel
     // matrix dimensions into a single pyramid level (multi-file SOP instances).
@@ -738,6 +741,7 @@ fn write_ome_tiff(
         }
         groups.push(vec![meta]);
     }
+    if let Some(p) = pb { p.set_length(groups.len() as u64); }
 
     let ome_xml      = generate_OME_XML(slide_level_metadata_list);
     let image_desc_c = CString::new(ome_xml).unwrap();
@@ -832,8 +836,7 @@ fn write_ome_tiff(
             // Finalise IFD 0.  libtiff now knows to route the next n_subifds
             // TIFFWriteDirectory calls into the SubIFD chain.
             TIFFWriteDirectory(tiff);
-            println!("  [OME-TIFF] IFD 0 (full res): {}x{} ({} DICOM file(s))",
-                ifd_width, ifd_height, group.len());
+            if let Some(p) = pb { p.inc(1); }
         }
 
         // ── SubIFDs: pyramid sub-resolutions (chained from IFD 0) ─────────
@@ -906,8 +909,7 @@ fn write_ome_tiff(
             // This call writes into the SubIFD chain while n_subifds > 0,
             // then returns to the main IFD chain.
             TIFFWriteDirectory(tiff);
-            println!("  [OME-TIFF] SubIFD {} (level {}): {}x{} ({} DICOM file(s))",
-                sub_idx, sub_idx + 1, ifd_width, ifd_height, group.len());
+            if let Some(p) = pb { p.inc(1); }
         }
 
         // ── Optional associated images (main chain, after SubIFD chain) ────
@@ -1036,6 +1038,7 @@ fn write_svs(
     label_meta: Option<&DcmMetadata>,
     overview_meta: Option<&DcmMetadata>,
     output_path: &str,
+    pb: Option<&ProgressBar>,
 ) {
     // Determine SVS compression code and photometric from the full-res level
     let base = &slide_levels[0];
@@ -1073,6 +1076,13 @@ fn write_svs(
     );
     let image_desc_c = CString::new(image_desc).unwrap();
 
+    let total_ifds = 1
+        + slide_levels.len().saturating_sub(1) as u64
+        + thumbnail_meta.is_some() as u64
+        + label_meta.is_some() as u64
+        + overview_meta.is_some() as u64;
+    if let Some(p) = pb { p.set_length(total_ifds); }
+
     unsafe {
         let tiff = TIFFOpen(
             CString::new(output_path).unwrap().as_ptr(),
@@ -1088,7 +1098,7 @@ fn write_svs(
             Some(&image_desc_c),
         );
         TIFFWriteDirectory(tiff);
-        println!("  [SVS] IFD 0 (full res): {}x{}", img_w, img_h);
+        if let Some(p) = pb { p.inc(1); }
 
         // ── IFD 1: Thumbnail (decoded + re-encoded as JPEG) ──────────────
         let thumb_written = thumbnail_meta
@@ -1096,21 +1106,14 @@ fn write_svs(
             .map(|(jpeg, w, h)| {
                 write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE);
                 TIFFWriteDirectory(tiff);
-                println!("  [SVS] IFD 1 (thumbnail): {}x{}", w, h);
+                if let Some(p) = pb { p.inc(1); }
             });
-
-        if thumb_written.is_none() {
-            // No dedicated thumbnail DICOM — skip (OpenSlide can manage without it)
-            println!("  [SVS] IFD 1 (thumbnail): skipped (not available or decode failed)");
-        }
+        let _ = thumb_written;
 
         // ── IFDs 2..N: Remaining pyramid levels ───────────────────────────
         let base_cols = base.px_columns.unwrap_or(1) as f64;
-        for (i, level) in slide_levels[1..].iter().enumerate() {
+        for (_i, level) in slide_levels[1..].iter().enumerate() {
             let ds = base_cols / level.px_columns.unwrap_or(1) as f64;
-            let lw = base.px_columns.unwrap_or(0);
-            let lh = base.px_rows.unwrap_or(0);
-            let _ = (lw, lh); // suppress warnings; actual size from level metadata
             write_svs_tiled_level(
                 tiff, level,
                 svs_compression, photometric,
@@ -1119,9 +1122,7 @@ fn write_svs(
                 None,
             );
             TIFFWriteDirectory(tiff);
-            println!("  [SVS] IFD {} (level {}): {}x{} (ds={:.1}x)",
-                i + 2, i + 1,
-                level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0), ds);
+            if let Some(p) = pb { p.inc(1); }
         }
 
         // ── Label image ───────────────────────────────────────────────────
@@ -1129,9 +1130,7 @@ fn write_svs(
             if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
                 write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE);
                 TIFFWriteDirectory(tiff);
-                println!("  [SVS] Label: {}x{}", w, h);
-            } else {
-                println!("  [SVS] Label: decode failed, skipped");
+                if let Some(p) = pb { p.inc(1); }
             }
         }
 
@@ -1141,9 +1140,7 @@ fn write_svs(
             if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
                 write_svs_stripped_jpeg(tiff, &jpeg, w, h, 9);
                 TIFFWriteDirectory(tiff);
-                println!("  [SVS] Macro/Overview: {}x{}", w, h);
-            } else {
-                println!("  [SVS] Macro/Overview: decode failed, skipped");
+                if let Some(p) = pb { p.inc(1); }
             }
         }
 
@@ -1154,21 +1151,22 @@ fn write_svs(
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 pub fn run(args: Args) {
-    println!("Input:  {}", args.input_dir);
-    println!("Output: {}", args.output_dir);
+    if args.verbose {
+        println!("Input:  {}", args.input_dir);
+        println!("Output: {}", args.output_dir);
+    }
 
     // if output directory doesn't exist, create it
     if !Path::new(&args.output_dir).exists() {
         std::fs::create_dir_all(&args.output_dir).expect("Failed to create output directory");
     }
 
-    println!("Scanning for DICOM files...");
     let start_time = std::time::Instant::now();
-
     let dicom_files = search_dicom_files(&args.input_dir);
     let elapsed = start_time.elapsed();
-    // println!("Scan completed in {:.2?}", elapsed);
-    println!("Found {} DICOM files in {} seconds", dicom_files.len(), elapsed.as_millis() as f64 / 1000.0);
+    if args.verbose {
+        println!("Found {} DICOM files in {:.2}s", dicom_files.len(), elapsed.as_millis() as f64 / 1000.0);
+    }
 
     let metadata_list: Vec<DcmMetadata> = dicom_files.par_iter()
         .map(|p| extract_metadata(p))
@@ -1182,11 +1180,13 @@ pub fn run(args: Args) {
         .into_iter()
         .collect();
 
-    println!("Found {} unique WSI series", unique_series.len());
+    if args.verbose {
+        println!("Found {} unique WSI series", unique_series.len());
+    }
+
+    let mp = MultiProgress::new();
 
     unique_series.par_iter().for_each(|series_id| {
-        println!("──────────────────────────────────────────");
-        println!("Series: {}", series_id);
         let convert_start = std::time::Instant::now();
 
         let series_meta: Vec<&DcmMetadata> = metadata_list.iter()
@@ -1207,52 +1207,63 @@ pub fn run(args: Args) {
             &series_meta.iter().map(|m| (*m).clone()).collect::<Vec<_>>()
         ) {
             Some(v) => v.into_iter().cloned().collect::<Vec<_>>(),
-            None => {
-                println!("  No VOLUME images found, skipping.");
-                return;
-            }
+            None => return,
         };
 
-        println!("  Pyramid levels: {}", slide_levels_owned.len());
-        for (i, lv) in slide_levels_owned.iter().enumerate() {
-            println!("    Level {}: {}x{} (MPP={:?})",
-                i, lv.px_columns.unwrap_or(0), lv.px_rows.unwrap_or(0), lv.mpp_x);
-        }
+        // Create per-series progress bar
+        let pb = mp.add(ProgressBar::new(0));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "  {msg:<45} [{bar:35.green/white}] {pos:>2}/{len} IFDs  {elapsed}"
+            ).unwrap().progress_chars("=>-"),
+        );
+        let msg = if series_id.len() > 43 {
+            format!("…{}", &series_id[series_id.len() - 42..])
+        } else {
+            series_id.clone()
+        };
+        pb.set_message(msg);
 
-        // Determine output format
+        // Determine output format and path
         let ts_uid = &slide_levels_owned[0].transfer_syntax_uid;
         let comp = map_transfer_syntax_to_compression(ts_uid);
 
+        let output_path = if args.legacy && is_jpeg2000(&comp) {
+            format!("{}/{}.svs", args.output_dir, series_id)
+        } else if args.legacy {
+            format!("{}/{}.tiff", args.output_dir, series_id)
+        } else {
+            format!("{}/{}.ome.tiff", args.output_dir, series_id)
+        };
+
         if args.legacy {
-            // --legacy: SVS for JPEG 2000, generic pyramidal TIFF for JPEG
             if is_jpeg2000(&comp) {
-                let output_path = format!("{}/{}.svs", args.output_dir, series_id);
-                println!("  → Writing SVS (JPEG 2000): {}", output_path);
                 write_svs(
                     &slide_levels_owned,
                     thumbnail_meta.as_ref(),
                     label_meta.as_ref(),
                     overview_meta.as_ref(),
                     &output_path,
+                    Some(&pb),
                 );
             } else {
-                let output_path = format!("{}/{}.tiff", args.output_dir, series_id);
-                println!("  → Writing pyramidal TIFF (JPEG): {}", output_path);
-                write_flat_multipage_tiff(&slide_levels_owned, &output_path);
+                write_flat_multipage_tiff(&slide_levels_owned, &output_path, Some(&pb));
             }
         } else {
-            // Default: OME-TIFF regardless of compression type
-            let output_path = format!("{}/{}.ome.tiff", args.output_dir, series_id);
-            println!("  → Writing OME-TIFF: {}", output_path);
             write_ome_tiff(
                 &slide_levels_owned,
                 thumbnail_meta.as_ref(),
                 overview_meta.as_ref(),
                 label_meta.as_ref(),
                 &output_path,
+                Some(&pb),
             );
         }
-        let convert_elapsed = convert_start.elapsed();
-        println!("  Done. Time elapsed: {:.2?} sec", convert_elapsed.as_millis() as f64 / 1000.0);
+
+        let elapsed = convert_start.elapsed();
+        pb.finish_with_message(format!("{:.2}s  {}",
+            elapsed.as_millis() as f64 / 1000.0,
+            std::path::Path::new(&output_path).file_name()
+                .and_then(|n| n.to_str()).unwrap_or("")));
     });
 }
