@@ -7,7 +7,20 @@
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 mod bindings;
-use bindings::*;
+use bindings::{
+    TIFF, TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteDirectory, TIFFClose,
+    TIFFTAG_SUBFILETYPE, TIFFTAG_IMAGEWIDTH, TIFFTAG_IMAGELENGTH, TIFFTAG_TILEWIDTH,
+    TIFFTAG_TILELENGTH, TIFFTAG_COMPRESSION, TIFFTAG_PHOTOMETRIC, TIFFTAG_SAMPLESPERPIXEL,
+    TIFFTAG_BITSPERSAMPLE, TIFFTAG_SAMPLEFORMAT, TIFFTAG_PLANARCONFIG, TIFFTAG_ORIENTATION,
+    TIFFTAG_RESOLUTIONUNIT, TIFFTAG_XRESOLUTION, TIFFTAG_YRESOLUTION,
+    PHOTOMETRIC_RGB, PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK,
+    SAMPLEFORMAT_UINT, TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_YCBCRSUBSAMPLING,
+    PLANARCONFIG_CONTIG, TIFFTAG_SUBIFD, TIFFWriteRawStrip,
+    ORIENTATION_TOPLEFT,
+    RESUNIT_CENTIMETER,
+    FILETYPE_REDUCEDIMAGE,
+    TIFFTAG_ROWSPERSTRIP,
+};
 
 use std::ffi::CString;
 use std::os::raw::c_void;
@@ -306,7 +319,7 @@ fn calc_downsampling_factors(list: &[DcmMetadata]) -> Vec<u32> {
 /// Decode a single DICOM frame and encode it as a JPEG byte stream.
 /// Returns (jpeg_bytes, width, height).
 /// Only used for SVS thumbnail/label/overview IFDs, which require a self-contained JPEG stream (no raw tiles).
-fn decode_frame_as_jpeg(dcm_path: &str, frame: u32, quality: u8) -> Option<(Vec<u8>, u32, u32)> {
+fn decode_frame_as_jpeg(dcm_path: &str, frame: u32, _quality: u8) -> Option<(Vec<u8>, u32, u32)> {
     let dcm = dicom::object::open_file(dcm_path).ok()?;
     let decoded = dcm.decode_pixel_data_frame(frame).ok()?;
     let img = decoded.to_dynamic_image(0).ok()?;
@@ -723,9 +736,9 @@ fn tiff_compression_tag(ts_uid: &str) -> u32 {
 // The OME-XML conforms to the OME 2016-06 schema and is parsed by BioFormats.
 fn write_ome_tiff(
     slide_level_metadata_list: &[DcmMetadata],
-    thumbnail_meta: Option<&DcmMetadata>,
-    overview_meta: Option<&DcmMetadata>,
-    label_meta: Option<&DcmMetadata>,
+    _thumbnail_meta: Option<&DcmMetadata>,
+    _overview_meta: Option<&DcmMetadata>,
+    _label_meta: Option<&DcmMetadata>,
     output_path: &str,
     pb: Option<&ProgressBar>,
 ) {
@@ -842,7 +855,7 @@ fn write_ome_tiff(
         // ── SubIFDs: pyramid sub-resolutions (chained from IFD 0) ─────────
         // libtiff automatically routes the next n_subifds WriteDirectory calls
         // to the SubIFD chain declared above.  No special API call needed here.
-        for (sub_idx, group) in groups[1..].iter().enumerate() {
+        for (_sub_idx, group) in groups[1..].iter().enumerate() {
             let metadata  = group[0];
             let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
 
@@ -967,7 +980,7 @@ unsafe fn write_svs_tiled_level(
     res_y: f64,
     subfile_type: u32,
     image_desc: Option<&CString>,
-) {
+) { unsafe {
     let dicom_obj  = dicom::object::open_file(&metadata.file_path).unwrap();
     let px_elem    = dicom_obj.element_by_name("PixelData").expect("No PixelData");
     let fragments  = px_elem.fragments().expect("Not encapsulated pixel data");
@@ -1005,7 +1018,7 @@ unsafe fn write_svs_tiled_level(
             );
         }
     }
-}
+}}
 
 /// Write a stripped JPEG IFD (thumbnail / label / macro).
 /// `jpeg_bytes` must be a complete, self-contained JPEG byte stream.
@@ -1015,7 +1028,7 @@ unsafe fn write_svs_stripped_jpeg(
     width: u32,
     height: u32,
     subfile_type: u32,
-) {
+) { unsafe {
     TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
     TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      width);
     TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     height);
@@ -1030,7 +1043,7 @@ unsafe fn write_svs_stripped_jpeg(
         jpeg_bytes.as_ptr() as *mut c_void,
         jpeg_bytes.len() as i64,
     );
-}
+}}
 
 fn write_svs(
     slide_levels: &[DcmMetadata],      // sorted largest-first (VOLUME)
