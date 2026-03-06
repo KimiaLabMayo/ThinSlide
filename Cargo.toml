@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2024"
 links = "tiff"
 
+[build-dependencies]
+pkg-config = "0.3"
+
 [dependencies]
 rayon = "1"
 indicatif = "0.17"

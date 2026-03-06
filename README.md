@@ -34,13 +34,22 @@ Pixel data is written directly to the output file without decoding or re-encodin
 - Rust toolchain (edition 2024)
 - [libtiff](http://www.libtiff.org/) (used via FFI)
 
-On macOS with Homebrew:
-
+**macOS (Homebrew):**
 ```sh
 brew install libtiff
 ```
 
-The build script (`build.rs`) automatically links against `/opt/homebrew/lib/libtiff`. If your libtiff is installed elsewhere, update `build.rs` accordingly.
+**Linux (Debian / Ubuntu):**
+```sh
+sudo apt install libtiff-dev
+```
+
+**Linux (Fedora / RHEL):**
+```sh
+sudo dnf install libtiff-devel
+```
+
+The build script uses `pkg-config` to locate libtiff automatically on both macOS and Linux. On macOS without `pkg-config`, it falls back to the Homebrew library paths (`/opt/homebrew/lib`, `/usr/local/lib`).
 
 ## Building
 
@@ -67,24 +76,12 @@ Output files are named after the DICOM Series Instance UID:
 - `<SeriesInstanceUID>.tiff` — JPEG-compressed input, with `--legacy`
 - `<SeriesInstanceUID>.svs` — JPEG 2000-compressed input, with `--legacy`
 
-### Progress bars
-
-By default, a live per-series progress bar is shown for every WSI series being converted. Each bar advances once per IFD written and finishes with the elapsed time and output filename:
-
-```
-  …1.2.840.10008.5.1.4.1.1.77.1.6.1234  [===========----------] 3/5 IFDs
-```
-
-Parallel series are displayed on separate rows thanks to `indicatif`'s `MultiProgress`. Pass `-v` to also print the input directory, file count, and series count before conversion starts.
 
 ### Examples
 
 ```sh
 # Default: OME-TIFF with live progress bars
 ./target/release/dcm2tiff /data/wsi_dicoms /data/output
-
-# Verbose: also prints scan summary
-./target/release/dcm2tiff -v /data/wsi_dicoms /data/output
 
 # Legacy: auto-select BigTIFF or SVS based on compression type
 ./target/release/dcm2tiff /data/wsi_dicoms /data/output --legacy
@@ -145,5 +142,5 @@ The Aperio SVS format requires IFDs in a specific order for OpenSlide compatibil
 
 - Only WSI DICOM files (SOP Class `1.2.840.10008.5.1.4.1.1.77.1.6`, Modality `SM`) are processed; other DICOM files in the input directory are ignored.
 - Uncompressed or transfer syntaxes not listed in the supported set are treated as JPEG 2000 by default.
-- The build script assumes Homebrew libtiff on macOS (`/opt/homebrew/lib`). Linux users will need to adjust `build.rs`.
+- The build script uses `pkg-config` to find libtiff. If `pkg-config` is not available, it falls back to Homebrew paths on macOS; on other systems without `pkg-config`, set `LIBRARY_PATH` or adjust `build.rs`.
 - OME-TIFF output assumes a 2D slide (no Z-stack or time series); `SizeZ=1`, `SizeT=1`.
