@@ -1214,7 +1214,7 @@ pub fn run(args: Args) {
         let pb = mp.add(ProgressBar::new(0));
         pb.set_style(
             ProgressStyle::with_template(
-                "  {msg:<45} [{bar:35.green/white}] {pos:>2}/{len} IFDs  {elapsed}"
+                "  {msg:<45} [{bar:35.green/white}] {pos:>2}/{len} IFDs"
             ).unwrap().progress_chars("=>-"),
         );
         let msg = if series_id.len() > 43 {

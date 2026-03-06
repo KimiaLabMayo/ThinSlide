@@ -53,12 +53,13 @@ The `bindings.rs` file contains pre-generated bindgen bindings for `tiffio.h`. I
 ## Usage
 
 ```
-dcm2tiff <input_dir> <output_dir> [--legacy]
+dcm2tiff <input_dir> <output_dir> [--legacy] [-v | --verbose]
 ```
 
 - `<input_dir>`: Directory (searched recursively) containing `.dcm` files
-- `<output_dir>`: Directory where output files will be written (must exist)
+- `<output_dir>`: Directory where output files will be written (created if it does not exist)
 - `--legacy`: Write SVS or generic BigTIFF instead of OME-TIFF (format chosen by compression type)
+- `-v` / `--verbose`: Print input/output paths and DICOM scan summary in addition to progress bars
 
 Output files are named after the DICOM Series Instance UID:
 
@@ -66,11 +67,24 @@ Output files are named after the DICOM Series Instance UID:
 - `<SeriesInstanceUID>.tiff` — JPEG-compressed input, with `--legacy`
 - `<SeriesInstanceUID>.svs` — JPEG 2000-compressed input, with `--legacy`
 
+### Progress bars
+
+By default, a live per-series progress bar is shown for every WSI series being converted. Each bar advances once per IFD written and finishes with the elapsed time and output filename:
+
+```
+  …1.2.840.10008.5.1.4.1.1.77.1.6.1234  [===========----------] 3/5 IFDs
+```
+
+Parallel series are displayed on separate rows thanks to `indicatif`'s `MultiProgress`. Pass `-v` to also print the input directory, file count, and series count before conversion starts.
+
 ### Examples
 
 ```sh
-# Default: OME-TIFF (BioFormats / QuPath compatible pyramid)
+# Default: OME-TIFF with live progress bars
 ./target/release/dcm2tiff /data/wsi_dicoms /data/output
+
+# Verbose: also prints scan summary
+./target/release/dcm2tiff -v /data/wsi_dicoms /data/output
 
 # Legacy: auto-select BigTIFF or SVS based on compression type
 ./target/release/dcm2tiff /data/wsi_dicoms /data/output --legacy
@@ -122,6 +136,8 @@ The Aperio SVS format requires IFDs in a specific order for OpenSlide compatibil
 | `dicom` / `dicom-object` | Reading DICOM files and metadata |
 | `dicom-pixeldata` | Decoding pixel data (used for thumbnail/label/overview re-encoding) |
 | `image` | Encoding decoded frames as JPEG |
+| `indicatif` | Live per-series progress bars with `MultiProgress` |
+| `rayon` | Parallel conversion of multiple series |
 | `walkdir` | Recursive directory traversal |
 | libtiff (FFI) | Writing TIFF/SVS files with raw tile support |
 
