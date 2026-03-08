@@ -20,6 +20,7 @@ use bindings::{
     RESUNIT_CENTIMETER,
     FILETYPE_REDUCEDIMAGE,
     TIFFTAG_ROWSPERSTRIP,
+    TIFFTAG_ICCPROFILE,
 };
 
 use std::ffi::CString;
@@ -161,6 +162,14 @@ fn infer_color_space(dcm: &dicom::object::DefaultDicomObject) -> ColorSpace {
 
     // JPEG default for 3-component data is YCbCr
     ColorSpace::YCbCr
+}
+
+/// Extract the ICC profile bytes from DICOM Tag (0028,2000), if present.
+fn extract_icc_profile(dcm: &dicom::object::DefaultDicomObject) -> Option<Vec<u8>> {
+    use dicom_core::Tag;
+    dcm.element(Tag(0x0028, 0x2000)).ok()
+        .and_then(|e| e.to_bytes().ok())
+        .map(|b| b.into_owned())
 }
 
 // ─── Metadata ────────────────────────────────────────────────────────────────
@@ -568,6 +577,16 @@ fn write_flat_multipage_tiff(
                     }
                 }
             }
+
+            // Embed ICC profile from DICOM Tag (0028,2000) if present (first IFD only).
+            if group_idx == 0 {
+                let icc_profile = extract_icc_profile(&first_dcm);
+                if let Some(ref icc) = icc_profile {
+                    TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                        icc.len() as u32, icc.as_ptr() as *const c_void);
+                }
+            }
+
             drop(first_dcm);
 
             // Write tiles from every DICOM file in this resolution group, placing
@@ -837,6 +856,14 @@ fn write_ome_tiff(
                     }
                 }
             }
+
+            // Embed ICC profile from DICOM Tag (0028,2000) if present.
+            let icc_profile = extract_icc_profile(&first_dcm);
+            if let Some(ref icc) = icc_profile {
+                TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                    icc.len() as u32, icc.as_ptr() as *const c_void);
+            }
+
             drop(first_dcm);
 
             for dcm_meta in group.iter() {
