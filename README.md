@@ -1,6 +1,6 @@
 # dcm2tiff
 
-A command-line tool written in Rust that converts Whole Slide Image (WSI) DICOM files into OME-TIFF (default) or legacy pyramidal TIFF / Aperio SVS files — without re-encoding the pixel data.
+An extremely fast command-line tool that converts Whole Slide Image (WSI) DICOM files into OME-TIFF (default) or legacy pyramidal TIFF / Aperio SVS files — without re-encoding the pixel data.
 
 ## Overview
 

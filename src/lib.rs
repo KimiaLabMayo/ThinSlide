@@ -304,6 +304,13 @@ fn get_label_obj<'a>(list: &'a [DcmMetadata]) -> Option<&'a DcmMetadata> {
 fn get_slide_level_obj(list: &[DcmMetadata]) -> Option<Vec<&DcmMetadata>> {
     let mut v: Vec<&DcmMetadata> = list.iter()
         .filter(|m| m.image_type.as_deref().unwrap_or("").contains("VOLUME"))
+        .filter(|m| {
+            // skip if IFD size is smaller than tile size
+            let ifd_w = m.px_columns.unwrap_or(0);
+            let ifd_h = m.px_rows.unwrap_or(0);
+            let (tile_w, tile_h) = m.tile_size.unwrap_or((ifd_w, ifd_h));
+            ifd_w >= tile_w && ifd_h >= tile_h
+        })
         .collect();
     v.sort_by(|a, b| b.px_columns.cmp(&a.px_columns));
     if v.is_empty() { None } else { Some(v) }
