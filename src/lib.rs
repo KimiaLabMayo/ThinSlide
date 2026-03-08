@@ -656,6 +656,14 @@ fn uid_to_uuid(uid: &str) -> String {
 /// * For RGB/YCbCr images one `<Channel SamplesPerPixel="3">` is emitted with
 ///   `Interleaved="true"`, matching the JPEG interleaved storage layout.
 /// * Physical pixel size is expressed in µm (OME default unit).
+/// Escape special XML characters in an attribute value.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+     .replace('<', "&lt;")
+     .replace('>', "&gt;")
+     .replace('"', "&quot;")
+}
+
 #[allow(non_snake_case)]
 fn generate_OME_XML(metadata_list: &[DcmMetadata]) -> String {
     let base   = &metadata_list[0];
@@ -666,8 +674,7 @@ fn generate_OME_XML(metadata_list: &[DcmMetadata]) -> String {
     let uuid   = uid_to_uuid(&base.series_instance_uid);
     let name   = &base.series_instance_uid;
 
-    // Read SamplesPerPixel and BitsAllocated from the DICOM file so that the
-    // XML is accurate for both RGB and grayscale slides.
+    // Read SamplesPerPixel, BitsAllocated, and Manufacturer from the DICOM file.
     let dcm = dicom::object::open_file(&base.file_path).ok();
     let spp: u32 = dcm.as_ref()
         .and_then(|d| d.element_by_name("SamplesPerPixel").ok())
@@ -677,6 +684,12 @@ fn generate_OME_XML(metadata_list: &[DcmMetadata]) -> String {
         .and_then(|d| d.element_by_name("BitsAllocated").ok())
         .and_then(|e| e.to_str().ok().and_then(|s| s.trim().parse().ok()))
         .unwrap_or(8);
+
+    // DICOM Tag (0008,0070): scanner vendor name.
+    let manufacturer: Option<String> = dcm.as_ref()
+        .and_then(|d| d.element_by_name("Manufacturer").ok())
+        .and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
+        .filter(|s| !s.is_empty());
 
     // OME pixel type string
     let pixel_type = match (bps, spp) {
@@ -695,14 +708,28 @@ fn generate_OME_XML(metadata_list: &[DcmMetadata]) -> String {
         (1u32, 1u32, "false")
     };
 
+    // Optional <Instrument> block and back-reference from <Image>.
+    // Per OME 2016-06 schema: <Instrument> must precede <Image> in the root;
+    // <InstrumentRef> must precede <Pixels> inside <Image>.
+    let (instrument_block, instrument_ref) = match manufacturer {
+        Some(ref mfr) => (
+            format!(
+                "  <Instrument ID=\"Instrument:0\">\n    <Microscope Manufacturer=\"{}\"/>\n  </Instrument>\n",
+                xml_escape(mfr)
+            ),
+            "    <InstrumentRef ID=\"Instrument:0\"/>\n".to_string(),
+        ),
+        None => (String::new(), String::new()),
+    };
+
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"
      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
      xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd"
      UUID="urn:uuid:{uuid}">
-  <Image ID="Image:0" Name="{name}">
-    <Pixels ID="Pixels:0"
+{instrument_block}  <Image ID="Image:0" Name="{name}">
+{instrument_ref}    <Pixels ID="Pixels:0"
             DimensionOrder="XYZCT"
             Type="{pixel_type}"
             SizeX="{width}"
