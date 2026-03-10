@@ -62,12 +62,13 @@ The `bindings.rs` file contains pre-generated bindgen bindings for `tiffio.h`. I
 ## Usage
 
 ```
-dcm2tiff <input_dir> <output_dir> [--legacy] [-v | --verbose]
+dcm2tiff <input_dir> <output_dir> [--legacy] [-j | --jobs <N>] [-v | --verbose]
 ```
 
 - `<input_dir>`: Directory (searched recursively) containing `.dcm` files
 - `<output_dir>`: Directory where output files will be written (created if it does not exist)
 - `--legacy`: Write SVS or generic BigTIFF instead of OME-TIFF (format chosen by compression type)
+- `-j` / `--jobs <N>`: Number of parallel threads to use (default: all available CPUs)
 - `-v` / `--verbose`: Print input/output paths and DICOM scan summary in addition to progress bars
 
 Output files are named after the DICOM Series Instance UID:
@@ -80,11 +81,14 @@ Output files are named after the DICOM Series Instance UID:
 ### Examples
 
 ```sh
-# Default: OME-TIFF with live progress bars
+# Default: OME-TIFF with live progress bars, using all available CPUs
 ./target/release/dcm2tiff /data/wsi_dicoms /data/output
 
 # Legacy: auto-select BigTIFF or SVS based on compression type
 ./target/release/dcm2tiff /data/wsi_dicoms /data/output --legacy
+
+# Limit parallelism to 4 threads
+./target/release/dcm2tiff /data/wsi_dicoms /data/output -j 4
 ```
 
 ## IFD Structure

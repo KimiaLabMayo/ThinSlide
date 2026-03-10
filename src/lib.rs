@@ -356,6 +356,7 @@ pub struct Args {
     pub output_dir: String,
     pub legacy:     bool,
     pub verbose:    bool,
+    pub jobs:       Option<usize>,
 }
 
 impl Args {
@@ -363,13 +364,28 @@ impl Args {
         let all: Vec<String> = args.collect();
         let legacy  = all.iter().any(|a| a == "--legacy");
         let verbose = all.iter().any(|a| a == "-v" || a == "--verbose");
-        let positional: Vec<&str> = all[1..].iter()
-            .filter(|a| !a.starts_with('-'))
-            .map(|s| s.as_str())
-            .collect();
+
+        // Parse --jobs N or -j N
+        let jobs = all.windows(2).find_map(|w| {
+            if w[0] == "--jobs" || w[0] == "-j" {
+                w[1].parse::<usize>().ok()
+            } else {
+                None
+            }
+        });
+
+        // Collect positional args, skipping flags and their values
+        let mut positional: Vec<&str> = Vec::new();
+        let mut skip_next = false;
+        for token in &all[1..] {
+            if skip_next { skip_next = false; continue; }
+            if token == "--jobs" || token == "-j" { skip_next = true; continue; }
+            if token.starts_with('-') { continue; }
+            positional.push(token.as_str());
+        }
         let input_dir  = positional.get(0).ok_or("Didn't get an input directory path")?.to_string();
         let output_dir = positional.get(1).ok_or("Didn't get an output directory path")?.to_string();
-        Ok(Args { input_dir, output_dir, legacy, verbose })
+        Ok(Args { input_dir, output_dir, legacy, verbose, jobs })
     }
 }
 
@@ -656,6 +672,13 @@ fn uid_to_uuid(uid: &str) -> String {
 /// * For RGB/YCbCr images one `<Channel SamplesPerPixel="3">` is emitted with
 ///   `Interleaved="true"`, matching the JPEG interleaved storage layout.
 /// * Physical pixel size is expressed in µm (OME default unit).
+/// Round `v` up to the nearest multiple of `align`.
+/// libtiff requires JPEG tile dimensions to be multiples of 16 (YCbCr MCU boundary).
+/// Applying this universally is safe: for other compressions it has no side-effects.
+fn tile_align(v: u32, align: u32) -> u32 {
+    (v + align - 1) / align * align
+}
+
 /// Escape special XML characters in an attribute value.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
@@ -735,7 +758,7 @@ fn generate_OME_XML(metadata_list: &[DcmMetadata]) -> String {
             SizeX="{width}"
             SizeY="{height}"
             SizeZ="1"
-            SizeC="{size_c}"
+            SizeC="1"
             SizeT="1"
             PhysicalSizeX="{mpp_x:.6}"
             PhysicalSizeXUnit="µm"
@@ -1225,6 +1248,13 @@ fn write_svs(
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 pub fn run(args: Args) {
+    if let Some(n) = args.jobs {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(n)
+            .build_global()
+            .expect("Failed to build Rayon thread pool");
+    }
+
     if args.verbose {
         println!("Input:  {}", args.input_dir);
         println!("Output: {}", args.output_dir);
