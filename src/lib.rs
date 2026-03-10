@@ -1272,9 +1272,20 @@ pub fn run(args: Args) {
         println!("Found {} DICOM files in {:.2}s", dicom_files.len(), elapsed.as_millis() as f64 / 1000.0);
     }
 
+    let mp = MultiProgress::new();
+
+    let scan_pb = mp.add(ProgressBar::new(dicom_files.len() as u64));
+    scan_pb.set_style(
+        ProgressStyle::with_template(
+            "  Scanning DICOM files [{bar:35.cyan/white}] {pos}/{len} ({elapsed})"
+        ).unwrap().progress_chars("=>-"),
+    );
+
     let metadata_list: Vec<DcmMetadata> = dicom_files.par_iter()
-        .map(|p| extract_metadata(p))
+        .map(|p| { let m = extract_metadata(p); scan_pb.inc(1); m })
         .collect();
+
+    scan_pb.finish_and_clear();
 
     // Unique series instance UIDs for WSI
     let unique_series: Vec<String> = metadata_list.iter()
@@ -1288,7 +1299,12 @@ pub fn run(args: Args) {
         println!("Found {} unique WSI series", unique_series.len());
     }
 
-    let mp = MultiProgress::new();
+    let overall = mp.add(ProgressBar::new(unique_series.len() as u64));
+    overall.set_style(
+        ProgressStyle::with_template(
+            "  Converting series    [{bar:35.yellow/white}] {pos}/{len}"
+        ).unwrap().progress_chars("=>-"),
+    );
 
     unique_series.par_iter().for_each(|series_id| {
         let convert_start = std::time::Instant::now();
@@ -1369,5 +1385,7 @@ pub fn run(args: Args) {
             elapsed.as_millis() as f64 / 1000.0,
             std::path::Path::new(&output_path).file_name()
                 .and_then(|n| n.to_str()).unwrap_or("")));
+        overall.inc(1);
     });
+    overall.finish_with_message("Done");
 }
