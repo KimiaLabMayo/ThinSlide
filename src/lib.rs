@@ -84,7 +84,6 @@ enum ColorSpace {
     RGB,
     YCbCr,
     Grayscale,
-    Unknown,
 }
 
 // implement std::fmt::Display for ColorSpace {
@@ -94,7 +93,6 @@ impl std::fmt::Display for ColorSpace {
             ColorSpace::RGB => "RGB",
             ColorSpace::YCbCr => "YCbCr",
             ColorSpace::Grayscale => "Grayscale",
-            ColorSpace::Unknown => "Unknown",
         };
         write!(f, "{}", s)
     }
@@ -177,7 +175,6 @@ fn extract_icc_profile(dcm: &dicom::object::DefaultDicomObject) -> Option<Vec<u8
 #[derive(Clone)]
 struct DcmMetadata {
     sop_class_uid: String,
-    study_instance_uid: String,
     series_instance_uid: String,
     modality: String,
     transfer_syntax_uid: String,
@@ -225,7 +222,6 @@ fn extract_metadata(dcm_path: &str) -> DcmMetadata {
     };
 
     let sop_class_uid      = get_str("SOPClassUID");
-    let study_instance_uid = get_str("StudyInstanceUID");
     let series_instance_uid= get_str("SeriesInstanceUID");
     let modality           = get_str("Modality");
     let transfer_syntax_uid= dcm.meta().transfer_syntax().to_string();
@@ -278,7 +274,6 @@ fn extract_metadata(dcm_path: &str) -> DcmMetadata {
 
     DcmMetadata {
         sop_class_uid,
-        study_instance_uid,
         series_instance_uid,
         modality,
         transfer_syntax_uid,
@@ -325,12 +320,6 @@ fn get_slide_level_obj(list: &[DcmMetadata]) -> Option<Vec<&DcmMetadata>> {
     if v.is_empty() { None } else { Some(v) }
 }
 
-fn calc_downsampling_factors(list: &[DcmMetadata]) -> Vec<u32> {
-    let max_cols = list.iter().filter_map(|m| m.px_columns).max().unwrap_or(1);
-    list.iter()
-        .filter_map(|m| m.px_columns.map(|c| max_cols / c))
-        .collect()
-}
 
 /// Decode a single DICOM frame and encode it as a JPEG byte stream.
 /// Returns (jpeg_bytes, width, height).
@@ -532,6 +521,17 @@ fn write_flat_multipage_tiff(
 
         for (group_idx, group) in groups.iter().enumerate() {
             let metadata  = group[0];
+            // Skip resolution levels where the entire image fits in a single tile
+            // (tile_size == None means tile dimensions equal image dimensions).
+            // Such levels provide no pyramid benefit and can have non-16-aligned
+            // dimensions that libtiff rejects for JPEG tiles.
+            if metadata.tile_size.is_none() {
+                eprintln!("  [skip] IFD {} ({}x{}): no tile size — single-tile level omitted",
+                    group_idx,
+                    metadata.px_columns.unwrap_or(0),
+                    metadata.px_rows.unwrap_or(0));
+                continue;
+            }
             let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
 
             let ifd_width  = metadata.px_columns.unwrap_or(0);
@@ -543,7 +543,6 @@ fn write_flat_multipage_tiff(
                 ColorSpace::RGB       => PHOTOMETRIC_RGB,
                 ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
                 ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
-                ColorSpace::Unknown   => PHOTOMETRIC_RGB,
             };
 
             let ts_uid = first_dcm.meta().transfer_syntax();
@@ -568,8 +567,8 @@ fn write_flat_multipage_tiff(
             TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
             TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      ifd_width);
             TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     ifd_height);
-            TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_w);
-            TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_h);
+            TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_align(tile_w, 16));
+            TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_align(tile_h, 16));
             TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     compression);
             TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
             TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, 3u32);
@@ -836,7 +835,8 @@ fn write_ome_tiff(
     let image_desc_c = CString::new(ome_xml).unwrap();
 
     // Number of sub-resolution levels that will be stored as SubIFDs.
-    let n_subifds = groups.len().saturating_sub(1);
+    // Exclude single-tile levels (tile_size == None) as they are skipped below.
+    let n_subifds = groups[1..].iter().filter(|g| g[0].tile_size.is_some()).count();
 
     unsafe {
         let tiff = TIFFOpen(
@@ -859,7 +859,6 @@ fn write_ome_tiff(
                 ColorSpace::RGB       => PHOTOMETRIC_RGB,
                 ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
                 ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
-                ColorSpace::Unknown   => PHOTOMETRIC_RGB,
             };
             let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
 
@@ -881,8 +880,8 @@ fn write_ome_tiff(
             TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     0u32);
             TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      ifd_width);
             TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     ifd_height);
-            TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_w);
-            TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_h);
+            TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_align(tile_w, 16));
+            TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_align(tile_h, 16));
             TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     compr);
             TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
             TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
@@ -941,6 +940,12 @@ fn write_ome_tiff(
         // to the SubIFD chain declared above.  No special API call needed here.
         for (_sub_idx, group) in groups[1..].iter().enumerate() {
             let metadata  = group[0];
+            if metadata.tile_size.is_none() {
+                eprintln!("  [skip] SubIFD ({}x{}): no tile size — single-tile level omitted",
+                    metadata.px_columns.unwrap_or(0),
+                    metadata.px_rows.unwrap_or(0));
+                continue;
+            }
             let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
 
             let ifd_width  = metadata.px_columns.unwrap_or(0);
@@ -952,7 +957,6 @@ fn write_ome_tiff(
                 ColorSpace::RGB       => PHOTOMETRIC_RGB,
                 ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
                 ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
-                ColorSpace::Unknown   => PHOTOMETRIC_RGB,
             };
             let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
 
@@ -965,8 +969,8 @@ fn write_ome_tiff(
             TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     FILETYPE_REDUCEDIMAGE);
             TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      ifd_width);
             TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     ifd_height);
-            TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_w);
-            TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_h);
+            TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_align(tile_w, 16));
+            TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_align(tile_h, 16));
             TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     compr);
             TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
             TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
@@ -1076,8 +1080,8 @@ unsafe fn write_svs_tiled_level(
     TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
     TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      ifd_width);
     TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     ifd_height);
-    TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_w);
-    TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_h);
+    TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_align(tile_w, 16));
+    TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_align(tile_h, 16));
     TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     svs_compression);
     TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
     TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, 3u32);
@@ -1141,7 +1145,7 @@ fn write_svs(
     let base = &slide_levels[0];
     let dcm0 = dicom::object::open_file(&base.file_path).unwrap();
     let (svs_compression, photometric) = match infer_color_space(&dcm0) {
-        ColorSpace::RGB | ColorSpace::Unknown => {
+        ColorSpace::RGB => {
             (COMPRESSION_APERIO_JP2_RGB, PHOTOMETRIC_RGB as u32)
         }
         ColorSpace::YCbCr => {
@@ -1210,6 +1214,12 @@ fn write_svs(
         // ── IFDs 2..N: Remaining pyramid levels ───────────────────────────
         let base_cols = base.px_columns.unwrap_or(1) as f64;
         for (_i, level) in slide_levels[1..].iter().enumerate() {
+            if level.tile_size.is_none() {
+                eprintln!("  [skip] SVS level ({}x{}): no tile size — single-tile level omitted",
+                    level.px_columns.unwrap_or(0),
+                    level.px_rows.unwrap_or(0));
+                continue;
+            }
             let ds = base_cols / level.px_columns.unwrap_or(1) as f64;
             write_svs_tiled_level(
                 tiff, level,
