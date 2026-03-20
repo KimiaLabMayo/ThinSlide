@@ -1097,10 +1097,21 @@ unsafe fn write_svs_tiled_level(
         TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
     }
 
+    // For YCbCr JPEG, detect actual subsampling from the first tile.
+    if photometric == PHOTOMETRIC_YCBCR as u32 && svs_compression == 7 {
+        if let Some(first) = fragments.iter().find(|f| !f.is_empty()) {
+            if let Some((h, v)) = detect_jpeg_subsampling(first) {
+                TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
+            }
+        }
+    }
+
+    let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
     for (i, fragment) in fragments.iter().enumerate() {
         if !fragment.is_empty() {
+            let tile_num = tile_indices.get(i).copied().unwrap_or(i as u32);
             TIFFWriteRawTile(
-                tiff, i as u32,
+                tiff, tile_num,
                 fragment.as_ptr() as *mut c_void,
                 fragment.len() as i64,
             );
@@ -1141,19 +1152,40 @@ fn write_svs(
     output_path: &str,
     pb: Option<&ProgressBar>,
 ) {
-    // Determine SVS compression code and photometric from the full-res level
+    // Determine SVS compression code and photometric from the full-res level.
+    // For JPEG2000 source use Aperio proprietary codes; for JPEG use standard 7.
+    //
+    // Aperio codes for JPEG2000:
+    //   33003 (YCBCR): OpenSlide decodes J2K then applies YCbCr→RGB conversion.
+    //   33005 (RGB):   OpenSlide decodes J2K and treats output as-is (no conversion).
+    //
+    // DICOM YBR_ICT/YBR_RCT data has ICT applied in the J2K stream.
+    // OpenSlide does not reverse ICT when using 33005, so the decoded values
+    // remain in YCbCr space and colors appear wrong.
+    // Using 33003 tells OpenSlide to apply YCbCr→RGB, which correctly compensates.
     let base = &slide_levels[0];
     let dcm0 = dicom::object::open_file(&base.file_path).unwrap();
-    let (svs_compression, photometric) = match infer_color_space(&dcm0) {
-        ColorSpace::RGB => {
-            (COMPRESSION_APERIO_JP2_RGB, PHOTOMETRIC_RGB as u32)
-        }
-        ColorSpace::YCbCr => {
-            (COMPRESSION_APERIO_JP2_YCBCR, PHOTOMETRIC_YCBCR as u32)
-        }
-        ColorSpace::Grayscale => {
-            (COMPRESSION_APERIO_JP2_RGB, PHOTOMETRIC_MINISBLACK as u32)
-        }
+    let color_space = infer_color_space(&dcm0);
+    let ts_uid = dcm0.meta().transfer_syntax();
+    let is_jp2 = is_jpeg2000(&map_transfer_syntax_to_compression(ts_uid));
+    // Read raw PhotometricInterpretation to distinguish YBR_ICT/YBR_RCT from RGB.
+    let photometric_interp = dcm0.element_by_name("PhotometricInterpretation")
+        .ok()
+        .and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
+        .unwrap_or_default();
+    let (svs_compression, photometric) = match (is_jp2, photometric_interp.as_str()) {
+        (true,  "YBR_ICT") | (true, "YBR_RCT")
+                              => (COMPRESSION_APERIO_JP2_YCBCR, PHOTOMETRIC_YCBCR as u32),
+        (true,  "YBR_FULL") | (true, "YBR_FULL_422")
+                              => (COMPRESSION_APERIO_JP2_YCBCR, PHOTOMETRIC_YCBCR as u32),
+        (true,  _) if matches!(color_space, ColorSpace::Grayscale)
+                              => (COMPRESSION_APERIO_JP2_RGB,   PHOTOMETRIC_MINISBLACK as u32),
+        (true,  _)            => (COMPRESSION_APERIO_JP2_RGB,   PHOTOMETRIC_RGB as u32),
+        (false, _) if matches!(color_space, ColorSpace::YCbCr)
+                              => (7u32,                         PHOTOMETRIC_YCBCR as u32),
+        (false, _) if matches!(color_space, ColorSpace::Grayscale)
+                              => (7u32,                         PHOTOMETRIC_MINISBLACK as u32),
+        (false, _)            => (7u32,                         PHOTOMETRIC_RGB as u32),
     };
 
     // Base resolution
