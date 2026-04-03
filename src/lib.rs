@@ -560,6 +560,14 @@ fn write_flat_multipage_tiff(
                 CompressionType::Unknown                             => 34712,
             };
 
+            // For JPEG passthrough, libtiff checks that the JPEG SOF header dimensions match the TIFF tile declaration.
+            // If tiles are not multiples of 16, this mismatch causes an error, so we skip these levels.
+            if compression == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
+                eprintln!("  [skip] IFD {} ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
+                    group_idx, ifd_width, ifd_height, tile_w, tile_h);
+                continue;
+            }
+
             let mpp = metadata.mpp_x.unwrap_or(0.25);
             let res = 1e4 / mpp;
 
@@ -676,6 +684,15 @@ fn uid_to_uuid(uid: &str) -> String {
 /// Applying this universally is safe: for other compressions it has no side-effects.
 fn tile_align(v: u32, align: u32) -> u32 {
     (v + align - 1) / align * align
+}
+
+/// Check if the JPEG tile dimensions are multiples of 16, as required by libtiff for pass-through tiles.
+/// When using `TIFFWriteRawTile` for pass-through, libtiff checks that the JPEG SOF header dimensions match 
+/// the TIFF tile declaration (after tile_align). If the JPEG dimensions are not multiples of 16, this mismatch 
+/// causes a "Bad value N for tileWidth/tileLength tag" error.
+/// 
+fn is_jpeg_tile_aligned(tile_w: u32, tile_h: u32) -> bool {
+    tile_w % 16 == 0 && tile_h % 16 == 0
 }
 
 /// Escape special XML characters in an attribute value.
@@ -962,6 +979,16 @@ fn write_ome_tiff(
 
             let ts_uid = first_dcm.meta().transfer_syntax();
             let compr  = tiff_compression_tag(ts_uid);
+
+            // When using `TIFFWriteRawTile` for pass-through, libtiff checks that the JPEG SOF header dimensions match
+            // the TIFF tile declaration (after tile_align). If the JPEG dimensions are not multiples of 16,
+            // this mismatch causes a "Bad value N for tileWidth/tileLength tag" error.
+            if compr == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
+                eprintln!("  [skip] SubIFD ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
+                    ifd_width, ifd_height, tile_w, tile_h);
+                continue;
+            }
+
             let mpp    = metadata.mpp_x.unwrap_or(0.25);
             let res    = 1e4 / mpp;
 
@@ -1250,6 +1277,16 @@ fn write_svs(
                 eprintln!("  [skip] SVS level ({}x{}): no tile size — single-tile level omitted",
                     level.px_columns.unwrap_or(0),
                     level.px_rows.unwrap_or(0));
+                continue;
+            }
+
+            // For JPEG passthrough, libtiff checks that the JPEG SOF header dimensions match the TIFF tile declaration.
+            // If tiles are not multiples of 16, this mismatch causes an error, so we skip these levels.
+            let (lvl_tile_w, lvl_tile_h) = level.tile_size.unwrap();
+            if svs_compression == 7 && !is_jpeg_tile_aligned(lvl_tile_w, lvl_tile_h) {
+                eprintln!("  [skip] SVS level ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
+                    level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
+                    lvl_tile_w, lvl_tile_h);
                 continue;
             }
             let ds = base_cols / level.px_columns.unwrap_or(1) as f64;
