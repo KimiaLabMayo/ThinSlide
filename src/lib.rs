@@ -8,7 +8,7 @@
 #[allow(non_snake_case)]
 mod bindings;
 use bindings::{
-    TIFF, TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteDirectory, TIFFClose,
+    TIFF, TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteTile, TIFFWriteDirectory, TIFFClose,
     TIFFTAG_SUBFILETYPE, TIFFTAG_IMAGEWIDTH, TIFFTAG_IMAGELENGTH, TIFFTAG_TILEWIDTH,
     TIFFTAG_TILELENGTH, TIFFTAG_COMPRESSION, TIFFTAG_PHOTOMETRIC, TIFFTAG_SAMPLESPERPIXEL,
     TIFFTAG_BITSPERSAMPLE, TIFFTAG_SAMPLEFORMAT, TIFFTAG_PLANARCONFIG, TIFFTAG_ORIENTATION,
@@ -21,13 +21,16 @@ use bindings::{
     FILETYPE_REDUCEDIMAGE,
     TIFFTAG_ROWSPERSTRIP,
     TIFFTAG_ICCPROFILE,
+    TIFFTAG_JPEGQUALITY, TIFFTAG_JPEGCOLORMODE, JPEGCOLORMODE_RGB,
 };
 
 use std::ffi::CString;
 use std::os::raw::c_void;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use rayon::prelude::*;
 use walkdir::WalkDir;
 use dicom_pixeldata::PixelDecoder;
+use image::imageops::FilterType;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::path::Path;
 
@@ -36,6 +39,11 @@ const PWSI_CLASS_UID: &str = "1.2.840.10008.5.1.4.1.1.77.1.6";
 // SVS (Aperio) JPEG 2000 proprietary compression codes recognized by OpenSlide
 const COMPRESSION_APERIO_JP2_YCBCR: u32 = 33003;
 const COMPRESSION_APERIO_JP2_RGB: u32 = 33005;
+
+/// Minimum length of the longer image side (pixels) required to include a
+/// pyramid level in the resampled output.  Levels below this threshold are
+/// skipped because they add no useful detail at typical screen resolutions.
+const MIN_PYRAMID_SIDE: u32 = 512;
 
 // ─── Compression type ───────────────────────────────────────────────────────
 
@@ -346,6 +354,13 @@ pub struct Args {
     pub legacy:     bool,
     pub verbose:    bool,
     pub jobs:       Option<usize>,
+    /// Target resolution in microns-per-pixel.  When set, tiles are decoded,
+    /// resampled to the nearest valid tile size, and re-encoded as JPEG.
+    pub mpp:        Option<f64>,
+    /// JPEG quality used when resampling (--mpp).  Default 87.
+    pub quality:    u8,
+    /// Resampling filter used when resizing tiles (--mpp).  Default Nearest.
+    pub filter:     FilterType,
 }
 
 impl Args {
@@ -363,18 +378,54 @@ impl Args {
             }
         });
 
+        // Parse --mpp N
+        let mpp = all.windows(2).find_map(|w| {
+            if w[0] == "--mpp" {
+                w[1].parse::<f64>().ok()
+            } else {
+                None
+            }
+        });
+
+        // Parse --quality N (default 87)
+        let quality = all.windows(2).find_map(|w| {
+            if w[0] == "--quality" {
+                w[1].parse::<u8>().ok()
+            } else {
+                None
+            }
+        }).unwrap_or(87);
+
+        // Parse --filter NAME (default: nearest)
+        let filter = all.windows(2).find_map(|w| {
+            if w[0] == "--filter" {
+                match w[1].to_lowercase().as_str() {
+                    "nearest"              => Some(FilterType::Nearest),
+                    "triangle" | "bilinear"=> Some(FilterType::Triangle),
+                    "catmullrom"| "bicubic"=> Some(FilterType::CatmullRom),
+                    "gaussian"             => Some(FilterType::Gaussian),
+                    "lanczos3"             => Some(FilterType::Lanczos3),
+                    _                      => None,
+                }
+            } else {
+                None
+            }
+        }).unwrap_or(FilterType::Nearest);
+
         // Collect positional args, skipping flags and their values
         let mut positional: Vec<&str> = Vec::new();
         let mut skip_next = false;
         for token in &all[1..] {
             if skip_next { skip_next = false; continue; }
-            if token == "--jobs" || token == "-j" { skip_next = true; continue; }
+            if matches!(token.as_str(), "--jobs" | "-j" | "--mpp" | "--quality" | "--filter") {
+                skip_next = true; continue;
+            }
             if token.starts_with('-') { continue; }
             positional.push(token.as_str());
         }
         let input_dir  = positional.get(0).ok_or("Didn't get an input directory path")?.to_string();
         let output_dir = positional.get(1).ok_or("Didn't get an output directory path")?.to_string();
-        Ok(Args { input_dir, output_dir, legacy, verbose, jobs })
+        Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter })
     }
 }
 
@@ -693,6 +744,13 @@ fn tile_align(v: u32, align: u32) -> u32 {
 /// 
 fn is_jpeg_tile_aligned(tile_w: u32, tile_h: u32) -> bool {
     tile_w % 16 == 0 && tile_h % 16 == 0
+}
+
+/// Round `v` to the nearest multiple of 16, with a minimum of 16.
+/// Used to compute the output tile size for resampled TIFF writing so that
+/// JPEG tiles always satisfy libtiff's MCU-boundary requirement.
+fn nearest_16(v: f64) -> u32 {
+    ((v / 16.0).round() as u32).max(1) * 16
 }
 
 /// Escape special XML characters in an attribute value.
@@ -1324,6 +1382,257 @@ fn write_svs(
     }
 }
 
+// ─── Resampled TIFF writer ────────────────────────────────────────────────────
+//
+// Decodes each DICOM resolution level, resizes every tile by the same scale
+// factor (derived from the base level), and writes a pyramidal OME-TIFF using
+// libtiff's built-in JPEG encoder (TIFFWriteTile + JPEGCOLORMODE_RGB).
+//
+// Output tile size is fixed across all levels (computed once from the base
+// level and rounded to the nearest multiple of 16 for JPEG MCU compliance).
+// Pyramid levels whose longer side falls below MIN_PYRAMID_SIDE are skipped.
+// If the source has only one DICOM level the output is a single-IFD TIFF.
+fn write_resampled_tiff(
+    slide_level_metadata_list: &[DcmMetadata],
+    output_path: &str,
+    target_mpp: f64,
+    quality: u8,
+    filter: FilterType,
+    // When true: OME-TIFF (SubIFD pyramid + OME-XML ImageDescription).
+    // When false: flat pyramidal BigTIFF (sequential IFDs, no OME-XML).
+    ome: bool,
+    pb: Option<&ProgressBar>,
+) {
+
+    // ── Group DICOM files by resolution level ─────────────────────────────
+    let mut groups: Vec<Vec<&DcmMetadata>> = Vec::new();
+    for meta in slide_level_metadata_list {
+        if let Some(last) = groups.last_mut() {
+            if last[0].px_columns == meta.px_columns && last[0].px_rows == meta.px_rows {
+                last.push(meta);
+                continue;
+            }
+        }
+        groups.push(vec![meta]);
+    }
+
+    // ── Scale parameters derived from base level ───────────────────────────
+    let base      = groups[0][0];
+    let base_w    = base.px_columns.unwrap_or(0);
+    let base_h    = base.px_rows.unwrap_or(0);
+    let (in_tile_w, in_tile_h) = base.tile_size.unwrap_or((base_w, base_h));
+    let src_mpp_x = base.mpp_x.unwrap_or(0.25);
+    let src_mpp_y = base.mpp_y.unwrap_or(src_mpp_x);
+
+    // Output tile size: nearest multiple of 16 to the scaled base tile.
+    let out_tile_w = nearest_16(in_tile_w as f64 * src_mpp_x / target_mpp);
+    let out_tile_h = nearest_16(in_tile_h as f64 * src_mpp_y / target_mpp);
+
+    // Actual scale after rounding (used uniformly for every level).
+    let actual_scale_x = out_tile_w as f64 / in_tile_w as f64;
+    let actual_scale_y = out_tile_h as f64 / in_tile_h as f64;
+
+    // ── Determine which groups produce an active pyramid level ─────────────
+    // A level is active if its longer output side meets the minimum threshold.
+    struct LevelInfo<'a> {
+        group:     &'a Vec<&'a DcmMetadata>,
+        out_img_w: u32,
+        out_img_h: u32,
+        // input tile size for this level (may differ from base)
+        in_tw:     u32,
+        in_th:     u32,
+        actual_mpp_x: f64,
+        actual_mpp_y: f64,
+    }
+
+    let active_levels: Vec<LevelInfo> = groups.iter().filter_map(|group| {
+        let meta      = group[0];
+        let src_w     = meta.px_columns.unwrap_or(0);
+        let src_h     = meta.px_rows.unwrap_or(0);
+        let out_img_w = (src_w as f64 * actual_scale_x).round() as u32;
+        let out_img_h = (src_h as f64 * actual_scale_y).round() as u32;
+        if out_img_w.max(out_img_h) < MIN_PYRAMID_SIDE {
+            eprintln!("  [skip] resampled level {}x{} → {}x{}: shorter than MIN_PYRAMID_SIDE ({})",
+                src_w, src_h, out_img_w, out_img_h, MIN_PYRAMID_SIDE);
+            return None;
+        }
+        let (in_tw, in_th) = meta.tile_size.unwrap_or((src_w, src_h));
+        let lv_mpp_x = meta.mpp_x.unwrap_or(src_mpp_x);
+        let lv_mpp_y = meta.mpp_y.unwrap_or(src_mpp_y);
+        // Actual stored mpp reflects the rounded tile size.
+        let actual_mpp_x = lv_mpp_x * in_tw as f64 / out_tile_w as f64;
+        let actual_mpp_y = lv_mpp_y * in_th as f64 / out_tile_h as f64;
+        Some(LevelInfo { group, out_img_w, out_img_h, in_tw, in_th, actual_mpp_x, actual_mpp_y })
+    }).collect();
+
+    if active_levels.is_empty() { return; }
+
+    // n_subifds: pyramid levels stored as SubIFDs (all active levels except base).
+    let n_subifds = active_levels.len() - 1;
+
+    // Total tile count across all active levels for the progress bar.
+    let total_tiles: u64 = active_levels.iter().map(|lv| {
+        lv.group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum::<u64>()
+    }).sum();
+    if let Some(p) = pb { p.set_length(total_tiles); }
+
+    // ── Color space from the base level ───────────────────────────────────
+    let first_dcm   = dicom::object::open_file(&base.file_path).unwrap();
+    let color_space = infer_color_space(&first_dcm);
+    let (photometric, spp): (u32, u32) = match color_space {
+        ColorSpace::Grayscale => (PHOTOMETRIC_MINISBLACK as u32, 1),
+        _                     => (PHOTOMETRIC_YCBCR      as u32, 3),
+    };
+    drop(first_dcm);
+
+    // ── OME-XML (only for OME-TIFF output) ───────────────────────────────
+    let base_lv = &active_levels[0];
+    let image_desc_c: Option<CString> = if ome {
+        let mut resampled_meta = base.clone();
+        resampled_meta.px_columns = Some(base_lv.out_img_w);
+        resampled_meta.px_rows    = Some(base_lv.out_img_h);
+        resampled_meta.mpp_x      = Some(base_lv.actual_mpp_x);
+        resampled_meta.mpp_y      = Some(base_lv.actual_mpp_y);
+        resampled_meta.tile_size  = Some((out_tile_w, out_tile_h));
+        Some(CString::new(generate_OME_XML(&[resampled_meta])).unwrap())
+    } else {
+        None
+    };
+
+    // ── Helper: write all tiles for one level ─────────────────────────────
+    // Declared as a closure so it captures out_tile_w/h, spp, quality, pb.
+    // `tiles_across` must be computed from the level's output image width.
+    let write_level_tiles = |tiff: *mut TIFF,
+                              lv: &LevelInfo,
+                              tiles_across: u32| {
+        unsafe {
+            // Per-IFD JPEG settings must be (re)applied after each TIFFWriteDirectory.
+            if photometric == PHOTOMETRIC_YCBCR as u32 {
+                TIFFSetField(tiff, TIFFTAG_JPEGCOLORMODE as u32, JPEGCOLORMODE_RGB as u32);
+            }
+            TIFFSetField(tiff, TIFFTAG_JPEGQUALITY as u32, quality as u32);
+
+            for dcm_meta in lv.group.iter() {
+                let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+                let src_ifd_w    = dcm_meta.px_columns.unwrap_or(0);
+                let tile_indices = frame_to_tile_indices(
+                    &dicom_obj, lv.in_tw, lv.in_th, src_ifd_w,
+                );
+                let n_frames = dcm_meta.n_frames.unwrap_or(0);
+
+                for frame_idx in 0..n_frames {
+                    let decoded = match dicom_obj.decode_pixel_data_frame(frame_idx) {
+                        Ok(d)  => d,
+                        Err(e) => {
+                            eprintln!("  [warn] frame {}: decode failed: {}", frame_idx, e);
+                            if let Some(p) = pb { p.inc(1); }
+                            continue;
+                        }
+                    };
+                    let img = match decoded.to_dynamic_image(0) {
+                        Ok(i)  => i,
+                        Err(e) => {
+                            eprintln!("  [warn] frame {}: to_dynamic_image failed: {}", frame_idx, e);
+                            if let Some(p) = pb { p.inc(1); }
+                            continue;
+                        }
+                    };
+
+                    let resized = img.resize_exact(out_tile_w, out_tile_h, filter);
+
+                    let tile_num = tile_indices.get(frame_idx as usize).copied()
+                        .unwrap_or(frame_idx);
+                    let x = (tile_num % tiles_across) * out_tile_w;
+                    let y = (tile_num / tiles_across) * out_tile_h;
+
+                    let mut buf: Vec<u8> = if spp == 1 {
+                        resized.to_luma8().into_raw()
+                    } else {
+                        resized.to_rgb8().into_raw()
+                    };
+                    TIFFWriteTile(tiff, buf.as_mut_ptr() as *mut c_void, x, y, 0, 0);
+
+                    if let Some(p) = pb { p.inc(1); }
+                }
+            }
+        }
+    };
+
+    unsafe {
+        let tiff = TIFFOpen(
+            CString::new(output_path).unwrap().as_ptr(),
+            CString::new("w8").unwrap().as_ptr(), // BigTIFF
+        );
+
+        // ── IFD 0: base (full resampled resolution) ───────────────────────
+        let lv0          = &active_levels[0];
+        let tiles_across0 = (lv0.out_img_w + out_tile_w - 1) / out_tile_w;
+
+        eprintln!("  [resample] {}x{} @ {:.4} µm/px  →  {}x{} @ {:.4} µm/px  (tile {}x{} → {}x{})",
+            base_w, base_h, src_mpp_x,
+            lv0.out_img_w, lv0.out_img_h, lv0.actual_mpp_x,
+            in_tile_w, in_tile_h, out_tile_w, out_tile_h);
+
+        // For OME-TIFF: register the SubIFD chain before writing IFD 0.
+        // For flat TIFF: no SubIFD tag; pyramid levels are sequential IFDs.
+        if ome && n_subifds > 0 {
+            let zeros: Vec<u64> = vec![0u64; n_subifds];
+            TIFFSetField(tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr());
+        }
+
+        TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     0u32);
+        TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      lv0.out_img_w);
+        TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     lv0.out_img_h);
+        TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       out_tile_w);
+        TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      out_tile_h);
+        TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     7u32); // JPEG
+        TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
+        TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
+        TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
+        TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
+        TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
+        TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
+        TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
+        TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv0.actual_mpp_x);
+        TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv0.actual_mpp_y);
+        if let Some(ref desc) = image_desc_c {
+            TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
+        }
+
+        write_level_tiles(tiff, lv0, tiles_across0);
+        TIFFWriteDirectory(tiff);
+
+        // ── SubIFDs: remaining active levels ──────────────────────────────
+        for lv in &active_levels[1..] {
+            let tiles_across_k = (lv.out_img_w + out_tile_w - 1) / out_tile_w;
+
+            eprintln!("  [resample]   SubIFD {}x{} @ {:.4} µm/px",
+                lv.out_img_w, lv.out_img_h, lv.actual_mpp_x);
+
+            TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     FILETYPE_REDUCEDIMAGE);
+            TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      lv.out_img_w);
+            TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     lv.out_img_h);
+            TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       out_tile_w);
+            TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      out_tile_h);
+            TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     7u32);
+            TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
+            TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
+            TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
+            TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
+            TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
+            TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
+            TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
+            TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv.actual_mpp_x);
+            TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv.actual_mpp_y);
+
+            write_level_tiles(tiff, lv, tiles_across_k);
+            TIFFWriteDirectory(tiff);
+        }
+
+        TIFFClose(tiff);
+    }
+}
+
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
 pub fn run(args: Args) {
@@ -1378,14 +1687,11 @@ pub fn run(args: Args) {
         println!("Found {} unique WSI series", unique_series.len());
     }
 
-    let overall = mp.add(ProgressBar::new(unique_series.len() as u64));
-    overall.set_style(
-        ProgressStyle::with_template(
-            "  Converting series    [{bar:35.yellow/white}] {pos}/{len}"
-        ).unwrap().progress_chars("=>-"),
-    );
+    let total_series   = unique_series.len();
+    let series_counter = AtomicUsize::new(0);
 
     unique_series.par_iter().for_each(|series_id| {
+        let series_idx    = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
         let convert_start = std::time::Instant::now();
 
         let series_meta: Vec<&DcmMetadata> = metadata_list.iter()
@@ -1409,25 +1715,25 @@ pub fn run(args: Args) {
             None => return,
         };
 
-        // Create per-series progress bar
-        let pb = mp.add(ProgressBar::new(0));
-        pb.set_style(
-            ProgressStyle::with_template(
-                "  {msg:<45} [{bar:35.green/white}] {pos:>2}/{len} IFDs"
-            ).unwrap().progress_chars("=>-"),
-        );
-        let msg = if series_id.len() > 43 {
-            format!("…{}", &series_id[series_id.len() - 42..])
-        } else {
-            series_id.clone()
-        };
-        pb.set_message(msg);
-
-        // Determine output format and path
+        // Determine output format and path before creating the progress bar so
+        // the filename can be shown in the message prefix from the start.
         let ts_uid = &slide_levels_owned[0].transfer_syntax_uid;
         let comp = map_transfer_syntax_to_compression(ts_uid);
 
-        let output_path = if args.legacy && is_jpeg2000(&comp) {
+        // When --mpp is specified, check whether downsampling is actually needed.
+        // If the requested mpp is finer (smaller) than the source, fall back to
+        // passthrough so we never invent detail that does not exist in the data.
+        let src_mpp = slide_levels_owned[0].mpp_x.unwrap_or(0.25);
+        let effective_mpp = args.mpp.filter(|&t| t > src_mpp);
+
+        let output_path = if effective_mpp.is_some() {
+            // Resampled output is always TIFF or OME-TIFF (never SVS).
+            if args.legacy {
+                format!("{}/{}.tiff", args.output_dir, series_id)
+            } else {
+                format!("{}/{}.ome.tiff", args.output_dir, series_id)
+            }
+        } else if args.legacy && is_jpeg2000(&comp) {
             format!("{}/{}.svs", args.output_dir, series_id)
         } else if args.legacy {
             format!("{}/{}.tiff", args.output_dir, series_id)
@@ -1435,7 +1741,36 @@ pub fn run(args: Args) {
             format!("{}/{}.ome.tiff", args.output_dir, series_id)
         };
 
-        if args.legacy {
+        // Build the progress bar message: "(idx/total) filename", truncated to fit.
+        let fname = Path::new(&output_path)
+            .file_name().and_then(|n| n.to_str()).unwrap_or(series_id.as_str());
+        let prefix   = format!("({}/{})", series_idx, total_series);
+        let max_name = 52usize.saturating_sub(prefix.len() + 1);
+        let name_str = if fname.len() > max_name {
+            format!("…{}", &fname[fname.len() - max_name.saturating_sub(1)..])
+        } else {
+            fname.to_string()
+        };
+        let pb_msg = format!("{} {}", prefix, name_str);
+
+        // Per-series progress bar: unit is tiles (either decoded tiles in --mpp
+        // mode, or IFDs in passthrough mode — the write functions set the length).
+        let pb = mp.add(ProgressBar::new(0));
+        pb.set_style(
+            ProgressStyle::with_template(
+                "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
+            ).unwrap().progress_chars("=>-"),
+        );
+        pb.set_message(pb_msg.clone());
+
+        if let Some(target_mpp) = effective_mpp {
+            write_resampled_tiff(
+                &slide_levels_owned, &output_path,
+                target_mpp, args.quality, args.filter,
+                !args.legacy,   // ome = true unless --legacy
+                Some(&pb),
+            );
+        } else if args.legacy {
             if is_jpeg2000(&comp) {
                 write_svs(
                     &slide_levels_owned,
@@ -1460,11 +1795,8 @@ pub fn run(args: Args) {
         }
 
         let elapsed = convert_start.elapsed();
-        pb.finish_with_message(format!("{:.2}s  {}",
-            elapsed.as_millis() as f64 / 1000.0,
-            std::path::Path::new(&output_path).file_name()
-                .and_then(|n| n.to_str()).unwrap_or("")));
-        overall.inc(1);
+        pb.finish_with_message(format!("{} {:.2}s",
+            pb_msg,
+            elapsed.as_millis() as f64 / 1000.0));
     });
-    overall.finish_with_message("Done");
 }
