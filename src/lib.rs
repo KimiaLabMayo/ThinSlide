@@ -27,6 +27,8 @@ use bindings::{
 use std::ffi::CString;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+use std::time::Duration;
 use rayon::prelude::*;
 use walkdir::WalkDir;
 use dicom_pixeldata::PixelDecoder;
@@ -427,15 +429,6 @@ impl Args {
         let output_dir = positional.get(1).ok_or("Didn't get an output directory path")?.to_string();
         Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter })
     }
-}
-
-fn search_dicom_files(input_dir: &str) -> Vec<String> {
-    WalkDir::new(input_dir)
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().unwrap_or_default() == "dcm")
-        .map(|e| e.path().to_string_lossy().into_owned())
-        .collect()
 }
 
 // ─── JPEG subsampling detection ──────────────────────────────────────────────
@@ -1680,168 +1673,209 @@ pub fn run(args: Args) {
         }
     }
 
-    let start_time = std::time::Instant::now();
-    let dicom_files = search_dicom_files(&args.input_dir);
-    let elapsed = start_time.elapsed();
-    if args.verbose {
-        println!("Found {} DICOM files in {:.2}s", dicom_files.len(), elapsed.as_millis() as f64 / 1000.0);
-    }
-
     let mp = MultiProgress::new();
 
-    let scan_pb = mp.add(ProgressBar::new(dicom_files.len() as u64));
+    // ── Phase 1: discover .dcm paths grouped by directory (fast, no I/O) ─────
+    let scan_pb = mp.add(ProgressBar::new_spinner());
     scan_pb.set_style(
+        ProgressStyle::with_template("  Scanning...  {msg}").unwrap()
+    );
+    scan_pb.enable_steady_tick(Duration::from_millis(100));
+
+    let mut dir_map: std::collections::HashMap<std::path::PathBuf, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut last_dir_count  = 0usize;
+    let mut total_file_count = 0usize;
+    for entry in WalkDir::new(&args.input_dir).into_iter().filter_map(|e| e.ok()) {
+        if entry.file_type().is_file()
+            && entry.path().extension().map_or(false, |e| e == "dcm")
+        {
+            let parent = entry.path().parent()
+                .unwrap_or(Path::new(".")).to_path_buf();
+            dir_map.entry(parent).or_default()
+                .push(entry.path().to_string_lossy().into_owned());
+            total_file_count += 1;
+            let n_dirs = dir_map.len();
+            if n_dirs != last_dir_count {
+                scan_pb.set_message(format!("{} files in {} dirs found",
+                    total_file_count, n_dirs));
+                last_dir_count = n_dirs;
+            }
+        }
+    }
+    scan_pb.finish_and_clear();
+
+    let dir_groups: Vec<Vec<String>> = dir_map.into_values().collect();
+    let total_files = total_file_count as u64;
+
+    if args.verbose {
+        println!("Found {} DICOM files in {} directories",
+            total_files, dir_groups.len());
+    }
+
+    // ── Phase 2+3: metadata extraction pipelined with conversion ─────────────
+    //
+    // Scanner thread: iterates over directory groups in parallel, extracts
+    // metadata, groups by series_instance_uid, and sends each WSI series
+    // through a channel.
+    //
+    // Main thread: receives complete series via the channel and immediately
+    // spawns conversion tasks into a rayon::scope, so scanning and conversion
+    // overlap in time.
+    let meta_pb = mp.add(ProgressBar::new(total_files));
+    meta_pb.set_style(
         ProgressStyle::with_template(
-            "  Scanning DICOM files [{bar:35.cyan/white}] {pos}/{len} ({elapsed})"
+            "  Extracting metadata [{bar:35.cyan/white}] {pos}/{len} ({elapsed})"
         ).unwrap().progress_chars("=>-"),
     );
 
-    let metadata_list: Vec<DcmMetadata> = dicom_files.par_iter()
-        .map(|p| { let m = extract_metadata(p); scan_pb.inc(1); m })
-        .collect();
-
-    scan_pb.finish_and_clear();
-
-    // Unique series instance UIDs for WSI
-    let unique_series: Vec<String> = metadata_list.iter()
-        .filter(|m| is_wsi_dicom(m))
-        .map(|m| m.series_instance_uid.clone())
-        .collect::<std::collections::HashSet<_>>()
-        .into_iter()
-        .collect();
-
-    if args.verbose {
-        println!("Found {} unique WSI series", unique_series.len());
-    }
-
-    let total_series   = unique_series.len();
     let series_counter = AtomicUsize::new(0);
     let skipped_count  = AtomicUsize::new(0);
 
-    unique_series.par_iter().for_each(|series_id| {
-        let series_idx    = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
-        let convert_start = std::time::Instant::now();
+    let (tx, rx) = mpsc::channel::<Vec<DcmMetadata>>();
 
-        let series_meta: Vec<&DcmMetadata> = metadata_list.iter()
-            .filter(|m| m.series_instance_uid == *series_id)
-            .collect();
+    // Scanner thread: process directories in parallel; send each WSI series.
+    let meta_pb_clone = meta_pb.clone();
+    let scanner = std::thread::spawn(move || {
+        dir_groups.into_par_iter().for_each_with(tx, |tx, files| {
+            let n = files.len() as u64;
+            let metas: Vec<DcmMetadata> = files.par_iter()
+                .map(|p| extract_metadata(p))
+                .collect();
+            meta_pb_clone.inc(n);
 
-        let thumbnail_meta = get_thumbnail_obj(
-            &series_meta.iter().map(|m| (*m).clone()).collect::<Vec<_>>()
-        ).cloned();
-        let label_meta = get_label_obj(
-            &series_meta.iter().map(|m| (*m).clone()).collect::<Vec<_>>()
-        ).cloned();
-        let overview_meta = get_overview_obj(
-            &series_meta.iter().map(|m| (*m).clone()).collect::<Vec<_>>()
-        ).cloned();
-
-        let slide_levels_owned = match get_slide_level_obj(
-            &series_meta.iter().map(|m| (*m).clone()).collect::<Vec<_>>()
-        ) {
-            Some(v) => v.into_iter().cloned().collect::<Vec<_>>(),
-            None => return,
-        };
-
-        // Determine output format and path before creating the progress bar so
-        // the filename can be shown in the message prefix from the start.
-        let ts_uid = &slide_levels_owned[0].transfer_syntax_uid;
-        let comp = map_transfer_syntax_to_compression(ts_uid);
-
-        // When --mpp is specified, check whether downsampling is actually needed.
-        // If the requested mpp is finer (smaller) than the source, fall back to
-        // passthrough so we never invent detail that does not exist in the data.
-        let src_mpp = slide_levels_owned[0].mpp_x.unwrap_or(0.25);
-        let effective_mpp = args.mpp.filter(|&t| t > src_mpp);
-
-        let output_path = if effective_mpp.is_some() {
-            // Resampled output is always TIFF or OME-TIFF (never SVS).
-            if args.legacy {
-                format!("{}/{}.tiff", args.output_dir, series_id)
-            } else {
-                format!("{}/{}.ome.tiff", args.output_dir, series_id)
+            let mut by_series: std::collections::HashMap<String, Vec<DcmMetadata>> =
+                std::collections::HashMap::new();
+            for m in metas {
+                if is_wsi_dicom(&m) {
+                    by_series.entry(m.series_instance_uid.clone())
+                        .or_default().push(m);
+                }
             }
-        } else if args.legacy && is_jpeg2000(&comp) {
-            format!("{}/{}.svs", args.output_dir, series_id)
-        } else if args.legacy {
-            format!("{}/{}.tiff", args.output_dir, series_id)
-        } else {
-            format!("{}/{}.ome.tiff", args.output_dir, series_id)
-        };
-
-        // Build the progress bar message: "(idx/total) filename", truncated to fit.
-        let fname = Path::new(&output_path)
-            .file_name().and_then(|n| n.to_str()).unwrap_or(series_id.as_str());
-        let prefix   = format!("({}/{})", series_idx, total_series);
-        let max_name = 52usize.saturating_sub(prefix.len() + 1);
-        let name_str = if fname.len() > max_name {
-            format!("…{}", &fname[fname.len() - max_name.saturating_sub(1)..])
-        } else {
-            fname.to_string()
-        };
-        let pb_msg = format!("{} {}", prefix, name_str);
-
-        // Per-series progress bar: unit is tiles (either decoded tiles in --mpp
-        // mode, or IFDs in passthrough mode — the write functions set the length).
-        let pb = mp.add(ProgressBar::new(0));
-        pb.set_style(
-            ProgressStyle::with_template(
-                "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
-            ).unwrap().progress_chars("=>-"),
-        );
-        pb.set_message(pb_msg.clone());
-
-        // Skip if the final output already exists (guaranteed complete via tmp rename).
-        if Path::new(&output_path).exists() {
-            skipped_count.fetch_add(1, Ordering::Relaxed);
-            pb.finish_and_clear();
-            return;
-        }
-
-        let tmp_path = format!("{}.tmp", output_path);
-
-        if let Some(target_mpp) = effective_mpp {
-            write_resampled_tiff(
-                &slide_levels_owned, &tmp_path,
-                target_mpp, args.quality, args.filter,
-                !args.legacy,   // ome = true unless --legacy
-                Some(&pb),
-            );
-        } else if args.legacy {
-            if is_jpeg2000(&comp) {
-                write_svs(
-                    &slide_levels_owned,
-                    thumbnail_meta.as_ref(),
-                    label_meta.as_ref(),
-                    overview_meta.as_ref(),
-                    &tmp_path,
-                    Some(&pb),
-                );
-            } else {
-                write_flat_multipage_tiff(&slide_levels_owned, &tmp_path, Some(&pb));
+            for (_, series_metas) in by_series {
+                tx.send(series_metas).ok();
             }
-        } else {
-            write_ome_tiff(
-                &slide_levels_owned,
-                thumbnail_meta.as_ref(),
-                overview_meta.as_ref(),
-                label_meta.as_ref(),
-                &tmp_path,
-                Some(&pb),
-            );
-        }
-
-        std::fs::rename(&tmp_path, &output_path)
-            .expect("Failed to rename tmp file to output");
-
-        let elapsed = convert_start.elapsed();
-        pb.finish_with_message(format!("{} {:.2}s",
-            pb_msg,
-            elapsed.as_millis() as f64 / 1000.0));
+        });
+        // All tx clones drop here, closing the channel.
     });
 
+    // References shared across all rayon::scope tasks (safe: scope outlives them).
+    let mp_ref      = &mp;
+    let args_ref    = &args;
+    let skipped_ref = &skipped_count;
+
+    rayon::scope(|s| {
+        for series_meta in rx {
+            let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
+            s.spawn(move |_| {
+                let convert_start = std::time::Instant::now();
+
+                let thumbnail_meta = get_thumbnail_obj(&series_meta).cloned();
+                let label_meta     = get_label_obj(&series_meta).cloned();
+                let overview_meta  = get_overview_obj(&series_meta).cloned();
+
+                let slide_levels_owned = match get_slide_level_obj(&series_meta) {
+                    Some(v) => v.into_iter().cloned().collect::<Vec<_>>(),
+                    None    => return,
+                };
+
+                let series_id     = &slide_levels_owned[0].series_instance_uid;
+                let ts_uid        = &slide_levels_owned[0].transfer_syntax_uid;
+                let comp          = map_transfer_syntax_to_compression(ts_uid);
+                let src_mpp       = slide_levels_owned[0].mpp_x.unwrap_or(0.25);
+                let effective_mpp = args_ref.mpp.filter(|&t| t > src_mpp);
+
+                let output_path = if effective_mpp.is_some() {
+                    if args_ref.legacy {
+                        format!("{}/{}.tiff", args_ref.output_dir, series_id)
+                    } else {
+                        format!("{}/{}.ome.tiff", args_ref.output_dir, series_id)
+                    }
+                } else if args_ref.legacy && is_jpeg2000(&comp) {
+                    format!("{}/{}.svs", args_ref.output_dir, series_id)
+                } else if args_ref.legacy {
+                    format!("{}/{}.tiff", args_ref.output_dir, series_id)
+                } else {
+                    format!("{}/{}.ome.tiff", args_ref.output_dir, series_id)
+                };
+
+                // Build progress bar message: "(idx) filename", truncated to fit.
+                let fname    = Path::new(&output_path)
+                    .file_name().and_then(|n| n.to_str()).unwrap_or(series_id.as_str());
+                let prefix   = format!("({})", series_idx);
+                let max_name = 52usize.saturating_sub(prefix.len() + 1);
+                let name_str = if fname.len() > max_name {
+                    format!("…{}", &fname[fname.len() - max_name.saturating_sub(1)..])
+                } else {
+                    fname.to_string()
+                };
+                let pb_msg = format!("{} {}", prefix, name_str);
+
+                let pb = mp_ref.add(ProgressBar::new(0));
+                pb.set_style(
+                    ProgressStyle::with_template(
+                        "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
+                    ).unwrap().progress_chars("=>-"),
+                );
+                pb.set_message(pb_msg.clone());
+
+                // Skip if the final output already exists (guaranteed complete).
+                if Path::new(&output_path).exists() {
+                    skipped_ref.fetch_add(1, Ordering::Relaxed);
+                    pb.finish_and_clear();
+                    return;
+                }
+
+                let tmp_path = format!("{}.tmp", output_path);
+
+                if let Some(target_mpp) = effective_mpp {
+                    write_resampled_tiff(
+                        &slide_levels_owned, &tmp_path,
+                        target_mpp, args_ref.quality, args_ref.filter,
+                        !args_ref.legacy,
+                        Some(&pb),
+                    );
+                } else if args_ref.legacy {
+                    if is_jpeg2000(&comp) {
+                        write_svs(
+                            &slide_levels_owned,
+                            thumbnail_meta.as_ref(),
+                            label_meta.as_ref(),
+                            overview_meta.as_ref(),
+                            &tmp_path,
+                            Some(&pb),
+                        );
+                    } else {
+                        write_flat_multipage_tiff(&slide_levels_owned, &tmp_path, Some(&pb));
+                    }
+                } else {
+                    write_ome_tiff(
+                        &slide_levels_owned,
+                        thumbnail_meta.as_ref(),
+                        overview_meta.as_ref(),
+                        label_meta.as_ref(),
+                        &tmp_path,
+                        Some(&pb),
+                    );
+                }
+
+                std::fs::rename(&tmp_path, &output_path)
+                    .expect("Failed to rename tmp file to output");
+
+                let elapsed = convert_start.elapsed();
+                pb.finish_with_message(format!("{} {:.2}s",
+                    pb_msg, elapsed.as_millis() as f64 / 1000.0));
+            });
+        }
+    });
+
+    scanner.join().unwrap();
+    meta_pb.finish_and_clear();
+
+    let total_processed = series_counter.load(Ordering::Relaxed);
     let skipped = skipped_count.load(Ordering::Relaxed);
     if skipped > 0 {
-        println!("  {} of {} series skipped (output already exists).", skipped, total_series);
+        println!("  {} of {} series skipped (output already exists).",
+            skipped, total_processed);
     }
 }

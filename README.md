@@ -33,7 +33,7 @@ OME-TIFF is always BigTIFF. SVS is not produced when `--mpp` is used, regardless
 - Embeds resolution metadata (microns per pixel) as TIFF `XResolution`/`YResolution` (pixels/cm)
 - For SVS output, writes Aperio `ImageDescription` with magnification and MPP, and includes thumbnail, label, and macro/overview images
 - For OME-TIFF output, embeds a conforming OME-XML 2016-06 block and uses the TIFF `SubIFD` tag to chain sub-resolution levels, making the pyramid readable by BioFormats and QuPath
-- **Resampling mode** (`--mpp`): decodes each tile, resizes to the target resolution using Lanczos3 interpolation, and re-encodes as JPEG; produces a pyramidal OME-TIFF whose resolution tags reflect the actual stored mpp; supports JPEG and JPEG 2000 source data equally
+- **Resampling mode** (`--mpp`): decodes each tile, resizes to the target resolution using nearest interpolation, and re-encodes as JPEG; produces a pyramidal OME-TIFF whose resolution tags reflect the actual stored mpp; supports JPEG and JPEG 2000 source data equally
 
 ## Requirements
 
