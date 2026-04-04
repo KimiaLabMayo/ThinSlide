@@ -562,7 +562,11 @@ fn write_flat_multipage_tiff(
         }
         groups.push(vec![meta]);
     }
-    if let Some(p) = pb { p.set_length(groups.len() as u64); }
+    let total_tiles: u64 = groups.iter()
+        .filter(|g| g[0].tile_size.is_some())
+        .map(|g| g.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum::<u64>())
+        .sum();
+    if let Some(p) = pb { p.set_length(total_tiles); }
 
     unsafe {
         let tiff = TIFFOpen(
@@ -685,7 +689,8 @@ fn write_flat_multipage_tiff(
             }
 
             TIFFWriteDirectory(tiff);
-            if let Some(p) = pb { p.inc(1); }
+            let group_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+            if let Some(p) = pb { p.inc(group_tiles); }
         }
         TIFFClose(tiff);
     }
@@ -904,7 +909,11 @@ fn write_ome_tiff(
         }
         groups.push(vec![meta]);
     }
-    if let Some(p) = pb { p.set_length(groups.len() as u64); }
+    let total_tiles: u64 = groups.iter()
+        .filter(|g| g[0].tile_size.is_some())
+        .map(|g| g.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum::<u64>())
+        .sum();
+    if let Some(p) = pb { p.set_length(total_tiles); }
 
     let ome_xml      = generate_OME_XML(slide_level_metadata_list);
     let image_desc_c = CString::new(ome_xml).unwrap();
@@ -1007,7 +1016,8 @@ fn write_ome_tiff(
             // Finalise IFD 0.  libtiff now knows to route the next n_subifds
             // TIFFWriteDirectory calls into the SubIFD chain.
             TIFFWriteDirectory(tiff);
-            if let Some(p) = pb { p.inc(1); }
+            let ifd0_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+            if let Some(p) = pb { p.inc(ifd0_tiles); }
         }
 
         // ── SubIFDs: pyramid sub-resolutions (chained from IFD 0) ─────────
@@ -1095,7 +1105,8 @@ fn write_ome_tiff(
             // This call writes into the SubIFD chain while n_subifds > 0,
             // then returns to the main IFD chain.
             TIFFWriteDirectory(tiff);
-            if let Some(p) = pb { p.inc(1); }
+            let subifd_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+            if let Some(p) = pb { p.inc(subifd_tiles); }
         }
 
         // ── Optional associated images (main chain, after SubIFD chain) ────
@@ -1294,12 +1305,20 @@ fn write_svs(
     );
     let image_desc_c = CString::new(image_desc).unwrap();
 
-    let total_ifds = 1
-        + slide_levels.len().saturating_sub(1) as u64
-        + thumbnail_meta.is_some() as u64
-        + label_meta.is_some() as u64
-        + overview_meta.is_some() as u64;
-    if let Some(p) = pb { p.set_length(total_ifds); }
+    let total_tiles: u64 = {
+        let base_tiles = slide_levels[0].n_frames.unwrap_or(0) as u64;
+        let other_tiles: u64 = slide_levels[1..].iter().map(|level| {
+            if level.tile_size.is_none() { return 0; }
+            let (tile_w, tile_h) = level.tile_size.unwrap();
+            if svs_compression == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) { return 0; }
+            level.n_frames.unwrap_or(0) as u64
+        }).sum();
+        base_tiles + other_tiles
+            + thumbnail_meta.is_some() as u64
+            + label_meta.is_some() as u64
+            + overview_meta.is_some() as u64
+    };
+    if let Some(p) = pb { p.set_length(total_tiles); }
 
     unsafe {
         let tiff = TIFFOpen(
@@ -1316,7 +1335,7 @@ fn write_svs(
             Some(&image_desc_c),
         );
         TIFFWriteDirectory(tiff);
-        if let Some(p) = pb { p.inc(1); }
+        if let Some(p) = pb { p.inc(base.n_frames.unwrap_or(0) as u64); }
 
         // ── IFD 1: Thumbnail (decoded + re-encoded as JPEG) ──────────────
         let thumb_written = thumbnail_meta
@@ -1356,7 +1375,7 @@ fn write_svs(
                 None,
             );
             TIFFWriteDirectory(tiff);
-            if let Some(p) = pb { p.inc(1); }
+            if let Some(p) = pb { p.inc(level.n_frames.unwrap_or(0) as u64); }
         }
 
         // ── Label image ───────────────────────────────────────────────────
