@@ -1672,6 +1672,14 @@ pub fn run(args: Args) {
         std::fs::create_dir_all(&args.output_dir).expect("Failed to create output directory");
     }
 
+    // Remove any stale .tmp files left by a previously interrupted run.
+    for entry in std::fs::read_dir(&args.output_dir).into_iter().flatten().flatten() {
+        let p = entry.path();
+        if p.extension().map_or(false, |e| e == "tmp") {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+
     let start_time = std::time::Instant::now();
     let dicom_files = search_dicom_files(&args.input_dir);
     let elapsed = start_time.elapsed();
@@ -1708,6 +1716,7 @@ pub fn run(args: Args) {
 
     let total_series   = unique_series.len();
     let series_counter = AtomicUsize::new(0);
+    let skipped_count  = AtomicUsize::new(0);
 
     unique_series.par_iter().for_each(|series_id| {
         let series_idx    = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1782,9 +1791,18 @@ pub fn run(args: Args) {
         );
         pb.set_message(pb_msg.clone());
 
+        // Skip if the final output already exists (guaranteed complete via tmp rename).
+        if Path::new(&output_path).exists() {
+            skipped_count.fetch_add(1, Ordering::Relaxed);
+            pb.finish_and_clear();
+            return;
+        }
+
+        let tmp_path = format!("{}.tmp", output_path);
+
         if let Some(target_mpp) = effective_mpp {
             write_resampled_tiff(
-                &slide_levels_owned, &output_path,
+                &slide_levels_owned, &tmp_path,
                 target_mpp, args.quality, args.filter,
                 !args.legacy,   // ome = true unless --legacy
                 Some(&pb),
@@ -1796,11 +1814,11 @@ pub fn run(args: Args) {
                     thumbnail_meta.as_ref(),
                     label_meta.as_ref(),
                     overview_meta.as_ref(),
-                    &output_path,
+                    &tmp_path,
                     Some(&pb),
                 );
             } else {
-                write_flat_multipage_tiff(&slide_levels_owned, &output_path, Some(&pb));
+                write_flat_multipage_tiff(&slide_levels_owned, &tmp_path, Some(&pb));
             }
         } else {
             write_ome_tiff(
@@ -1808,14 +1826,22 @@ pub fn run(args: Args) {
                 thumbnail_meta.as_ref(),
                 overview_meta.as_ref(),
                 label_meta.as_ref(),
-                &output_path,
+                &tmp_path,
                 Some(&pb),
             );
         }
+
+        std::fs::rename(&tmp_path, &output_path)
+            .expect("Failed to rename tmp file to output");
 
         let elapsed = convert_start.elapsed();
         pb.finish_with_message(format!("{} {:.2}s",
             pb_msg,
             elapsed.as_millis() as f64 / 1000.0));
     });
+
+    let skipped = skipped_count.load(Ordering::Relaxed);
+    if skipped > 0 {
+        println!("  {} of {} series skipped (output already exists).", skipped, total_series);
+    }
 }
