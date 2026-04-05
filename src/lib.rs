@@ -88,6 +88,7 @@ fn is_jpeg2000(comp: &CompressionType) -> bool {
 
 // ─── Color space ─────────────────────────────────────────────────────────────
 
+#[derive(PartialEq)]
 enum ColorSpace {
     RGB,
     YCbCr,
@@ -1514,22 +1515,39 @@ fn write_resampled_tiff(
     };
 
     // ── Helper: write all tiles for one level ─────────────────────────────
-    // Captures out_tile_w/h, spp, quality, filter, pb from the outer scope.
+    // Pipeline per tile (fully parallel within each chunk):
+    //   1. decode  — turbojpeg::decompress (SIMD) for JPEG sources;
+    //                decode_pixel_data_frame for JPEG2000/other
+    //   2. resize  — fast_image_resize (SIMD via NEON/AVX2)
+    //   3. encode  — turbojpeg::compress (SIMD)
+    //   4. write   — TIFFWriteRawTile (~memcpy, sequential)
     //
-    // Pipeline per chunk:
-    //   parallel  — decode + resize + turbojpeg JPEG encode → Vec<u8>
-    //   sequential — TIFFWriteRawTile (raw byte passthrough, ~memcpy speed)
-    //
-    // For JPEG-compressed sources, raw JPEG fragments are pre-extracted as
-    // Vec<Vec<u8>> before the parallel section so that each worker thread
-    // decodes its own independent byte slice via turbojpeg::decompress.
-    // This eliminates the shared &dicom_obj reference from the hot loop,
-    // removing any potential internal serialization inside decode_pixel_data_frame.
-    // For non-JPEG sources the original decode_pixel_data_frame path is kept.
-    // Chunk size = num_threads * 4 keeps all workers busy while bounding
-    // peak memory (one decoded+encoded tile per in-flight slot).
+    // For JPEG sources, raw fragments are pre-extracted as Vec<Vec<u8>> so each
+    // worker decodes its own independent bytes (no shared dicom_obj in the hot path).
+
+    // Map image::FilterType → fast_image_resize algorithm once.
+    // fast_image_resize has no Gaussian; Lanczos3 is the closest high-quality substitute.
+    use fast_image_resize as fir;
+    let fir_alg = match filter {
+        image::imageops::FilterType::Nearest    => fir::ResizeAlg::Nearest,
+        image::imageops::FilterType::Triangle   => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
+        image::imageops::FilterType::CatmullRom => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
+        image::imageops::FilterType::Gaussian   => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
+        image::imageops::FilterType::Lanczos3   => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
+        _                                       => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
+    };
+    let fir_pixel_type = if spp == 1 { fir::PixelType::U8 } else { fir::PixelType::U8x3 };
+    let resize_opts = fir::ResizeOptions::new().resize_alg(fir_alg);
+
     let write_level_tiles = |tiff: *mut TIFF, lv: &LevelInfo| {
         let chunk_size = (rayon::current_num_threads() * 4).max(1);
+
+        // JP2K reduce level: largest n such that 2^n <= min(in_tw/out_tile_w, in_th/out_tile_h).
+        // Decoding at this level yields ceil(in_tile / 2^n) pixels — far less work than full decode.
+        // Example: in_tw=256, out_tile_w=64 → scale_down=4 → n_reduce=2 (decode at 1/4 res).
+        let scale_down = (lv.in_tw as f64 / out_tile_w as f64)
+            .min(lv.in_th as f64 / out_tile_h as f64);
+        let n_reduce: u32 = if scale_down > 1.0 { scale_down.log2().floor() as u32 } else { 0 };
 
         for dcm_meta in lv.group.iter() {
             let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
@@ -1540,14 +1558,20 @@ fn write_resampled_tiff(
             let n_frames  = dcm_meta.n_frames.unwrap_or(0);
             let frame_ids: Vec<u32> = (0..n_frames).collect();
 
-            // For JPEG sources: pre-extract all fragments into owned Vec<Vec<u8>>.
-            // Each parallel worker then owns its input bytes independently,
-            // avoiding any shared state during decode.
+            // Pre-extract raw fragments for JPEG and JP2K sources so each parallel worker
+            // decodes its own independent byte slice (no shared dicom_obj in the hot path).
             let is_jpeg_src = matches!(
                 map_transfer_syntax_to_compression(&dcm_meta.transfer_syntax_uid),
                 CompressionType::JpegBaseline | CompressionType::JpegExtended
             );
-            let raw_fragments: Vec<Vec<u8>> = if is_jpeg_src {
+            let is_jp2k_src = matches!(
+                map_transfer_syntax_to_compression(&dcm_meta.transfer_syntax_uid),
+                CompressionType::Jpeg2000Lossless
+                | CompressionType::Jpeg2000
+                | CompressionType::Jpeg2000Part2MulticomponentLossless
+                | CompressionType::Jpeg2000Part2Multicomponent
+            );
+            let raw_fragments: Vec<Vec<u8>> = if is_jpeg_src || is_jp2k_src {
                 let px = dicom_obj.element_by_name("PixelData").expect("No PixelData");
                 px.fragments().expect("Not encapsulated pixel data")
                     .iter()
@@ -1563,42 +1587,106 @@ fn write_resampled_tiff(
                 let encoded: Vec<Option<(u32, Vec<u8>)>> = chunk
                     .par_iter()
                     .map(|&frame_idx| {
-                        let img: image::DynamicImage = if is_jpeg_src {
-                            // Lock-free path: each thread decodes its own fragment bytes.
-                            // Use image::load_from_memory so that JPEG color space is
-                            // determined from the stream itself (APP14 / SOF markers),
-                            // matching the behavior of dicom-pixeldata. turbojpeg::decompress
-                            // would need DICOM's PhotometricInterpretation to distinguish
-                            // RGB-coded JPEG from YCbCr, which is not available here.
+                        // ── 1. Decode → raw pixel bytes ───────────────────────
+                        let (raw_pixels, src_w, src_h): (Vec<u8>, u32, u32) = if is_jpeg_src {
                             let frag = raw_fragments.get(frame_idx as usize)?;
-                            image::load_from_memory(frag).ok()?
-                        } else {
-                            // Fallback: JPEG2000 / other — shared dicom_obj reference.
-                            let decoded = match dicom_obj.decode_pixel_data_frame(frame_idx) {
-                                Ok(d)  => d,
-                                Err(e) => {
-                                    eprintln!("  [warn] frame {}: decode failed: {}", frame_idx, e);
-                                    return None;
-                                }
+                            let (dec_pixels, dec_w, dec_h) = if spp == 1 {
+                                let dec = turbojpeg::decompress(frag, turbojpeg::PixelFormat::GRAY).ok()?;
+                                let (w, h, ch) = (dec.width, dec.height, 1usize);
+                                // Remove row padding if present (turbojpeg default is tight, but be safe).
+                                let pixels = if dec.pitch == w * ch {
+                                    dec.pixels
+                                } else {
+                                    (0..h).flat_map(|r| dec.pixels[r*dec.pitch..r*dec.pitch+w*ch].iter().copied()).collect()
+                                };
+                                (pixels, w as u32, h as u32)
+                            } else {
+                                let dec = turbojpeg::decompress(frag, turbojpeg::PixelFormat::RGB).ok()?;
+                                let (w, h, ch) = (dec.width, dec.height, 3usize);
+                                let pixels = if dec.pitch == w * ch {
+                                    dec.pixels
+                                } else {
+                                    (0..h).flat_map(|r| dec.pixels[r*dec.pitch..r*dec.pitch+w*ch].iter().copied()).collect()
+                                };
+                                (pixels, w as u32, h as u32)
                             };
-                            match decoded.to_dynamic_image(0) {
-                                Ok(i)  => i,
-                                Err(e) => {
-                                    eprintln!("  [warn] frame {}: to_dynamic_image failed: {}", frame_idx, e);
-                                    return None;
+                            (dec_pixels, dec_w, dec_h)
+                        } else if is_jp2k_src {
+                            // JP2K: decode only the DWT resolution levels needed (n_reduce).
+                            // Pixels decoded = ceil(W/2^n) × ceil(H/2^n) instead of W×H.
+                            let frag = raw_fragments.get(frame_idx as usize)?;
+                            // DICOM JP2K frames are raw J2K codestreams (magic: FF 4F FF 51)
+                            let stream = jp2k::Stream::from_bytes(frag)
+                                .map_err(|e| eprintln!("  [warn] frame {}: jp2k stream error: {}", frame_idx, e))
+                                .ok()?;
+                            let codec = jp2k::Codec::create(jp2k::CODEC_FORMAT::OPJ_CODEC_J2K)
+                                .map_err(|e| eprintln!("  [warn] frame {}: jp2k codec error: {}", frame_idx, e))
+                                .ok()?;
+                            let decode_params = jp2k::DecodeParams::default().with_reduce_factor(n_reduce);
+                            let buf = jp2k::ImageBuffer::build(codec, stream, decode_params)
+                                .map_err(|e| eprintln!("  [warn] frame {}: jp2k decode failed: {}", frame_idx, e))
+                                .ok()?;
+                            let (w, h) = (buf.width, buf.height);
+                            // Normalize to the expected number of channels (spp)
+                            let mut pixels: Vec<u8> = if spp == 1 && buf.num_bands == 1 {
+                                buf.buffer
+                            } else if spp == 3 && buf.num_bands == 3 {
+                                buf.buffer
+                            } else if spp == 3 && buf.num_bands == 4 {
+                                // RGBA -> RGB: drop alpha channel
+                                buf.buffer.chunks(4).flat_map(|c| c[..3].iter().copied()).collect()
+                            } else if spp == 1 && buf.num_bands > 1 {
+                                // Color -> grayscale: take first channel
+                                buf.buffer.into_iter().step_by(buf.num_bands).collect()
+                            } else {
+                                buf.buffer
+                            };
+                            // Convert YCbCr → RGB if DICOM PhotometricInterpretation is YBR_FULL.
+                            // jp2k decodes the raw codestream components without applying a color
+                            // transform (YBR_ICT/RCT are reversed by OpenJPEG internally, but
+                            // YBR_FULL data is stored as-is). Without this step the Y/Cb/Cr bytes
+                            // would be fed to turbojpeg as RGB, resulting in a double conversion.
+                            if color_space == ColorSpace::YCbCr && spp == 3 {
+                                for chunk in pixels.chunks_mut(3) {
+                                    let y  = chunk[0] as f32;
+                                    let cb = chunk[1] as f32 - 128.0;
+                                    let cr = chunk[2] as f32 - 128.0;
+                                    chunk[0] = (y + 1.40200 * cr).clamp(0.0, 255.0) as u8;
+                                    chunk[1] = (y - 0.34414 * cb - 0.71414 * cr).clamp(0.0, 255.0) as u8;
+                                    chunk[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
                                 }
                             }
+                            (pixels, w, h)
+                        } else {
+                            // Other transfer syntaxes: fall back to dicom-pixeldata decoder.
+                            let decoded = match dicom_obj.decode_pixel_data_frame(frame_idx) {
+                                Ok(d)  => d,
+                                Err(e) => { eprintln!("  [warn] frame {}: decode failed: {}", frame_idx, e); return None; }
+                            };
+                            let img = match decoded.to_dynamic_image(0) {
+                                Ok(i)  => i,
+                                Err(e) => { eprintln!("  [warn] frame {}: to_dynamic_image failed: {}", frame_idx, e); return None; }
+                            };
+                            let (w, h) = (img.width(), img.height());
+                            let pixels = if spp == 1 { img.to_luma8().into_raw() } else { img.to_rgb8().into_raw() };
+                            (pixels, w, h)
                         };
 
-                        let resized  = img.resize_exact(out_tile_w, out_tile_h, filter);
+                        // ── 2. Resize with fast_image_resize (SIMD) ──────────
+                        let src_fir = fir::images::Image::from_vec_u8(
+                            src_w, src_h, raw_pixels, fir_pixel_type,
+                        ).ok()?;
+                        let mut dst_fir = fir::images::Image::new(out_tile_w, out_tile_h, fir_pixel_type);
+                        fir::Resizer::new().resize(&src_fir, &mut dst_fir, &resize_opts).ok()?;
+                        let resized_raw = dst_fir.into_vec();
+
                         let tile_num = tile_indices.get(frame_idx as usize).copied()
                             .unwrap_or(frame_idx);
 
-                        // JPEG encode with turbojpeg (parallel, thread-safe).
+                        // ── 3. JPEG encode with turbojpeg (SIMD) ─────────────
                         let jpeg_bytes = if spp == 1 {
-                            let raw = resized.to_luma8().into_raw();
                             let tj_img = turbojpeg::Image::<&[u8]> {
-                                pixels: &raw,
+                                pixels: &resized_raw,
                                 width:  out_tile_w as usize,
                                 pitch:  out_tile_w as usize,
                                 height: out_tile_h as usize,
@@ -1607,9 +1695,8 @@ fn write_resampled_tiff(
                             turbojpeg::compress(tj_img, quality as i32, turbojpeg::Subsamp::Gray)
                                 .map(|b| b.to_vec()).ok()?
                         } else {
-                            let raw = resized.to_rgb8().into_raw();
                             let tj_img = turbojpeg::Image::<&[u8]> {
-                                pixels: &raw,
+                                pixels: &resized_raw,
                                 width:  out_tile_w as usize,
                                 pitch:  out_tile_w as usize * 3,
                                 height: out_tile_h as usize,
@@ -1623,8 +1710,7 @@ fn write_resampled_tiff(
                     })
                     .collect();
 
-                // Sequential write: TIFFWriteRawTile bypasses libtiff's JPEG
-                // encoder — it stores pre-encoded bytes directly (~memcpy).
+                // ── 4. Sequential write: TIFFWriteRawTile (~memcpy) ──────
                 for item in encoded {
                     if let Some((tile_num, jpeg_bytes)) = item {
                         unsafe {

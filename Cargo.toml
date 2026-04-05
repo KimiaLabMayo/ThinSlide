@@ -10,6 +10,8 @@ pkg-config = "0.3"
 [dependencies]
 rayon = "1"
 turbojpeg = "1"
+fast_image_resize = "4"
+jp2k = "0.3"
 indicatif = "0.17"
 dicom = "0.9.0"
 dicom-core = "0.9.0"
