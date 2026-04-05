@@ -1,15 +1,15 @@
 # dcm2tiff
 
-A fast command-line tool that converts Whole Slide Image (WSI) DICOM files into OME-TIFF (default) or legacy pyramidal TIFF / Aperio SVS files.
+An extremely fast command-line tool that converts Whole Slide Image (WSI) DICOM files into OME-TIFF (default) or legacy pyramidal TIFF / Aperio SVS files.
 
 Two conversion modes are supported:
 
-- **Passthrough** (default): compressed pixel data is written directly to the output file without decoding or re-encoding, preserving the original quality and maximising speed.
+- **Passthrough** (default): compressed pixel data is written directly to the output file **without decoding or re-encoding**, preserving the original quality and maximising speed.
 - **Resampling** (`--mpp`): each tile is decoded, resized to a target resolution, and re-encoded as JPEG. This produces a downsampled copy at a specified microns-per-pixel value.
 
 ## Overview
 
-Digital pathology scanners often store WSI data as multi-file DICOM sets. This tool reads those files and assembles them into a single pyramidal image file suitable for use with OpenSlide, QuPath, BioFormats, or other WSI viewers.
+Digital pathology scanners store WSI data as multi-file DICOM sets. This tool reads those files and assembles them into a single pyramidal image file suitable for use with OpenSlide, QuPath, BioFormats, or other WSI viewers.
 
 ### Output formats
 
@@ -20,20 +20,19 @@ By default the output is always OME-TIFF. Pass `--legacy` to select a format bas
 | JPEG (Baseline, Extended, Lossless, LS) | OME-TIFF (`.ome.tiff`) | BigTIFF (`.tiff`) | OME-TIFF or `.tiff` |
 | JPEG 2000 (all variants) | OME-TIFF (`.ome.tiff`) | Aperio SVS (`.svs`) | OME-TIFF or `.tiff` |
 
-OME-TIFF is always BigTIFF. SVS is not produced when `--mpp` is used, regardless of the source compression.
+Note:
+
+- OME-TIFF is always BigTIFF.
+- Resampling mode (`--mpp`) does not produce SVS output; use the default OME-TIFF or `--legacy` BigTIFF instead.
+- BigTIFF with Jpeg 2000 compression is not widely supported by popular libraries, so SVS is used as the legacy format for JPEG 2000 input.
 
 ## Features
 
-- Scans an input directory recursively for `.dcm` files
-- Groups files by DICOM series and identifies WSI series (SOP Class UID `1.2.840.10008.5.1.4.1.1.77.1.6`, Modality `SM`)
-- Assembles multi-file pyramid levels (a single resolution level may be split across multiple DICOM instances)
-- Correctly places tiles using `PerFrameFunctionalGroupsSequence` / `PlanePositionSlideSequence` position metadata
-- Detects color space from `PhotometricInterpretation`, APP14 JPEG markers, or `SamplesPerPixel`
-- Detects YCbCr chroma subsampling factors from the JPEG stream and writes the correct `YCbCrSubSampling` TIFF tag
-- Embeds resolution metadata (microns per pixel) as TIFF `XResolution`/`YResolution` (pixels/cm)
-- For SVS output, writes Aperio `ImageDescription` with magnification and MPP, and includes thumbnail, label, and macro/overview images
+- Optimized for speed. Full support for multi-threaded conversion.
+    - **Passthrough** (default): compressed pixel data is written directly without decoding, preserving quality and maximizing speed. One thread per series, limited by disk I/O.
+    - **Resampling** (`--mpp`): each tile is decoded, resized to target resolution, and re-encoded as JPEG for downsampling at a specified microns-per-pixel value. (See details below.) Supports parallel processing of tiles within each series.
 - For OME-TIFF output, embeds a conforming OME-XML 2016-06 block and uses the TIFF `SubIFD` tag to chain sub-resolution levels, making the pyramid readable by BioFormats and QuPath
-- **Resampling mode** (`--mpp`): decodes each tile, resizes to the target resolution using nearest interpolation, and re-encodes as JPEG; produces a pyramidal OME-TIFF whose resolution tags reflect the actual stored mpp; supports JPEG and JPEG 2000 source data equally
+- Resampling mode (`--mpp`): decodes each tile, resizes to the target resolution using nearest interpolation, and re-encodes as JPEG; produces a pyramidal OME-TIFF whose resolution tags reflect the actual stored mpp; supports JPEG and JPEG 2000 source data equally
 
 ## Requirements
 
@@ -112,7 +111,7 @@ Output files are named after the DICOM Series Instance UID:
 
 ## Resampling mode (`--mpp`)
 
-When `--mpp <N>` is specified the tool decodes every tile and resizes it before writing. This is slower than passthrough but produces a new image at a controlled resolution, which is useful for creating standardised datasets or reducing storage size.
+When `--mpp <N>` is specified the tool decodes every tile and resizes it before writing. This is slower than passthrough but produces a new image at a controlled resolution, which is useful for reducing storage size.
 
 ### Resampling filter (`--filter`)
 
@@ -128,28 +127,17 @@ When `--mpp <N>` is specified the tool decodes every tile and resizes it before 
 
 ### How the output resolution is determined
 
-The output tile size is computed from the base (highest-resolution) DICOM level:
+Note that the mpp of the output image might differ slightly from the requested `--mpp` due to tile size rounding. This program resize the each tile to a size that is a multiple of 16 pixels in each dimension.
+
+Given an input tile size (`in_tile_w × in_tile_h`), source mpp (`source_mpp`), and requested mpp (`requested_mpp`), the target mpp will be calculated as follow:
 
 ```
-out_tile_w = nearest_multiple_of_16( in_tile_w × source_mpp / target_mpp )
-out_tile_h = nearest_multiple_of_16( in_tile_h × source_mpp / target_mpp )
-```
-
-Rounding to a multiple of 16 is required by libtiff for JPEG tile encoding (JPEG MCU boundary). Because of this rounding the stored mpp will differ slightly from the requested value. The exact stored mpp is:
-
-```
-actual_mpp = source_mpp × in_tile_w / out_tile_w
+target_tile_size = nearest_multiple_of_16( in_tile_size × source_mpp / requested_mpp )
+target_mpp = source_mpp × in_tile_size / target_tile_size
 ```
 
 This value is written into the TIFF `XResolution`/`YResolution` tags and into the OME-XML `PhysicalSizeX/Y` attributes, so viewers report the correct pixel size.
 
-### Pyramid construction
-
-If the source DICOM contains multiple resolution levels, each level is downsampled by the same scale ratio and written as a separate pyramid level. The output tile size (`out_tile_w × out_tile_h`) is fixed across all levels.
-
-Pyramid levels whose longer side would be shorter than 512 px after resampling are omitted.
-
-If the source DICOM contains only a single resolution level, the output is also a single IFD (no pyramid).
 
 ### Fallback behaviour
 
@@ -205,9 +193,6 @@ The OME-XML embedded in `ImageDescription` conforms to the [OME 2016-06 schema](
 
 ## Limitations
 
-- Only WSI DICOM files (SOP Class `1.2.840.10008.5.1.4.1.1.77.1.6`, Modality `SM`) are processed; other DICOM files in the input directory are ignored.
-- Uncompressed or unrecognised transfer syntaxes are treated as JPEG 2000 by default.
 - The build script uses `pkg-config` to find libtiff. If `pkg-config` is not available, it falls back to Homebrew paths on macOS; on other systems without `pkg-config`, set `LIBRARY_PATH` or adjust `build.rs`.
 - OME-TIFF output assumes a 2D slide (no Z-stack or time series); `SizeZ=1`, `SizeT=1`.
-- Resampling mode (`--mpp`) does not produce SVS output; use the default OME-TIFF or `--legacy` BigTIFF instead.
 - In resampling mode, pyramid generation requires that the source DICOM itself contains multiple resolution levels. Single-level source DICOMs produce single-IFD output without a pyramid.
