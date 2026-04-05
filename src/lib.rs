@@ -1,14 +1,13 @@
 // WSI dicom to tiff/svs converter
 // Convert the whole slide image dicom files to a single pyramidal OME-TIFF (default) or
 // legacy format (SVS / generic BigTIFF) when --legacy is passed.
-// No re-encoding: compressed pixel data is written directly to the output file
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 mod bindings;
 use bindings::{
-    TIFF, TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteTile, TIFFWriteDirectory, TIFFClose,
+    TIFF, TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteDirectory, TIFFClose,
     TIFFTAG_SUBFILETYPE, TIFFTAG_IMAGEWIDTH, TIFFTAG_IMAGELENGTH, TIFFTAG_TILEWIDTH,
     TIFFTAG_TILELENGTH, TIFFTAG_COMPRESSION, TIFFTAG_PHOTOMETRIC, TIFFTAG_SAMPLESPERPIXEL,
     TIFFTAG_BITSPERSAMPLE, TIFFTAG_SAMPLEFORMAT, TIFFTAG_PLANARCONFIG, TIFFTAG_ORIENTATION,
@@ -21,7 +20,6 @@ use bindings::{
     FILETYPE_REDUCEDIMAGE,
     TIFFTAG_ROWSPERSTRIP,
     TIFFTAG_ICCPROFILE,
-    TIFFTAG_JPEGQUALITY, TIFFTAG_JPEGCOLORMODE, JPEGCOLORMODE_RGB,
 };
 
 use std::ffi::CString;
@@ -1491,6 +1489,10 @@ fn write_resampled_tiff(
     // ── Color space from the base level ───────────────────────────────────
     let first_dcm   = dicom::object::open_file(&base.file_path).unwrap();
     let color_space = infer_color_space(&first_dcm);
+    // turbojpeg::compress with PixelFormat::RGB converts RGB→YCbCr internally
+    // (standard JPEG behavior), so the output tiles are YCbCr-encoded JPEG.
+    // Tag color IFDs as PHOTOMETRIC_YCBCR with the matching subsampling
+    // factor (Sub2x2 = 4:2:0 → [2,2]) so viewers decode the JPEG correctly.
     let (photometric, spp): (u32, u32) = match color_space {
         ColorSpace::Grayscale => (PHOTOMETRIC_MINISBLACK as u32, 1),
         _                     => (PHOTOMETRIC_YCBCR      as u32, 3),
@@ -1512,58 +1514,127 @@ fn write_resampled_tiff(
     };
 
     // ── Helper: write all tiles for one level ─────────────────────────────
-    // Declared as a closure so it captures out_tile_w/h, spp, quality, pb.
-    // `tiles_across` must be computed from the level's output image width.
-    let write_level_tiles = |tiff: *mut TIFF,
-                              lv: &LevelInfo,
-                              tiles_across: u32| {
-        unsafe {
-            // Per-IFD JPEG settings must be (re)applied after each TIFFWriteDirectory.
-            if photometric == PHOTOMETRIC_YCBCR as u32 {
-                TIFFSetField(tiff, TIFFTAG_JPEGCOLORMODE as u32, JPEGCOLORMODE_RGB as u32);
-            }
-            TIFFSetField(tiff, TIFFTAG_JPEGQUALITY as u32, quality as u32);
+    // Captures out_tile_w/h, spp, quality, filter, pb from the outer scope.
+    //
+    // Pipeline per chunk:
+    //   parallel  — decode + resize + turbojpeg JPEG encode → Vec<u8>
+    //   sequential — TIFFWriteRawTile (raw byte passthrough, ~memcpy speed)
+    //
+    // For JPEG-compressed sources, raw JPEG fragments are pre-extracted as
+    // Vec<Vec<u8>> before the parallel section so that each worker thread
+    // decodes its own independent byte slice via turbojpeg::decompress.
+    // This eliminates the shared &dicom_obj reference from the hot loop,
+    // removing any potential internal serialization inside decode_pixel_data_frame.
+    // For non-JPEG sources the original decode_pixel_data_frame path is kept.
+    // Chunk size = num_threads * 4 keeps all workers busy while bounding
+    // peak memory (one decoded+encoded tile per in-flight slot).
+    let write_level_tiles = |tiff: *mut TIFF, lv: &LevelInfo| {
+        let chunk_size = (rayon::current_num_threads() * 4).max(1);
 
-            for dcm_meta in lv.group.iter() {
-                let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
-                let src_ifd_w    = dcm_meta.px_columns.unwrap_or(0);
-                let tile_indices = frame_to_tile_indices(
-                    &dicom_obj, lv.in_tw, lv.in_th, src_ifd_w,
-                );
-                let n_frames = dcm_meta.n_frames.unwrap_or(0);
+        for dcm_meta in lv.group.iter() {
+            let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+            let src_ifd_w    = dcm_meta.px_columns.unwrap_or(0);
+            let tile_indices = frame_to_tile_indices(
+                &dicom_obj, lv.in_tw, lv.in_th, src_ifd_w,
+            );
+            let n_frames  = dcm_meta.n_frames.unwrap_or(0);
+            let frame_ids: Vec<u32> = (0..n_frames).collect();
 
-                for frame_idx in 0..n_frames {
-                    let decoded = match dicom_obj.decode_pixel_data_frame(frame_idx) {
-                        Ok(d)  => d,
-                        Err(e) => {
-                            eprintln!("  [warn] frame {}: decode failed: {}", frame_idx, e);
-                            if let Some(p) = pb { p.inc(1); }
-                            continue;
+            // For JPEG sources: pre-extract all fragments into owned Vec<Vec<u8>>.
+            // Each parallel worker then owns its input bytes independently,
+            // avoiding any shared state during decode.
+            let is_jpeg_src = matches!(
+                map_transfer_syntax_to_compression(&dcm_meta.transfer_syntax_uid),
+                CompressionType::JpegBaseline | CompressionType::JpegExtended
+            );
+            let raw_fragments: Vec<Vec<u8>> = if is_jpeg_src {
+                let px = dicom_obj.element_by_name("PixelData").expect("No PixelData");
+                px.fragments().expect("Not encapsulated pixel data")
+                    .iter()
+                    .map(|f| f.to_vec())
+                    .collect()
+            } else {
+                Vec::new()
+            };
+
+            for chunk in frame_ids.chunks(chunk_size) {
+                // Parallel: decode → resize → JPEG encode.
+                // Returns Some((tile_num, jpeg_bytes)) on success, None on error.
+                let encoded: Vec<Option<(u32, Vec<u8>)>> = chunk
+                    .par_iter()
+                    .map(|&frame_idx| {
+                        let img: image::DynamicImage = if is_jpeg_src {
+                            // Lock-free path: each thread decodes its own fragment bytes.
+                            // Use image::load_from_memory so that JPEG color space is
+                            // determined from the stream itself (APP14 / SOF markers),
+                            // matching the behavior of dicom-pixeldata. turbojpeg::decompress
+                            // would need DICOM's PhotometricInterpretation to distinguish
+                            // RGB-coded JPEG from YCbCr, which is not available here.
+                            let frag = raw_fragments.get(frame_idx as usize)?;
+                            image::load_from_memory(frag).ok()?
+                        } else {
+                            // Fallback: JPEG2000 / other — shared dicom_obj reference.
+                            let decoded = match dicom_obj.decode_pixel_data_frame(frame_idx) {
+                                Ok(d)  => d,
+                                Err(e) => {
+                                    eprintln!("  [warn] frame {}: decode failed: {}", frame_idx, e);
+                                    return None;
+                                }
+                            };
+                            match decoded.to_dynamic_image(0) {
+                                Ok(i)  => i,
+                                Err(e) => {
+                                    eprintln!("  [warn] frame {}: to_dynamic_image failed: {}", frame_idx, e);
+                                    return None;
+                                }
+                            }
+                        };
+
+                        let resized  = img.resize_exact(out_tile_w, out_tile_h, filter);
+                        let tile_num = tile_indices.get(frame_idx as usize).copied()
+                            .unwrap_or(frame_idx);
+
+                        // JPEG encode with turbojpeg (parallel, thread-safe).
+                        let jpeg_bytes = if spp == 1 {
+                            let raw = resized.to_luma8().into_raw();
+                            let tj_img = turbojpeg::Image::<&[u8]> {
+                                pixels: &raw,
+                                width:  out_tile_w as usize,
+                                pitch:  out_tile_w as usize,
+                                height: out_tile_h as usize,
+                                format: turbojpeg::PixelFormat::GRAY,
+                            };
+                            turbojpeg::compress(tj_img, quality as i32, turbojpeg::Subsamp::Gray)
+                                .map(|b| b.to_vec()).ok()?
+                        } else {
+                            let raw = resized.to_rgb8().into_raw();
+                            let tj_img = turbojpeg::Image::<&[u8]> {
+                                pixels: &raw,
+                                width:  out_tile_w as usize,
+                                pitch:  out_tile_w as usize * 3,
+                                height: out_tile_h as usize,
+                                format: turbojpeg::PixelFormat::RGB,
+                            };
+                            turbojpeg::compress(tj_img, quality as i32, turbojpeg::Subsamp::Sub2x2)
+                                .map(|b| b.to_vec()).ok()?
+                        };
+
+                        Some((tile_num, jpeg_bytes))
+                    })
+                    .collect();
+
+                // Sequential write: TIFFWriteRawTile bypasses libtiff's JPEG
+                // encoder — it stores pre-encoded bytes directly (~memcpy).
+                for item in encoded {
+                    if let Some((tile_num, jpeg_bytes)) = item {
+                        unsafe {
+                            TIFFWriteRawTile(
+                                tiff, tile_num,
+                                jpeg_bytes.as_ptr() as *mut c_void,
+                                jpeg_bytes.len() as i64,
+                            );
                         }
-                    };
-                    let img = match decoded.to_dynamic_image(0) {
-                        Ok(i)  => i,
-                        Err(e) => {
-                            eprintln!("  [warn] frame {}: to_dynamic_image failed: {}", frame_idx, e);
-                            if let Some(p) = pb { p.inc(1); }
-                            continue;
-                        }
-                    };
-
-                    let resized = img.resize_exact(out_tile_w, out_tile_h, filter);
-
-                    let tile_num = tile_indices.get(frame_idx as usize).copied()
-                        .unwrap_or(frame_idx);
-                    let x = (tile_num % tiles_across) * out_tile_w;
-                    let y = (tile_num / tiles_across) * out_tile_h;
-
-                    let mut buf: Vec<u8> = if spp == 1 {
-                        resized.to_luma8().into_raw()
-                    } else {
-                        resized.to_rgb8().into_raw()
-                    };
-                    TIFFWriteTile(tiff, buf.as_mut_ptr() as *mut c_void, x, y, 0, 0);
-
+                    }
                     if let Some(p) = pb { p.inc(1); }
                 }
             }
@@ -1577,8 +1648,7 @@ fn write_resampled_tiff(
         );
 
         // ── IFD 0: base (full resampled resolution) ───────────────────────
-        let lv0          = &active_levels[0];
-        let tiles_across0 = (lv0.out_img_w + out_tile_w - 1) / out_tile_w;
+        let lv0 = &active_levels[0];
 
         eprintln!("  [resample] {}x{} @ {:.4} µm/px  →  {}x{} @ {:.4} µm/px  (tile {}x{} → {}x{})",
             base_w, base_h, src_mpp_x,
@@ -1607,17 +1677,19 @@ fn write_resampled_tiff(
         TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
         TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv0.actual_mpp_x);
         TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv0.actual_mpp_y);
+        // Sub2x2 = 4:2:0 chroma subsampling → YCbCrSubSampling [2, 2]
+        if photometric == PHOTOMETRIC_YCBCR as u32 {
+            TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
+        }
         if let Some(ref desc) = image_desc_c {
             TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
         }
 
-        write_level_tiles(tiff, lv0, tiles_across0);
+        write_level_tiles(tiff, lv0);
         TIFFWriteDirectory(tiff);
 
         // ── SubIFDs: remaining active levels ──────────────────────────────
         for lv in &active_levels[1..] {
-            let tiles_across_k = (lv.out_img_w + out_tile_w - 1) / out_tile_w;
-
             eprintln!("  [resample]   SubIFD {}x{} @ {:.4} µm/px",
                 lv.out_img_w, lv.out_img_h, lv.actual_mpp_x);
 
@@ -1636,8 +1708,11 @@ fn write_resampled_tiff(
             TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
             TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv.actual_mpp_x);
             TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv.actual_mpp_y);
+            if photometric == PHOTOMETRIC_YCBCR as u32 {
+                TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
+            }
 
-            write_level_tiles(tiff, lv, tiles_across_k);
+            write_level_tiles(tiff, lv);
             TIFFWriteDirectory(tiff);
         }
 
@@ -1646,6 +1721,118 @@ fn write_resampled_tiff(
 }
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
+
+// ─── Per-series conversion ────────────────────────────────────────────────────
+//
+// Converts one WSI series (all resolution levels) to the appropriate output
+// format and writes the result atomically via a .tmp file.
+// Called either inline (resampling mode, serial) or from a rayon::scope task
+// (passthrough mode, parallel).
+fn convert_one_series(
+    series_meta: Vec<DcmMetadata>,
+    series_idx: usize,
+    args: &Args,
+    mp: &MultiProgress,
+    skipped: &AtomicUsize,
+) {
+    let convert_start = std::time::Instant::now();
+
+    let thumbnail_meta = get_thumbnail_obj(&series_meta).cloned();
+    let label_meta     = get_label_obj(&series_meta).cloned();
+    let overview_meta  = get_overview_obj(&series_meta).cloned();
+
+    let slide_levels_owned = match get_slide_level_obj(&series_meta) {
+        Some(v) => v.into_iter().cloned().collect::<Vec<_>>(),
+        None    => return,
+    };
+
+    let series_id     = &slide_levels_owned[0].series_instance_uid;
+    let ts_uid        = &slide_levels_owned[0].transfer_syntax_uid;
+    let comp          = map_transfer_syntax_to_compression(ts_uid);
+    let src_mpp       = slide_levels_owned[0].mpp_x.unwrap_or(0.25);
+    let effective_mpp = args.mpp.filter(|&t| t > src_mpp);
+
+    let output_path = if effective_mpp.is_some() {
+        if args.legacy {
+            format!("{}/{}.tiff", args.output_dir, series_id)
+        } else {
+            format!("{}/{}.ome.tiff", args.output_dir, series_id)
+        }
+    } else if args.legacy && is_jpeg2000(&comp) {
+        format!("{}/{}.svs", args.output_dir, series_id)
+    } else if args.legacy {
+        format!("{}/{}.tiff", args.output_dir, series_id)
+    } else {
+        format!("{}/{}.ome.tiff", args.output_dir, series_id)
+    };
+
+    // Build progress bar message: "(idx) filename", truncated to fit.
+    let fname    = Path::new(&output_path)
+        .file_name().and_then(|n| n.to_str()).unwrap_or(series_id.as_str());
+    let prefix   = format!("({})", series_idx);
+    let max_name = 52usize.saturating_sub(prefix.len() + 1);
+    let name_str = if fname.len() > max_name {
+        format!("…{}", &fname[fname.len() - max_name.saturating_sub(1)..])
+    } else {
+        fname.to_string()
+    };
+    let pb_msg = format!("{} {}", prefix, name_str);
+
+    let pb = mp.add(ProgressBar::new(0));
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
+        ).unwrap().progress_chars("=>-"),
+    );
+    pb.set_message(pb_msg.clone());
+
+    // Skip if the final output already exists (guaranteed complete via tmp rename).
+    if Path::new(&output_path).exists() {
+        skipped.fetch_add(1, Ordering::Relaxed);
+        pb.finish_and_clear();
+        return;
+    }
+
+    let tmp_path = format!("{}.tmp", output_path);
+
+    if let Some(target_mpp) = effective_mpp {
+        write_resampled_tiff(
+            &slide_levels_owned, &tmp_path,
+            target_mpp, args.quality, args.filter,
+            !args.legacy,
+            Some(&pb),
+        );
+    } else if args.legacy {
+        if is_jpeg2000(&comp) {
+            write_svs(
+                &slide_levels_owned,
+                thumbnail_meta.as_ref(),
+                label_meta.as_ref(),
+                overview_meta.as_ref(),
+                &tmp_path,
+                Some(&pb),
+            );
+        } else {
+            write_flat_multipage_tiff(&slide_levels_owned, &tmp_path, Some(&pb));
+        }
+    } else {
+        write_ome_tiff(
+            &slide_levels_owned,
+            thumbnail_meta.as_ref(),
+            overview_meta.as_ref(),
+            label_meta.as_ref(),
+            &tmp_path,
+            Some(&pb),
+        );
+    }
+
+    std::fs::rename(&tmp_path, &output_path)
+        .expect("Failed to rename tmp file to output");
+
+    let elapsed = convert_start.elapsed();
+    pb.finish_with_message(format!("{} {:.2}s",
+        pb_msg, elapsed.as_millis() as f64 / 1000.0));
+}
 
 pub fn run(args: Args) {
     if let Some(n) = args.jobs {
@@ -1767,105 +1954,18 @@ pub fn run(args: Args) {
     rayon::scope(|s| {
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            s.spawn(move |_| {
-                let convert_start = std::time::Instant::now();
-
-                let thumbnail_meta = get_thumbnail_obj(&series_meta).cloned();
-                let label_meta     = get_label_obj(&series_meta).cloned();
-                let overview_meta  = get_overview_obj(&series_meta).cloned();
-
-                let slide_levels_owned = match get_slide_level_obj(&series_meta) {
-                    Some(v) => v.into_iter().cloned().collect::<Vec<_>>(),
-                    None    => return,
-                };
-
-                let series_id     = &slide_levels_owned[0].series_instance_uid;
-                let ts_uid        = &slide_levels_owned[0].transfer_syntax_uid;
-                let comp          = map_transfer_syntax_to_compression(ts_uid);
-                let src_mpp       = slide_levels_owned[0].mpp_x.unwrap_or(0.25);
-                let effective_mpp = args_ref.mpp.filter(|&t| t > src_mpp);
-
-                let output_path = if effective_mpp.is_some() {
-                    if args_ref.legacy {
-                        format!("{}/{}.tiff", args_ref.output_dir, series_id)
-                    } else {
-                        format!("{}/{}.ome.tiff", args_ref.output_dir, series_id)
-                    }
-                } else if args_ref.legacy && is_jpeg2000(&comp) {
-                    format!("{}/{}.svs", args_ref.output_dir, series_id)
-                } else if args_ref.legacy {
-                    format!("{}/{}.tiff", args_ref.output_dir, series_id)
-                } else {
-                    format!("{}/{}.ome.tiff", args_ref.output_dir, series_id)
-                };
-
-                // Build progress bar message: "(idx) filename", truncated to fit.
-                let fname    = Path::new(&output_path)
-                    .file_name().and_then(|n| n.to_str()).unwrap_or(series_id.as_str());
-                let prefix   = format!("({})", series_idx);
-                let max_name = 52usize.saturating_sub(prefix.len() + 1);
-                let name_str = if fname.len() > max_name {
-                    format!("…{}", &fname[fname.len() - max_name.saturating_sub(1)..])
-                } else {
-                    fname.to_string()
-                };
-                let pb_msg = format!("{} {}", prefix, name_str);
-
-                let pb = mp_ref.add(ProgressBar::new(0));
-                pb.set_style(
-                    ProgressStyle::with_template(
-                        "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
-                    ).unwrap().progress_chars("=>-"),
-                );
-                pb.set_message(pb_msg.clone());
-
-                // Skip if the final output already exists (guaranteed complete).
-                if Path::new(&output_path).exists() {
-                    skipped_ref.fetch_add(1, Ordering::Relaxed);
-                    pb.finish_and_clear();
-                    return;
-                }
-
-                let tmp_path = format!("{}.tmp", output_path);
-
-                if let Some(target_mpp) = effective_mpp {
-                    write_resampled_tiff(
-                        &slide_levels_owned, &tmp_path,
-                        target_mpp, args_ref.quality, args_ref.filter,
-                        !args_ref.legacy,
-                        Some(&pb),
-                    );
-                } else if args_ref.legacy {
-                    if is_jpeg2000(&comp) {
-                        write_svs(
-                            &slide_levels_owned,
-                            thumbnail_meta.as_ref(),
-                            label_meta.as_ref(),
-                            overview_meta.as_ref(),
-                            &tmp_path,
-                            Some(&pb),
-                        );
-                    } else {
-                        write_flat_multipage_tiff(&slide_levels_owned, &tmp_path, Some(&pb));
-                    }
-                } else {
-                    write_ome_tiff(
-                        &slide_levels_owned,
-                        thumbnail_meta.as_ref(),
-                        overview_meta.as_ref(),
-                        label_meta.as_ref(),
-                        &tmp_path,
-                        Some(&pb),
-                    );
-                }
-
-                std::fs::rename(&tmp_path, &output_path)
-                    .expect("Failed to rename tmp file to output");
-
-                let elapsed = convert_start.elapsed();
-                pb.finish_with_message(format!("{} {:.2}s",
-                    pb_msg, elapsed.as_millis() as f64 / 1000.0));
-            });
+            if args_ref.mpp.is_some() {
+                // Resampling: CPU-bound (decode + resize + encode).
+                // Process one WSI at a time so all n_jobs threads concentrate on
+                // tile-level parallelism inside write_resampled_tiff.
+                convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
+            } else {
+                // Passthrough: I/O-bound (raw fragment copy).
+                // Spawn multiple WSIs in parallel to overlap I/O across slides.
+                s.spawn(move |_| {
+                    convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
+                });
+            }
         }
     });
 
