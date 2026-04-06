@@ -1,6 +1,6 @@
 # dcm2tiff
 
-An extremely fast command-line tool that converts Whole Slide Image (WSI) DICOM files into OME-TIFF (default) or legacy pyramidal TIFF / Aperio SVS files.
+An fast command-line tool that converts Whole Slide Image (WSI) DICOM files into OME-TIFF (default) or legacy pyramidal TIFF / Aperio SVS files.
 
 Two conversion modes are supported:
 
@@ -80,12 +80,23 @@ dcm2tiff <input_dir> <output_dir> [OPTIONS]
 | `--mpp <N>` | Resample output to this resolution (µm/pixel). Triggers decode + resize + JPEG re-encode. Falls back to passthrough if `N` is finer than the source mpp. | off (passthrough) |
 | `--quality <N>` | JPEG quality for `--mpp` resampling (1–100) | 87 |
 | `--filter <NAME>` | Resampling filter for `--mpp` mode: `nearest`, `triangle`, `catmullrom`, `gaussian`, `lanczos3` | `nearest` |
+| `--use-parent-name` | Use the parent directory name of the DICOM files as the output filename stem instead of the Series Instance UID | off |
 
-Output files are named after the DICOM Series Instance UID:
+### Output file naming
+
+By default, output files are named after the DICOM **Series Instance UID**:
 
 - `<SeriesInstanceUID>.ome.tiff` — default (OME-TIFF, any compression)
 - `<SeriesInstanceUID>.tiff` — JPEG input with `--legacy`, or any input with `--mpp --legacy`
 - `<SeriesInstanceUID>.svs` — JPEG 2000 input with `--legacy` (not produced with `--mpp`)
+
+With `--use-parent-name`, the stem is replaced by the **name of the directory containing the DICOM files**:
+
+```
+/data/slides/case001/slide.dcm  →  <output_dir>/case001.ome.tiff
+```
+
+This is convenient when DICOM files are organised into per-case or per-slide subdirectories and human-readable names are preferred over UIDs.
 
 ### Examples
 
@@ -107,6 +118,9 @@ Output files are named after the DICOM Series Instance UID:
 
 # Resample to 0.5 µm/px, write as flat BigTIFF (no OME-XML)
 ./target/release/dcm2tiff /data/wsi_dicoms /data/output --mpp 0.5 --legacy
+
+# Use parent directory name as output filename (e.g. case001.ome.tiff)
+./target/release/dcm2tiff /data/wsi_dicoms /data/output --use-parent-name
 ```
 
 ## Resampling mode (`--mpp`)

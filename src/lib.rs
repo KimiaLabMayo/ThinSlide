@@ -361,14 +361,18 @@ pub struct Args {
     /// JPEG quality used when resampling (--mpp).  Default 87.
     pub quality:    u8,
     /// Resampling filter used when resizing tiles (--mpp).  Default Nearest.
-    pub filter:     FilterType,
+    pub filter:          FilterType,
+    /// When true, use the parent directory name of the DICOM files as the
+    /// output filename instead of the Series Instance UID.
+    pub use_parent_name: bool,
 }
 
 impl Args {
     pub fn build(args: impl Iterator<Item = String>) -> Result<Args, &'static str> {
         let all: Vec<String> = args.collect();
-        let legacy  = all.iter().any(|a| a == "--legacy");
-        let verbose = all.iter().any(|a| a == "-v" || a == "--verbose");
+        let legacy          = all.iter().any(|a| a == "--legacy");
+        let verbose         = all.iter().any(|a| a == "-v" || a == "--verbose");
+        let use_parent_name = all.iter().any(|a| a == "--use-parent-name");
 
         // Parse --jobs N or -j N
         let jobs = all.windows(2).find_map(|w| {
@@ -426,8 +430,54 @@ impl Args {
         }
         let input_dir  = positional.get(0).ok_or("Didn't get an input directory path")?.to_string();
         let output_dir = positional.get(1).ok_or("Didn't get an output directory path")?.to_string();
-        Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter })
+        Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter, use_parent_name })
     }
+}
+
+// ─── JPEG 2000 MCT detection ─────────────────────────────────────────────────
+
+/// Returns true when the J2K main-header COD marker has the Multiple Component
+/// Transform (MCT) flag set (SGcod byte 2 != 0).
+///
+/// When MCT is set, OpenJPEG applies the inverse ICT/RCT during decoding and
+/// the returned pixels are already in RGB — no manual colour conversion needed.
+/// When MCT is clear, OpenJPEG returns the raw transformed (YCbCr-like) values
+/// and the caller must apply the inverse transform manually.
+///
+/// Some DICOM encoders encode YBR_ICT frames with MCT=1 in the COD marker
+/// (letting OpenJPEG reverse it) while other frames in the same series have
+/// MCT=0 (requiring manual reversal).  Checking per-frame avoids the mosaic
+/// pattern that results from applying the conversion unconditionally.
+fn j2k_mct_is_set(data: &[u8]) -> bool {
+    // J2K codestream layout: SOC (FF 4F) followed by marker segments.
+    // Each segment: FF <code> <Lseg-hi> <Lseg-lo> <payload...>
+    // Lseg includes the 2 length bytes but NOT the 2-byte marker itself.
+    // COD marker = FF 52; SOT marker = FF 90 (end of main header).
+    if data.len() < 2 { return false; }
+    // Skip SOC (FF 4F) if present.
+    let mut i: usize = if data[0] == 0xFF && data[1] == 0x4F { 2 } else { 0 };
+    while i + 1 < data.len() {
+        if data[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let code = data[i + 1];
+        // SOT marks the end of the main header; COD will not appear after it.
+        if code == 0x90 { break; }
+        // COD: FF 52 | Lcod(2) | Scod(1) | SGcod: prog(1) layers(2) MCT(1)
+        // MCT flag is at byte offset 8 from the start of the FF marker byte.
+        if code == 0x52 {
+            return i + 8 < data.len() && data[i + 8] != 0;
+        }
+        // Skip over this marker segment using its length field.
+        if i + 3 < data.len() {
+            let seg_len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
+            i += 2 + seg_len;
+        } else {
+            break;
+        }
+    }
+    false
 }
 
 // ─── JPEG subsampling detection ──────────────────────────────────────────────
@@ -1490,10 +1540,23 @@ fn write_resampled_tiff(
     // ── Color space from the base level ───────────────────────────────────
     let first_dcm   = dicom::object::open_file(&base.file_path).unwrap();
     let color_space = infer_color_space(&first_dcm);
-    // turbojpeg::compress with PixelFormat::RGB converts RGB→YCbCr internally
-    // (standard JPEG behavior), so the output tiles are YCbCr-encoded JPEG.
-    // Tag color IFDs as PHOTOMETRIC_YCBCR with the matching subsampling
-    // factor (Sub2x2 = 4:2:0 → [2,2]) so viewers decode the JPEG correctly.
+    let icc_profile = extract_icc_profile(&first_dcm);
+
+    // The jp2k crate (OpenJPEG) does NOT automatically reverse the JPEG 2000
+    // Irreversible/Reversible Color Transform for DICOM tiles.  When DICOM
+    // PhotometricInterpretation is YBR_ICT or YBR_RCT the decoded component
+    // values are still in the transformed YCbCr-like space; we must apply the
+    // inverse transform manually before feeding pixels to turbojpeg.
+    let src_photometric_interp = first_dcm.element_by_name("PhotometricInterpretation")
+        .ok()
+        .and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
+        .unwrap_or_default();
+    let jp2k_has_ict_rct = matches!(src_photometric_interp.as_str(), "YBR_ICT" | "YBR_RCT");
+
+    // turbojpeg always produces JFIF JPEG (YCbCr encoded internally), regardless
+    // of the source color space.  PHOTOMETRIC_YCBCR is the standard convention
+    // for JFIF JPEG tiles in TIFF (used by libvips and other WSI tools) and is
+    // correctly handled by OpenSlide / Bio-Formats without double-conversion.
     let (photometric, spp): (u32, u32) = match color_space {
         ColorSpace::Grayscale => (PHOTOMETRIC_MINISBLACK as u32, 1),
         _                     => (PHOTOMETRIC_YCBCR      as u32, 3),
@@ -1641,12 +1704,16 @@ fn write_resampled_tiff(
                             } else {
                                 buf.buffer
                             };
-                            // Convert YCbCr → RGB if DICOM PhotometricInterpretation is YBR_FULL.
-                            // jp2k decodes the raw codestream components without applying a color
-                            // transform (YBR_ICT/RCT are reversed by OpenJPEG internally, but
-                            // YBR_FULL data is stored as-is). Without this step the Y/Cb/Cr bytes
-                            // would be fed to turbojpeg as RGB, resulting in a double conversion.
-                            if color_space == ColorSpace::YCbCr && spp == 3 {
+                            // Convert YCbCr → RGB when the decoded components are not yet in
+                            // RGB space:
+                            //   YBR_FULL   — jp2k returns raw YCbCr (no transform applied)
+                            //   YBR_ICT/RCT — OpenJPEG does NOT reverse the JPEG 2000 color
+                            //                 transform for DICOM tiles; the values are still in
+                            //                 the ICT/RCT-transformed (YCbCr-like) space.
+                            // Without this step the YCbCr bytes would be fed to turbojpeg as
+                            // RGB, yielding a double color-space conversion and completely wrong
+                            // colors in the output.
+                            if (color_space == ColorSpace::YCbCr || jp2k_has_ict_rct) && spp == 3 {
                                 for chunk in pixels.chunks_mut(3) {
                                     let y  = chunk[0] as f32;
                                     let cb = chunk[1] as f32 - 128.0;
@@ -1770,6 +1837,10 @@ fn write_resampled_tiff(
         if let Some(ref desc) = image_desc_c {
             TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
         }
+        if let Some(ref icc) = icc_profile {
+            TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                icc.len() as u32, icc.as_ptr() as *const c_void);
+        }
 
         write_level_tiles(tiff, lv0);
         TIFFWriteDirectory(tiff);
@@ -1838,18 +1909,30 @@ fn convert_one_series(
     let src_mpp       = slide_levels_owned[0].mpp_x.unwrap_or(0.25);
     let effective_mpp = args.mpp.filter(|&t| t > src_mpp);
 
+    // Resolve the stem used for the output filename.
+    let file_stem: String = if args.use_parent_name {
+        Path::new(&slide_levels_owned[0].file_path)
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            .unwrap_or(series_id.as_str())
+            .to_string()
+    } else {
+        series_id.clone()
+    };
+
     let output_path = if effective_mpp.is_some() {
         if args.legacy {
-            format!("{}/{}.tiff", args.output_dir, series_id)
+            format!("{}/{}.tiff", args.output_dir, file_stem)
         } else {
-            format!("{}/{}.ome.tiff", args.output_dir, series_id)
+            format!("{}/{}.ome.tiff", args.output_dir, file_stem)
         }
     } else if args.legacy && is_jpeg2000(&comp) {
-        format!("{}/{}.svs", args.output_dir, series_id)
+        format!("{}/{}.svs", args.output_dir, file_stem)
     } else if args.legacy {
-        format!("{}/{}.tiff", args.output_dir, series_id)
+        format!("{}/{}.tiff", args.output_dir, file_stem)
     } else {
-        format!("{}/{}.ome.tiff", args.output_dir, series_id)
+        format!("{}/{}.ome.tiff", args.output_dir, file_stem)
     };
 
     // Build progress bar message: "(idx) filename", truncated to fit.
