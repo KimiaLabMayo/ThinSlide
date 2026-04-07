@@ -1669,6 +1669,12 @@ fn write_resampled_tiff(
                 Vec::new()
             };
 
+            // Buffer all encoded tiles for this DICOM level; write in one
+            // sequential pass after encoding completes.  On HDD this avoids
+            // alternating between CPU-bound encoding and I/O-bound writes,
+            // letting the write phase stream data without stalls.
+            let mut level_tiles: Vec<(u32, Vec<u8>)> = Vec::with_capacity(n_frames as usize);
+
             for chunk in frame_ids.chunks(chunk_size) {
                 // Parallel: decode → resize → JPEG encode.
                 // Returns Some((tile_num, jpeg_bytes)) on success, None on error.
@@ -1813,18 +1819,23 @@ fn write_resampled_tiff(
                     })
                     .collect();
 
-                // ── 4. Sequential write: TIFFWriteRawTile (~memcpy) ──────
+                // Accumulate encoded tiles; update progress bar per tile.
                 for item in encoded {
-                    if let Some((tile_num, jpeg_bytes)) = item {
-                        unsafe {
-                            TIFFWriteRawTile(
-                                tiff, tile_num,
-                                jpeg_bytes.as_ptr() as *mut c_void,
-                                jpeg_bytes.len() as i64,
-                            );
-                        }
-                    }
+                    if let Some(pair) = item { level_tiles.push(pair); }
                     if let Some(p) = pb { p.inc(1); }
+                }
+            }
+
+            // Sort by tile_num so writes are in file-offset order (sequential
+            // stream on HDD; no extra seeks between tiles).
+            level_tiles.sort_unstable_by_key(|(n, _)| *n);
+            for (tile_num, jpeg_bytes) in &level_tiles {
+                unsafe {
+                    TIFFWriteRawTile(
+                        tiff, *tile_num,
+                        jpeg_bytes.as_ptr() as *mut c_void,
+                        jpeg_bytes.len() as i64,
+                    );
                 }
             }
         }
@@ -2062,10 +2073,12 @@ fn convert_one_series(
 
 pub fn run(args: Args) {
     if let Some(n) = args.jobs {
-        rayon::ThreadPoolBuilder::new()
+        // Ignore AlreadyBuilt errors: a dependency may have initialised the
+        // global pool already.  In that case we accept whatever thread count
+        // rayon chose and proceed.
+        let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(n)
-            .build_global()
-            .expect("Failed to build Rayon thread pool");
+            .build_global();
     }
 
     if args.verbose {

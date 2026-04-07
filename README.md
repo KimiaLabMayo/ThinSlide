@@ -75,7 +75,7 @@ dcm2tiff <input_dir> <output_dir> [OPTIONS]
 | Option | Description | Default |
 |---|---|---|
 | `--legacy` | Write SVS or BigTIFF instead of OME-TIFF (format chosen by compression type) | off |
-| `-j` / `--jobs <N>` | Number of parallel threads | all CPUs |
+| `-j` / `--jobs <N>` | Number of parallel threads (see [Parallelism](#parallelism)) | all CPUs |
 | `-v` / `--verbose` | Print input/output paths and scan summary | off |
 | `--mpp <N>` | Resample output to this resolution (µm/pixel). Triggers decode + resize + JPEG re-encode. Falls back to passthrough if `N` is finer than the source mpp. | off (passthrough) |
 | `--quality <N>` | JPEG quality for `--mpp` resampling (1–100) | 87 |
@@ -122,6 +122,44 @@ This is convenient when DICOM files are organised into per-case or per-slide sub
 # Use parent directory name as output filename (e.g. case001.ome.tiff)
 ./target/release/dcm2tiff /data/wsi_dicoms /data/output --use-parent-name
 ```
+
+## Parallelism
+
+`-j N` sets the number of threads, but its effect depends on the mode:
+
+### Resampling mode (`--mpp`)
+
+WSI series are processed **one at a time**. All `N` threads are used in parallel to decode, resize, and JPEG-encode the tiles within that single series. Only one output file is written at any moment, so there is no concurrent seeking even on HDD.
+
+```
+Series A  ────[tile decode / resize / encode, N threads]──── write ──► done
+Series B  ──────────────────────────────────────────────[tile decode / resize / encode, N threads]──── write ──► done
+```
+
+Use a higher `-j` (or the default, all CPUs) to maximise encoding throughput. Reducing `-j` in resampling mode only slows down tile encoding with no I/O benefit.
+
+### Passthrough mode (default, no `--mpp`)
+
+Up to `N` series are processed **concurrently**, each writing its own output file simultaneously. This overlaps I/O across series, which benefits SSD but causes random seeking on HDD.
+
+```
+Series A  ──[read raw tiles]──[write TIFF]──────────────────────────────────► done
+Series B          ──[read raw tiles]──[write TIFF]──────────────────────────► done
+Series C                  ──[read raw tiles]──[write TIFF]──────────────────► done
+```
+
+**On HDD**, use `-j 1` to process series sequentially and avoid concurrent seeking:
+
+```sh
+./target/release/dcm2tiff /data/wsi_dicoms /data/hdd_output -j 1
+```
+
+### Summary
+
+| Mode | `-j N` controls | Recommended for HDD |
+|---|---|---|
+| `--mpp` (resampling) | Tile-level parallelism (decode + resize + encode) | Default (all CPUs) is fine |
+| Passthrough (default) | Number of series processed concurrently | `-j 1` to avoid seek contention |
 
 ## Resampling mode (`--mpp`)
 
