@@ -61,6 +61,26 @@ enum CompressionType {
     Unknown,
 }
 
+// for printing debug info (fmt)
+impl std::fmt::Display for CompressionType {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        let s = match self {
+            CompressionType::JpegBaseline => "JPEG Baseline",
+            CompressionType::JpegExtended => "JPEG Extended Sequential",
+            CompressionType::JpegLossless => "JPEG Lossless",
+            CompressionType::JpegLosslessNonHierarchical => "JPEG Lossless Non-Hierarchical",
+            CompressionType::JpegLSLossless => "JPEG-LS Lossless",
+            CompressionType::JpegLSNearLossless => "JPEG-LS Near-Lossless",
+            CompressionType::Jpeg2000Lossless => "JPEG 2000 Lossless",
+            CompressionType::Jpeg2000 => "JPEG 2000",
+            CompressionType::Jpeg2000Part2MulticomponentLossless => "JPEG 2000 Part 2 Multicomponent Lossless",
+            CompressionType::Jpeg2000Part2Multicomponent => "JPEG 2000 Part 2 Multicomponent",
+            CompressionType::Unknown => "Unknown/Uncompressed",
+        };
+        write!(f, "{}", s)
+    }
+}
+
 fn map_transfer_syntax_to_compression(transfer_syntax_uid: &str) -> CompressionType {
     match transfer_syntax_uid {
         "1.2.840.10008.1.2.4.50" => CompressionType::JpegBaseline,
@@ -432,52 +452,6 @@ impl Args {
         let output_dir = positional.get(1).ok_or("Didn't get an output directory path")?.to_string();
         Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter, use_parent_name })
     }
-}
-
-// ─── JPEG 2000 MCT detection ─────────────────────────────────────────────────
-
-/// Returns true when the J2K main-header COD marker has the Multiple Component
-/// Transform (MCT) flag set (SGcod byte 2 != 0).
-///
-/// When MCT is set, OpenJPEG applies the inverse ICT/RCT during decoding and
-/// the returned pixels are already in RGB — no manual colour conversion needed.
-/// When MCT is clear, OpenJPEG returns the raw transformed (YCbCr-like) values
-/// and the caller must apply the inverse transform manually.
-///
-/// Some DICOM encoders encode YBR_ICT frames with MCT=1 in the COD marker
-/// (letting OpenJPEG reverse it) while other frames in the same series have
-/// MCT=0 (requiring manual reversal).  Checking per-frame avoids the mosaic
-/// pattern that results from applying the conversion unconditionally.
-fn j2k_mct_is_set(data: &[u8]) -> bool {
-    // J2K codestream layout: SOC (FF 4F) followed by marker segments.
-    // Each segment: FF <code> <Lseg-hi> <Lseg-lo> <payload...>
-    // Lseg includes the 2 length bytes but NOT the 2-byte marker itself.
-    // COD marker = FF 52; SOT marker = FF 90 (end of main header).
-    if data.len() < 2 { return false; }
-    // Skip SOC (FF 4F) if present.
-    let mut i: usize = if data[0] == 0xFF && data[1] == 0x4F { 2 } else { 0 };
-    while i + 1 < data.len() {
-        if data[i] != 0xFF {
-            i += 1;
-            continue;
-        }
-        let code = data[i + 1];
-        // SOT marks the end of the main header; COD will not appear after it.
-        if code == 0x90 { break; }
-        // COD: FF 52 | Lcod(2) | Scod(1) | SGcod: prog(1) layers(2) MCT(1)
-        // MCT flag is at byte offset 8 from the start of the FF marker byte.
-        if code == 0x52 {
-            return i + 8 < data.len() && data[i + 8] != 0;
-        }
-        // Skip over this marker segment using its length field.
-        if i + 3 < data.len() {
-            let seg_len = u16::from_be_bytes([data[i + 2], data[i + 3]]) as usize;
-            i += 2 + seg_len;
-        } else {
-            break;
-        }
-    }
-    false
 }
 
 // ─── JPEG subsampling detection ──────────────────────────────────────────────
@@ -1463,6 +1437,7 @@ fn write_resampled_tiff(
     // When false: flat pyramidal BigTIFF (sequential IFDs, no OME-XML).
     ome: bool,
     pb: Option<&ProgressBar>,
+    verbose: bool,
 ) {
 
     // ── Group DICOM files by resolution level ─────────────────────────────
@@ -1481,7 +1456,14 @@ fn write_resampled_tiff(
     let base      = groups[0][0];
     let base_w    = base.px_columns.unwrap_or(0);
     let base_h    = base.px_rows.unwrap_or(0);
+    if verbose {
+        println!("Base level: {}x{} px, MPP={:.6} µm/px, tile size={:?}",
+            base_w, base_h, base.mpp_x.unwrap_or(0.25), base.tile_size);
+    }
     let (in_tile_w, in_tile_h) = base.tile_size.unwrap_or((base_w, base_h));
+    if verbose {
+        println!("Input tile size: {}x{} px", in_tile_w, in_tile_h);
+    }
     let src_mpp_x = base.mpp_x.unwrap_or(0.25);
     let src_mpp_y = base.mpp_y.unwrap_or(src_mpp_x);
 
@@ -1489,9 +1471,18 @@ fn write_resampled_tiff(
     let out_tile_w = nearest_16(in_tile_w as f64 * src_mpp_x / target_mpp);
     let out_tile_h = nearest_16(in_tile_h as f64 * src_mpp_y / target_mpp);
 
+    if verbose {
+        println!("Output tile size: {}x{} px", out_tile_w, out_tile_h);
+    }
+
     // Actual scale after rounding (used uniformly for every level).
     let actual_scale_x = out_tile_w as f64 / in_tile_w as f64;
     let actual_scale_y = out_tile_h as f64 / in_tile_h as f64;
+
+    if verbose {
+        println!("Actual scale factor: {:.4}x ({} µm/px → {} µm/px)",
+            actual_scale_x, src_mpp_x, src_mpp_x * in_tile_w as f64 / out_tile_w as f64);
+    }
 
     // ── Determine which groups produce an active pyramid level ─────────────
     // A level is active if its longer output side meets the minimum threshold.
@@ -1535,12 +1526,27 @@ fn write_resampled_tiff(
     let total_tiles: u64 = active_levels.iter().map(|lv| {
         lv.group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum::<u64>()
     }).sum();
+    if verbose {
+        println!("Total active levels: {}, total tiles: {}", active_levels.len(), total_tiles);
+    }
     if let Some(p) = pb { p.set_length(total_tiles); }
 
     // ── Color space from the base level ───────────────────────────────────
     let first_dcm   = dicom::object::open_file(&base.file_path).unwrap();
     let color_space = infer_color_space(&first_dcm);
+
+    if verbose {
+        println!("Inferred color space: {}", color_space);
+    }
+
     let icc_profile = extract_icc_profile(&first_dcm);
+    if verbose {
+        if let Some(profile) = &icc_profile {
+            println!("Extracted ICC profile: {} bytes", profile.len());
+        } else {
+            println!("No ICC profile found in the base level.");
+        }
+    }
 
     // The jp2k crate (OpenJPEG) does NOT automatically reverse the JPEG 2000
     // Irreversible/Reversible Color Transform for DICOM tiles.  When DICOM
@@ -1551,7 +1557,18 @@ fn write_resampled_tiff(
         .ok()
         .and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
         .unwrap_or_default();
+    if verbose {
+        println!("Source PhotometricInterpretation: {}", src_photometric_interp);
+    }
+
     let jp2k_has_ict_rct = matches!(src_photometric_interp.as_str(), "YBR_ICT" | "YBR_RCT");
+    if verbose {
+        if jp2k_has_ict_rct {
+            println!("JPEG 2000 source has YBR_ICT/YBR_RCT photometric interpretation; will apply inverse color transform after decoding.");
+        } else {
+            println!("JPEG 2000 source does not have YBR_ICT/YBR_RCT photometric interpretation; no color transform needed after decoding.");
+        }
+    }
 
     // turbojpeg always produces JFIF JPEG (YCbCr encoded internally), regardless
     // of the source color space.  PHOTOMETRIC_YCBCR is the standard convention
@@ -1634,6 +1651,14 @@ fn write_resampled_tiff(
                 | CompressionType::Jpeg2000Part2MulticomponentLossless
                 | CompressionType::Jpeg2000Part2Multicomponent
             );
+
+            if verbose && is_jpeg_src {
+                println!("Level {}: detected JPEG source", lv.out_img_w);
+            }
+            if verbose && is_jp2k_src {
+                println!("Level {}: detected JPEG 2000 source", lv.out_img_w);
+            }
+
             let raw_fragments: Vec<Vec<u8>> = if is_jpeg_src || is_jp2k_src {
                 let px = dicom_obj.element_by_name("PixelData").expect("No PixelData");
                 px.fragments().expect("Not encapsulated pixel data")
@@ -1675,45 +1700,57 @@ fn write_resampled_tiff(
                             };
                             (dec_pixels, dec_w, dec_h)
                         } else if is_jp2k_src {
-                            // JP2K: decode only the DWT resolution levels needed (n_reduce).
-                            // Pixels decoded = ceil(W/2^n) × ceil(H/2^n) instead of W×H.
+                            // JP2K: use jpeg2k crate which correctly reads per-component
+                            // dimensions, allowing proper chroma upsampling for 4:2:2 / 4:2:0
+                            // subsampled sources (e.g. YBR_ICT DICOM WSI tiles).
                             let frag = raw_fragments.get(frame_idx as usize)?;
-                            // DICOM JP2K frames are raw J2K codestreams (magic: FF 4F FF 51)
-                            let stream = jp2k::Stream::from_bytes(frag)
-                                .map_err(|e| eprintln!("  [warn] frame {}: jp2k stream error: {}", frame_idx, e))
-                                .ok()?;
-                            let codec = jp2k::Codec::create(jp2k::CODEC_FORMAT::OPJ_CODEC_J2K)
-                                .map_err(|e| eprintln!("  [warn] frame {}: jp2k codec error: {}", frame_idx, e))
-                                .ok()?;
-                            let decode_params = jp2k::DecodeParams::default().with_reduce_factor(n_reduce);
-                            let buf = jp2k::ImageBuffer::build(codec, stream, decode_params)
+                            let params = jpeg2k::DecodeParameters::default().reduce(n_reduce);
+                            let j2k_img = jpeg2k::Image::from_bytes_with(frag, params)
                                 .map_err(|e| eprintln!("  [warn] frame {}: jp2k decode failed: {}", frame_idx, e))
                                 .ok()?;
-                            let (w, h) = (buf.width, buf.height);
-                            // Normalize to the expected number of channels (spp)
-                            let mut pixels: Vec<u8> = if spp == 1 && buf.num_bands == 1 {
-                                buf.buffer
-                            } else if spp == 3 && buf.num_bands == 3 {
-                                buf.buffer
-                            } else if spp == 3 && buf.num_bands == 4 {
-                                // RGBA -> RGB: drop alpha channel
-                                buf.buffer.chunks(4).flat_map(|c| c[..3].iter().copied()).collect()
-                            } else if spp == 1 && buf.num_bands > 1 {
-                                // Color -> grayscale: take first channel
-                                buf.buffer.into_iter().step_by(buf.num_bands).collect()
+                            let comps = j2k_img.components();
+                            if comps.is_empty() { return None; }
+                            let luma_w = comps[0].width() as usize;
+                            let luma_h = comps[0].height() as usize;
+                            if luma_w == 0 || luma_h == 0 { return None; }
+
+                            let mut pixels: Vec<u8> = if spp == 1 || comps.len() < 3 {
+                                // Grayscale: just the luma component
+                                comps[0].data().iter()
+                                    .map(|v| (*v).clamp(0, 255) as u8)
+                                    .collect()
                             } else {
-                                buf.buffer
+                                let y_data  = comps[0].data();
+                                let cb_data = comps[1].data();
+                                let cr_data = comps[2].data();
+                                let cb_w = comps[1].width() as usize;
+                                let cb_h = comps[1].height() as usize;
+                                let cr_w = comps[2].width() as usize;
+                                let cr_h = comps[2].height() as usize;
+
+                                let mut buf = Vec::with_capacity(luma_w * luma_h * 3);
+                                for row in 0..luma_h {
+                                    for col in 0..luma_w {
+                                        let y = y_data[row * luma_w + col].clamp(0, 255) as u8;
+                                        // Nearest-neighbor chroma upsampling to luma resolution
+                                        let cb_col = (col * cb_w / luma_w).min(cb_w.saturating_sub(1));
+                                        let cb_row = (row * cb_h / luma_h).min(cb_h.saturating_sub(1));
+                                        let cb = cb_data[cb_row * cb_w + cb_col].clamp(0, 255) as u8;
+                                        let cr_col = (col * cr_w / luma_w).min(cr_w.saturating_sub(1));
+                                        let cr_row = (row * cr_h / luma_h).min(cr_h.saturating_sub(1));
+                                        let cr = cr_data[cr_row * cr_w + cr_col].clamp(0, 255) as u8;
+                                        buf.extend_from_slice(&[y, cb, cr]);
+                                    }
+                                }
+                                buf
                             };
-                            // Convert YCbCr → RGB when the decoded components are not yet in
-                            // RGB space:
-                            //   YBR_FULL   — jp2k returns raw YCbCr (no transform applied)
-                            //   YBR_ICT/RCT — OpenJPEG does NOT reverse the JPEG 2000 color
-                            //                 transform for DICOM tiles; the values are still in
-                            //                 the ICT/RCT-transformed (YCbCr-like) space.
-                            // Without this step the YCbCr bytes would be fed to turbojpeg as
-                            // RGB, yielding a double color-space conversion and completely wrong
-                            // colors in the output.
-                            if (color_space == ColorSpace::YCbCr || jp2k_has_ict_rct) && spp == 3 {
+
+                            // Color transform: YCbCr → RGB when the decoded components are
+                            // in a YCbCr space:
+                            // YBR_ICT / YBR_RCT: apply ICT inverse (MCT=0 means OpenJPEG did
+                            //   not apply it; we must do so to obtain RGB).
+                            // YBR_FULL / YBR_FULL_422: OpenJPEG returns raw YCbCr.
+                            if (jp2k_has_ict_rct || color_space == ColorSpace::YCbCr) && spp == 3 {
                                 for chunk in pixels.chunks_mut(3) {
                                     let y  = chunk[0] as f32;
                                     let cb = chunk[1] as f32 - 128.0;
@@ -1723,7 +1760,7 @@ fn write_resampled_tiff(
                                     chunk[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
                                 }
                             }
-                            (pixels, w, h)
+                            (pixels, luma_w as u32, luma_h as u32)
                         } else {
                             // Other transfer syntaxes: fall back to dicom-pixeldata decoder.
                             let decoded = match dicom_obj.decode_pixel_data_frame(frame_idx) {
@@ -1749,7 +1786,6 @@ fn write_resampled_tiff(
 
                         let tile_num = tile_indices.get(frame_idx as usize).copied()
                             .unwrap_or(frame_idx);
-
                         // ── 3. JPEG encode with turbojpeg (SIMD) ─────────────
                         let jpeg_bytes = if spp == 1 {
                             let tj_img = turbojpeg::Image::<&[u8]> {
@@ -1830,7 +1866,6 @@ fn write_resampled_tiff(
         TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
         TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv0.actual_mpp_x);
         TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv0.actual_mpp_y);
-        // Sub2x2 = 4:2:0 chroma subsampling → YCbCrSubSampling [2, 2]
         if photometric == PHOTOMETRIC_YCBCR as u32 {
             TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
         }
@@ -1909,6 +1944,11 @@ fn convert_one_series(
     let src_mpp       = slide_levels_owned[0].mpp_x.unwrap_or(0.25);
     let effective_mpp = args.mpp.filter(|&t| t > src_mpp);
 
+    if args.verbose {
+        println!(" - Series {}: {} levels \n - Src MPP: {:.4} µm/px \n - Compression: {} \n - Effective MPP: {:?}",
+            series_id, slide_levels_owned.len(), src_mpp, comp, effective_mpp);
+    }
+
     // Resolve the stem used for the output filename.
     let file_stem: String = if args.use_parent_name {
         Path::new(&slide_levels_owned[0].file_path)
@@ -1965,11 +2005,15 @@ fn convert_one_series(
     let tmp_path = format!("{}.tmp", output_path);
 
     if let Some(target_mpp) = effective_mpp {
+        if args.verbose {
+            println!("  [resample] Requested MPP: {:.4} µm/px", target_mpp);
+        }
         write_resampled_tiff(
             &slide_levels_owned, &tmp_path,
             target_mpp, args.quality, args.filter,
             !args.legacy,
             Some(&pb),
+            args.verbose,
         );
     } else if args.legacy {
         if is_jpeg2000(&comp) {
@@ -2026,6 +2070,9 @@ pub fn run(args: Args) {
         let p = entry.path();
         if p.extension().map_or(false, |e| e == "tmp") {
             let _ = std::fs::remove_file(&p);
+            if args.verbose {
+                println!("Removed stale tmp file: {}", p.display());
+            }
         }
     }
 
@@ -2124,11 +2171,17 @@ pub fn run(args: Args) {
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
             if args_ref.mpp.is_some() {
+                if args.verbose {
+                    println!("Resampling mode");
+                }
                 // Resampling: CPU-bound (decode + resize + encode).
                 // Process one WSI at a time so all n_jobs threads concentrate on
                 // tile-level parallelism inside write_resampled_tiff.
                 convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
             } else {
+                if args.verbose {
+                    println!("Passthrough mode");
+                }
                 // Passthrough: I/O-bound (raw fragment copy).
                 // Spawn multiple WSIs in parallel to overlap I/O across slides.
                 s.spawn(move |_| {

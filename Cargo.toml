@@ -11,7 +11,7 @@ pkg-config = "0.3"
 rayon = "1"
 turbojpeg = "1"
 fast_image_resize = "4"
-jp2k = "0.3"
+jpeg2k = { version = "0.10", features = ["openjp2"], default-features = false }
 indicatif = "0.17"
 dicom = "0.9.0"
 dicom-core = "0.9.0"
