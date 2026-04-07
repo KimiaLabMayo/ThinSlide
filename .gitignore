@@ -4,5 +4,6 @@
 *.dcm
 *.tif
 *.svs
+*.tmp
 
 .DS_Store

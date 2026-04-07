@@ -1942,7 +1942,20 @@ fn convert_one_series(
     let ts_uid        = &slide_levels_owned[0].transfer_syntax_uid;
     let comp          = map_transfer_syntax_to_compression(ts_uid);
     let src_mpp       = slide_levels_owned[0].mpp_x.unwrap_or(0.25);
-    let effective_mpp = args.mpp.filter(|&t| t > src_mpp);
+
+    // if effective_mpp/src_mpp is <10% difference, treat as effectively the same to avoid unnecessary resampling.
+    let mut effective_mpp = args.mpp.filter(|&t| t > src_mpp);
+    if let Some(val) = effective_mpp {
+        if (val - src_mpp).abs() / src_mpp < 0.1 {
+            if args.verbose {
+                println!(
+                    "  [info] requested MPP {:.4} µm/px is within 10% of source MPP {:.4} µm/px; skipping resampling",
+                    val, src_mpp
+                );
+            }
+            effective_mpp = None;
+        }
+    }
 
     if args.verbose {
         println!(" - Series {}: {} levels \n - Src MPP: {:.4} µm/px \n - Compression: {} \n - Effective MPP: {:?}",
