@@ -1934,9 +1934,11 @@ fn write_resampled_tiff(
                 };
                 let spp_lv: u32 = if matches!(cs_lv, ColorSpace::Grayscale) { 1 } else { 3 };
 
-                eprintln!("  [passthrough] {}{}x{} @ {:.4} µm/px",
-                    if is_base { "" } else { "SubIFD " },
-                    lv.out_img_w, lv.out_img_h, lv.actual_mpp_x);
+                if verbose {
+                    eprintln!("  [passthrough] {}{}x{} @ {:.4} µm/px",
+                        if is_base { "" } else { "SubIFD " },
+                        lv.out_img_w, lv.out_img_h, lv.actual_mpp_x);
+                }
 
                 TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
                 TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      lv.out_img_w);
@@ -1995,10 +1997,12 @@ fn write_resampled_tiff(
                 }
             } else {
                 // ── Resample: decode → resize → JPEG re-encode ───────────
-                eprintln!("  [resample] {}{}x{} @ {:.4} µm/px  (tile {}x{} → {}x{})",
-                    if is_base { "" } else { "SubIFD " },
-                    lv.out_img_w, lv.out_img_h, lv.actual_mpp_x,
-                    lv.src_tile_w, lv.src_tile_h, lv.out_tile_w, lv.out_tile_h);
+                if verbose {
+                    eprintln!("  [resample] {}{}x{} @ {:.4} µm/px  (tile {}x{} → {}x{})",
+                        if is_base { "" } else { "SubIFD " },
+                        lv.out_img_w, lv.out_img_h, lv.actual_mpp_x,
+                        lv.src_tile_w, lv.src_tile_h, lv.out_tile_w, lv.out_tile_h);
+                }
 
                 TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
                 TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      lv.out_img_w);
@@ -2343,6 +2347,17 @@ pub fn run(args: Args) {
                 // Resampling: CPU-bound (decode + resize + encode).
                 // Process one WSI at a time so all n_jobs threads concentrate on
                 // tile-level parallelism inside write_resampled_tiff.
+                convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
+            } else if n_concurrent <= 1 {
+                if args.verbose {
+                    println!("Passthrough mode");
+                }
+                // n_concurrent == 1: run inline on the main thread.
+                // Spawning via s.spawn() and then blocking the calling thread on
+                // cvar.wait() inside rayon::scope can deadlock because the OS-level
+                // block prevents rayon's work-stealing from making progress.
+                // Inline execution is identical in behaviour to resampling mode
+                // (one WSI at a time, sequential) which is what -j 1 implies.
                 convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
             } else {
                 if args.verbose {
