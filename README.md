@@ -163,7 +163,21 @@ Series C                  ──[read raw tiles]──[write TIFF]────�
 
 ## Resampling mode (`--mpp`)
 
-When `--mpp <N>` is specified the tool decodes every tile and resizes it before writing. This is slower than passthrough but produces a new image at a controlled resolution, which is useful for reducing storage size.
+When `--mpp <N>` is specified the tool produces a new pyramidal image at the target resolution. For each output pyramid level the tool independently selects the closest existing input level as its source, then either copies tiles directly or decodes, resizes, and re-encodes them depending on how far the source MPP is from the target.
+
+### Per-level source selection
+
+Each output level has its own target MPP derived from the requested `--mpp` value scaled by the pyramid ratio. The input level whose MPP is closest to that target is used as the source for that level:
+
+- **Within 10 %**: tiles are copied as-is (passthrough — no decode/encode).
+- **More than 10 % away**: tiles are decoded, resized to the target size, and re-encoded as JPEG.
+
+Example with input levels at 0.25 / 0.5 / 1.0 / 2.0 µm/px and `--mpp 2.0`:
+
+```
+output level 0  target 2.0 µm/px  →  source 2.0 µm/px  (0 % diff)   → passthrough
+output level 1  target 4.0 µm/px  →  source 2.0 µm/px  (50 % diff)  → resample
+```
 
 ### Resampling filter (`--filter`)
 
@@ -179,26 +193,23 @@ When `--mpp <N>` is specified the tool decodes every tile and resizes it before 
 
 ### How the output resolution is determined
 
-Note that the mpp of the output image might differ slightly from the requested `--mpp` due to tile size rounding. This program resize the each tile to a size that is a multiple of 16 pixels in each dimension.
-
-Given an input tile size (`in_tile_w × in_tile_h`), source mpp (`source_mpp`), and requested mpp (`requested_mpp`), the target mpp will be calculated as follow:
+The output MPP may differ slightly from the requested value due to tile-size rounding. Each output level computes its tile size independently from its chosen source level:
 
 ```
-target_tile_size = nearest_multiple_of_16( in_tile_size × source_mpp / requested_mpp )
-target_mpp = source_mpp × in_tile_size / target_tile_size
+target_tile_size = nearest_multiple_of_16( source_tile_size × source_mpp / target_mpp )
+actual_mpp = source_mpp × source_tile_size / target_tile_size
 ```
 
 This value is written into the TIFF `XResolution`/`YResolution` tags and into the OME-XML `PhysicalSizeX/Y` attributes, so viewers report the correct pixel size.
 
-
 ### Fallback behaviour
 
-If the requested `--mpp` is smaller (finer) than the source resolution, the tool falls back to passthrough mode rather than inventing detail that does not exist in the source data.
+If the requested `--mpp` is smaller (finer) than the base source resolution, the tool falls back to full passthrough mode rather than inventing detail that does not exist in the source data.
 
 ```
 source mpp: 0.25 µm/px
 --mpp 0.1       → fallback to passthrough (0.1 < 0.25)
---mpp 0.25      → fallback to passthrough (equal)
+--mpp 0.25      → fallback to passthrough (within 10 %)
 --mpp 0.5       → resample  (0.5 > 0.25)
 ```
 

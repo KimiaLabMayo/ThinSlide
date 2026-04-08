@@ -25,6 +25,7 @@ use bindings::{
 use std::ffi::CString;
 use std::os::raw::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, Condvar};
 use std::sync::mpsc;
 use std::time::Duration;
 use rayon::prelude::*;
@@ -1467,54 +1468,98 @@ fn write_resampled_tiff(
     let src_mpp_x = base.mpp_x.unwrap_or(0.25);
     let src_mpp_y = base.mpp_y.unwrap_or(src_mpp_x);
 
-    // Output tile size: nearest multiple of 16 to the scaled base tile.
-    let out_tile_w = nearest_16(in_tile_w as f64 * src_mpp_x / target_mpp);
-    let out_tile_h = nearest_16(in_tile_h as f64 * src_mpp_y / target_mpp);
-
-    if verbose {
-        println!("Output tile size: {}x{} px", out_tile_w, out_tile_h);
-    }
-
-    // Actual scale after rounding (used uniformly for every level).
-    let actual_scale_x = out_tile_w as f64 / in_tile_w as f64;
-    let actual_scale_y = out_tile_h as f64 / in_tile_h as f64;
-
-    if verbose {
-        println!("Actual scale factor: {:.4}x ({} µm/px → {} µm/px)",
-            actual_scale_x, src_mpp_x, src_mpp_x * in_tile_w as f64 / out_tile_w as f64);
-    }
-
     // ── Determine which groups produce an active pyramid level ─────────────
-    // A level is active if its longer output side meets the minimum threshold.
+    // For each output level i, find the input group whose MPP is closest to
+    // the level's target output MPP.  If the closest group is within 10% →
+    // passthrough (raw tile copy); otherwise resample (decode→resize→encode).
     struct LevelInfo<'a> {
-        group:     &'a Vec<&'a DcmMetadata>,
-        out_img_w: u32,
-        out_img_h: u32,
-        // input tile size for this level (may differ from base)
-        in_tw:     u32,
-        in_th:     u32,
+        src_group:    &'a Vec<&'a DcmMetadata>,  // chosen source (closest by MPP)
+        out_img_w:    u32,
+        out_img_h:    u32,
+        src_tile_w:   u32,                       // tile size in the chosen source group
+        src_tile_h:   u32,
+        out_tile_w:   u32,                       // tile size written to the output IFD
+        out_tile_h:   u32,
         actual_mpp_x: f64,
         actual_mpp_y: f64,
+        passthrough:  bool,
     }
 
-    let active_levels: Vec<LevelInfo> = groups.iter().filter_map(|group| {
-        let meta      = group[0];
-        let src_w     = meta.px_columns.unwrap_or(0);
-        let src_h     = meta.px_rows.unwrap_or(0);
-        let out_img_w = (src_w as f64 * actual_scale_x).round() as u32;
-        let out_img_h = (src_h as f64 * actual_scale_y).round() as u32;
+    let active_levels: Vec<LevelInfo> = groups.iter().enumerate().filter_map(|(i, _)| {
+        // Target MPP for this output level: scale target_mpp by the ratio of
+        // this level's input MPP to the base level's MPP.
+        let group_mpp_x    = groups[i][0].mpp_x.unwrap_or(src_mpp_x);
+        let group_mpp_y    = groups[i][0].mpp_y.unwrap_or(src_mpp_y);
+        let target_lv_mpp_x = target_mpp * (group_mpp_x / src_mpp_x);
+        let target_lv_mpp_y = target_mpp * (group_mpp_y / src_mpp_y);
+
+        // Find the input group whose MPP is closest to target_lv_mpp_x.
+        let chosen = groups.iter()
+            .min_by(|a, b| {
+                let ma = a[0].mpp_x.unwrap_or(src_mpp_x);
+                let mb = b[0].mpp_x.unwrap_or(src_mpp_x);
+                (ma - target_lv_mpp_x).abs()
+                    .partial_cmp(&(mb - target_lv_mpp_x).abs()).unwrap()
+            })
+            .unwrap();
+
+        let chosen_meta  = chosen[0];
+        let chosen_mpp_x = chosen_meta.mpp_x.unwrap_or(src_mpp_x);
+        let chosen_mpp_y = chosen_meta.mpp_y.unwrap_or(src_mpp_y);
+        let chosen_w     = chosen_meta.px_columns.unwrap_or(0);
+        let chosen_h     = chosen_meta.px_rows.unwrap_or(0);
+        let (chosen_tw, chosen_th) = chosen_meta.tile_size.unwrap_or((chosen_w, chosen_h));
+
+        // Passthrough if the closest group's MPP is within 10 % of target.
+        let diff = (chosen_mpp_x - target_lv_mpp_x).abs() / target_lv_mpp_x;
+        let mut passthrough = diff < 0.1;
+
+        // For JPEG sources with non-16-aligned tiles, raw copy is rejected by
+        // libtiff → fall back to resample so the level is still produced.
+        if passthrough {
+            let compr = tiff_compression_tag(&chosen_meta.transfer_syntax_uid);
+            if compr == 7 && !is_jpeg_tile_aligned(chosen_tw, chosen_th) {
+                passthrough = false;
+            }
+        }
+
+        let (out_img_w, out_img_h, out_tile_w, out_tile_h, actual_mpp_x, actual_mpp_y) =
+            if passthrough {
+                // No scaling: output dimensions equal the source dimensions.
+                (chosen_w, chosen_h, chosen_tw, chosen_th, chosen_mpp_x, chosen_mpp_y)
+            } else {
+                // Output tile size: nearest multiple of 16 from the chosen source.
+                let otw = nearest_16(chosen_tw as f64 * chosen_mpp_x / target_lv_mpp_x);
+                let oth = nearest_16(chosen_th as f64 * chosen_mpp_y / target_lv_mpp_y);
+                let scale_x = if chosen_tw > 0 { otw as f64 / chosen_tw as f64 } else { 1.0 };
+                let scale_y = if chosen_th > 0 { oth as f64 / chosen_th as f64 } else { 1.0 };
+                let oiw = (chosen_w as f64 * scale_x).round() as u32;
+                let oih = (chosen_h as f64 * scale_y).round() as u32;
+                let amx = if otw > 0 { chosen_mpp_x * chosen_tw as f64 / otw as f64 } else { chosen_mpp_x };
+                let amy = if oth > 0 { chosen_mpp_y * chosen_th as f64 / oth as f64 } else { chosen_mpp_y };
+                (oiw, oih, otw, oth, amx, amy)
+            };
+
         if out_img_w.max(out_img_h) < MIN_PYRAMID_SIDE {
-            eprintln!("  [skip] resampled level {}x{} → {}x{}: shorter than MIN_PYRAMID_SIDE ({})",
-                src_w, src_h, out_img_w, out_img_h, MIN_PYRAMID_SIDE);
+            eprintln!("  [skip] level {} (target {:.4} µm/px) → {}x{}: below MIN_PYRAMID_SIDE ({})",
+                i, target_lv_mpp_x, out_img_w, out_img_h, MIN_PYRAMID_SIDE);
             return None;
         }
-        let (in_tw, in_th) = meta.tile_size.unwrap_or((src_w, src_h));
-        let lv_mpp_x = meta.mpp_x.unwrap_or(src_mpp_x);
-        let lv_mpp_y = meta.mpp_y.unwrap_or(src_mpp_y);
-        // Actual stored mpp reflects the rounded tile size.
-        let actual_mpp_x = lv_mpp_x * in_tw as f64 / out_tile_w as f64;
-        let actual_mpp_y = lv_mpp_y * in_th as f64 / out_tile_h as f64;
-        Some(LevelInfo { group, out_img_w, out_img_h, in_tw, in_th, actual_mpp_x, actual_mpp_y })
+
+        if verbose {
+            eprintln!("  [{}] level {}: source {:.4} µm/px → output {:.4} µm/px ({}x{})",
+                if passthrough { "passthrough" } else { "resample" },
+                i, chosen_mpp_x, actual_mpp_x, out_img_w, out_img_h);
+        }
+
+        Some(LevelInfo {
+            src_group: chosen,
+            out_img_w, out_img_h,
+            src_tile_w: chosen_tw, src_tile_h: chosen_th,
+            out_tile_w, out_tile_h,
+            actual_mpp_x, actual_mpp_y,
+            passthrough,
+        })
     }).collect();
 
     if active_levels.is_empty() { return; }
@@ -1524,7 +1569,7 @@ fn write_resampled_tiff(
 
     // Total tile count across all active levels for the progress bar.
     let total_tiles: u64 = active_levels.iter().map(|lv| {
-        lv.group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum::<u64>()
+        lv.src_group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum::<u64>()
     }).sum();
     if verbose {
         println!("Total active levels: {}, total tiles: {}", active_levels.len(), total_tiles);
@@ -1588,7 +1633,7 @@ fn write_resampled_tiff(
         resampled_meta.px_rows    = Some(base_lv.out_img_h);
         resampled_meta.mpp_x      = Some(base_lv.actual_mpp_x);
         resampled_meta.mpp_y      = Some(base_lv.actual_mpp_y);
-        resampled_meta.tile_size  = Some((out_tile_w, out_tile_h));
+        resampled_meta.tile_size  = Some((base_lv.out_tile_w, base_lv.out_tile_h));
         Some(CString::new(generate_OME_XML(&[resampled_meta])).unwrap())
     } else {
         None
@@ -1622,18 +1667,18 @@ fn write_resampled_tiff(
     let write_level_tiles = |tiff: *mut TIFF, lv: &LevelInfo| {
         let chunk_size = (rayon::current_num_threads() * 4).max(1);
 
-        // JP2K reduce level: largest n such that 2^n <= min(in_tw/out_tile_w, in_th/out_tile_h).
-        // Decoding at this level yields ceil(in_tile / 2^n) pixels — far less work than full decode.
-        // Example: in_tw=256, out_tile_w=64 → scale_down=4 → n_reduce=2 (decode at 1/4 res).
-        let scale_down = (lv.in_tw as f64 / out_tile_w as f64)
-            .min(lv.in_th as f64 / out_tile_h as f64);
+        // JP2K reduce level: largest n such that 2^n <= min(src_tile_w/out_tile_w, …).
+        // Decoding at this level yields ceil(src_tile / 2^n) pixels — far less work than full decode.
+        // Example: src_tile_w=256, out_tile_w=64 → scale_down=4 → n_reduce=2 (decode at 1/4 res).
+        let scale_down = (lv.src_tile_w as f64 / lv.out_tile_w as f64)
+            .min(lv.src_tile_h as f64 / lv.out_tile_h as f64);
         let n_reduce: u32 = if scale_down > 1.0 { scale_down.log2().floor() as u32 } else { 0 };
 
-        for dcm_meta in lv.group.iter() {
+        for dcm_meta in lv.src_group.iter() {
             let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
             let src_ifd_w    = dcm_meta.px_columns.unwrap_or(0);
             let tile_indices = frame_to_tile_indices(
-                &dicom_obj, lv.in_tw, lv.in_th, src_ifd_w,
+                &dicom_obj, lv.src_tile_w, lv.src_tile_h, src_ifd_w,
             );
             let n_frames  = dcm_meta.n_frames.unwrap_or(0);
             let frame_ids: Vec<u32> = (0..n_frames).collect();
@@ -1786,7 +1831,7 @@ fn write_resampled_tiff(
                         let src_fir = fir::images::Image::from_vec_u8(
                             src_w, src_h, raw_pixels, fir_pixel_type,
                         ).ok()?;
-                        let mut dst_fir = fir::images::Image::new(out_tile_w, out_tile_h, fir_pixel_type);
+                        let mut dst_fir = fir::images::Image::new(lv.out_tile_w, lv.out_tile_h, fir_pixel_type);
                         fir::Resizer::new().resize(&src_fir, &mut dst_fir, &resize_opts).ok()?;
                         let resized_raw = dst_fir.into_vec();
 
@@ -1796,9 +1841,9 @@ fn write_resampled_tiff(
                         let jpeg_bytes = if spp == 1 {
                             let tj_img = turbojpeg::Image::<&[u8]> {
                                 pixels: &resized_raw,
-                                width:  out_tile_w as usize,
-                                pitch:  out_tile_w as usize,
-                                height: out_tile_h as usize,
+                                width:  lv.out_tile_w as usize,
+                                pitch:  lv.out_tile_w as usize,
+                                height: lv.out_tile_h as usize,
                                 format: turbojpeg::PixelFormat::GRAY,
                             };
                             turbojpeg::compress(tj_img, quality as i32, turbojpeg::Subsamp::Gray)
@@ -1806,9 +1851,9 @@ fn write_resampled_tiff(
                         } else {
                             let tj_img = turbojpeg::Image::<&[u8]> {
                                 pixels: &resized_raw,
-                                width:  out_tile_w as usize,
-                                pitch:  out_tile_w as usize * 3,
-                                height: out_tile_h as usize,
+                                width:  lv.out_tile_w as usize,
+                                pitch:  lv.out_tile_w as usize * 3,
+                                height: lv.out_tile_h as usize,
                                 format: turbojpeg::PixelFormat::RGB,
                             };
                             turbojpeg::compress(tj_img, quality as i32, turbojpeg::Subsamp::Sub2x2)
@@ -1847,75 +1892,128 @@ fn write_resampled_tiff(
             CString::new("w8").unwrap().as_ptr(), // BigTIFF
         );
 
-        // ── IFD 0: base (full resampled resolution) ───────────────────────
-        let lv0 = &active_levels[0];
-
-        eprintln!("  [resample] {}x{} @ {:.4} µm/px  →  {}x{} @ {:.4} µm/px  (tile {}x{} → {}x{})",
-            base_w, base_h, src_mpp_x,
-            lv0.out_img_w, lv0.out_img_h, lv0.actual_mpp_x,
-            in_tile_w, in_tile_h, out_tile_w, out_tile_h);
-
-        // For OME-TIFF: register the SubIFD chain before writing IFD 0.
-        // For flat TIFF: no SubIFD tag; pyramid levels are sequential IFDs.
+        // For OME-TIFF: register the SubIFD chain on IFD 0 before writing anything.
         if ome && n_subifds > 0 {
             let zeros: Vec<u64> = vec![0u64; n_subifds];
             TIFFSetField(tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr());
         }
 
-        TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     0u32);
-        TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      lv0.out_img_w);
-        TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     lv0.out_img_h);
-        TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       out_tile_w);
-        TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      out_tile_h);
-        TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     7u32); // JPEG
-        TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
-        TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
-        TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
-        TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
-        TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
-        TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
-        TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
-        TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv0.actual_mpp_x);
-        TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv0.actual_mpp_y);
-        if photometric == PHOTOMETRIC_YCBCR as u32 {
-            TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
-        }
-        if let Some(ref desc) = image_desc_c {
-            TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
-        }
-        if let Some(ref icc) = icc_profile {
-            TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                icc.len() as u32, icc.as_ptr() as *const c_void);
-        }
+        for (lv_idx, lv) in active_levels.iter().enumerate() {
+            let is_base: bool    = lv_idx == 0;
+            let subfile_type: u32 = if is_base { 0 } else { FILETYPE_REDUCEDIMAGE };
 
-        write_level_tiles(tiff, lv0);
-        TIFFWriteDirectory(tiff);
+            if lv.passthrough {
+                // ── Passthrough: raw tile copy ────────────────────────────
+                // Derive compression and photometric from the chosen source.
+                let meta      = lv.src_group[0];
+                let first_dcm = dicom::object::open_file(&meta.file_path).unwrap();
+                let cs_lv     = infer_color_space(&first_dcm);
+                let ts_uid    = first_dcm.meta().transfer_syntax();
+                let compr     = tiff_compression_tag(ts_uid);
+                let photo_lv: u32 = match cs_lv {
+                    ColorSpace::RGB       => PHOTOMETRIC_RGB      as u32,
+                    ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR    as u32,
+                    ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK as u32,
+                };
+                let spp_lv: u32 = if matches!(cs_lv, ColorSpace::Grayscale) { 1 } else { 3 };
 
-        // ── SubIFDs: remaining active levels ──────────────────────────────
-        for lv in &active_levels[1..] {
-            eprintln!("  [resample]   SubIFD {}x{} @ {:.4} µm/px",
-                lv.out_img_w, lv.out_img_h, lv.actual_mpp_x);
+                eprintln!("  [passthrough] {}{}x{} @ {:.4} µm/px",
+                    if is_base { "" } else { "SubIFD " },
+                    lv.out_img_w, lv.out_img_h, lv.actual_mpp_x);
 
-            TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     FILETYPE_REDUCEDIMAGE);
-            TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      lv.out_img_w);
-            TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     lv.out_img_h);
-            TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       out_tile_w);
-            TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      out_tile_h);
-            TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     7u32);
-            TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
-            TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
-            TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
-            TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
-            TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
-            TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
-            TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
-            TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv.actual_mpp_x);
-            TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv.actual_mpp_y);
-            if photometric == PHOTOMETRIC_YCBCR as u32 {
-                TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
+                TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
+                TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      lv.out_img_w);
+                TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     lv.out_img_h);
+                TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_align(lv.out_tile_w, 16));
+                TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_align(lv.out_tile_h, 16));
+                TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     compr);
+                TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photo_lv);
+                TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp_lv);
+                TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
+                TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
+                TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
+                TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
+                TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
+                TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv.actual_mpp_x);
+                TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv.actual_mpp_y);
+                if matches!(cs_lv, ColorSpace::YCbCr) {
+                    let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
+                    let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
+                    if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
+                        if let Some((h, v)) = detect_jpeg_subsampling(frag) {
+                            TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
+                        }
+                    }
+                }
+                if is_base {
+                    if let Some(ref desc) = image_desc_c {
+                        TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
+                    }
+                    if let Some(ref icc) = icc_profile {
+                        TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                            icc.len() as u32, icc.as_ptr() as *const c_void);
+                    }
+                }
+                drop(first_dcm);
+
+                // Write raw tiles from every DICOM file in the source group.
+                for dcm_meta in lv.src_group.iter() {
+                    let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+                    let ifd_w        = dcm_meta.px_columns.unwrap_or(0);
+                    let tile_indices = frame_to_tile_indices(
+                        &dicom_obj, lv.src_tile_w, lv.src_tile_h, ifd_w,
+                    );
+                    let px_elem   = dicom_obj.element_by_name("PixelData").expect("No PixelData");
+                    let fragments = px_elem.fragments().expect("Not encapsulated pixel data");
+                    for (fi, fragment) in fragments.iter().enumerate() {
+                        if !fragment.is_empty() {
+                            let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
+                            TIFFWriteRawTile(tiff, tile_num,
+                                fragment.as_ptr() as *mut c_void, fragment.len() as i64);
+                        }
+                    }
+                    if let Some(p) = pb {
+                        p.inc(dcm_meta.n_frames.unwrap_or(0) as u64);
+                    }
+                }
+            } else {
+                // ── Resample: decode → resize → JPEG re-encode ───────────
+                eprintln!("  [resample] {}{}x{} @ {:.4} µm/px  (tile {}x{} → {}x{})",
+                    if is_base { "" } else { "SubIFD " },
+                    lv.out_img_w, lv.out_img_h, lv.actual_mpp_x,
+                    lv.src_tile_w, lv.src_tile_h, lv.out_tile_w, lv.out_tile_h);
+
+                TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
+                TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      lv.out_img_w);
+                TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     lv.out_img_h);
+                TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       lv.out_tile_w);
+                TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      lv.out_tile_h);
+                TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     7u32); // JPEG
+                TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
+                TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
+                TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
+                TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
+                TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
+                TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
+                TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
+                TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv.actual_mpp_x);
+                TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv.actual_mpp_y);
+                if photometric == PHOTOMETRIC_YCBCR as u32 {
+                    TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
+                }
+                if is_base {
+                    if let Some(ref desc) = image_desc_c {
+                        TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
+                    }
+                    if let Some(ref icc) = icc_profile {
+                        TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                            icc.len() as u32, icc.as_ptr() as *const c_void);
+                    }
+                }
+
+                write_level_tiles(tiff, lv);
             }
 
-            write_level_tiles(tiff, lv);
             TIFFWriteDirectory(tiff);
         }
 
@@ -2194,6 +2292,12 @@ pub fn run(args: Args) {
     let skipped_ref = &skipped_count;
 
     rayon::scope(|s| {
+        // Semaphore: limit concurrent passthrough WSIs to the thread-pool size
+        // so the process does not open more files or hold more memory than
+        // the number of worker threads.
+        let n_concurrent = rayon::current_num_threads();
+        let sem: Arc<(Mutex<usize>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
+
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
             if args_ref.mpp.is_some() {
@@ -2209,9 +2313,23 @@ pub fn run(args: Args) {
                     println!("Passthrough mode");
                 }
                 // Passthrough: I/O-bound (raw fragment copy).
-                // Spawn multiple WSIs in parallel to overlap I/O across slides.
+                // Acquire a slot before spawning; release it when the task finishes.
+                // This keeps concurrent WSI count equal to the thread-pool size.
+                {
+                    let (lock, cvar) = &*sem;
+                    let mut active = lock.lock().unwrap();
+                    while *active >= n_concurrent {
+                        active = cvar.wait(active).unwrap();
+                    }
+                    *active += 1;
+                }
+                let sem_clone = Arc::clone(&sem);
                 s.spawn(move |_| {
                     convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
+                    let (lock, cvar) = &*sem_clone;
+                    let mut active = lock.lock().unwrap();
+                    *active -= 1;
+                    cvar.notify_one();
                 });
             }
         }
