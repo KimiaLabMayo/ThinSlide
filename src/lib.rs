@@ -2302,7 +2302,7 @@ pub fn run(args: Args) {
     let scanner = std::thread::spawn(move || {
         for files in dir_groups {
             let n = files.len() as u64;
-            let metas: Vec<DcmMetadata> = files.par_iter()
+            let metas: Vec<DcmMetadata> = files.iter()
                 .map(|p| extract_metadata(p))
                 .collect();
             meta_pb_clone.inc(n);
