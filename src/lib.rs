@@ -1077,8 +1077,10 @@ fn write_ome_tiff(
             // the TIFF tile declaration (after tile_align). If the JPEG dimensions are not multiples of 16,
             // this mismatch causes a "Bad value N for tileWidth/tileLength tag" error.
             if compr == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
-                eprintln!("  [skip] SubIFD ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
-                    ifd_width, ifd_height, tile_w, tile_h);
+                if verbose {
+                    eprintln!("  [skip] SubIFD ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
+                        ifd_width, ifd_height, tile_w, tile_h);
+                }
                 continue;
             }
 
@@ -2254,7 +2256,14 @@ pub fn run(args: Args) {
     }
     scan_pb.finish_and_clear();
 
-    let dir_groups: Vec<Vec<String>> = dir_map.into_values().collect();
+    // Sort files within each directory group by path, then sort groups by their
+    // directory path.  Sequential order matches typical filesystem layout and
+    // minimises head-seek on HDD while still benefiting SSD prefetch.
+    let mut dir_groups: Vec<Vec<String>> = dir_map
+        .into_iter()
+        .map(|(_, mut files)| { files.sort(); files })
+        .collect();
+    dir_groups.sort_by(|a, b| a[0].cmp(&b[0]));
     let total_files = total_file_count as u64;
 
     if args.verbose {
@@ -2283,10 +2292,15 @@ pub fn run(args: Args) {
 
     let (tx, rx) = mpsc::channel::<Vec<DcmMetadata>>();
 
-    // Scanner thread: process directories in parallel; send each WSI series.
+    // Scanner thread: process directory groups one at a time in sorted order.
+    // Serial group processing keeps disk access sequential (avoids inter-directory
+    // seeks); files within each group are still read in parallel because they
+    // reside in the same directory and are nearby on disk.
+    // Each completed series is sent immediately so conversion can begin before
+    // all metadata has been extracted.
     let meta_pb_clone = meta_pb.clone();
     let scanner = std::thread::spawn(move || {
-        dir_groups.into_par_iter().for_each_with(tx, |tx, files| {
+        for files in dir_groups {
             let n = files.len() as u64;
             let metas: Vec<DcmMetadata> = files.par_iter()
                 .map(|p| extract_metadata(p))
@@ -2304,8 +2318,8 @@ pub fn run(args: Args) {
             for (_, series_metas) in by_series {
                 tx.send(series_metas).ok();
             }
-        });
-        // All tx clones drop here, closing the channel.
+        }
+        // tx drops here, closing the channel.
     });
 
     // References shared across all rayon::scope tasks (safe: scope outlives them).
