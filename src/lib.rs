@@ -565,6 +565,7 @@ fn write_flat_multipage_tiff(
     slide_level_metadata_list: &[DcmMetadata],
     output_path: &str,
     pb: Option<&ProgressBar>,
+    verbose: bool,
 ) {
     // A single resolution level may be split across multiple DICOM SOP instances
     // (common for large slides). Group consecutive entries that share the same
@@ -598,10 +599,12 @@ fn write_flat_multipage_tiff(
             // Such levels provide no pyramid benefit and can have non-16-aligned
             // dimensions that libtiff rejects for JPEG tiles.
             if metadata.tile_size.is_none() {
-                eprintln!("  [skip] IFD {} ({}x{}): no tile size — single-tile level omitted",
-                    group_idx,
-                    metadata.px_columns.unwrap_or(0),
-                    metadata.px_rows.unwrap_or(0));
+                if verbose {
+                    eprintln!("  [info] IFD {} ({}x{}): no tile size — single-tile level included but may be incompatible with JPEG",
+                        group_idx,
+                        metadata.px_columns.unwrap_or(0),
+                        metadata.px_rows.unwrap_or(0));
+                }
                 continue;
             }
             let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
@@ -635,8 +638,10 @@ fn write_flat_multipage_tiff(
             // For JPEG passthrough, libtiff checks that the JPEG SOF header dimensions match the TIFF tile declaration.
             // If tiles are not multiples of 16, this mismatch causes an error, so we skip these levels.
             if compression == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
-                eprintln!("  [skip] IFD {} ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
-                    group_idx, ifd_width, ifd_height, tile_w, tile_h);
+                if verbose {
+                    eprintln!("  [skip] IFD {} ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
+                        group_idx, ifd_width, ifd_height, tile_w, tile_h);
+                }
                 continue;
             }
 
@@ -913,6 +918,7 @@ fn write_ome_tiff(
     _label_meta: Option<&DcmMetadata>,
     output_path: &str,
     pb: Option<&ProgressBar>,
+    verbose: bool,
 ) {
     // Group consecutive DcmMetadata entries that share the same total pixel
     // matrix dimensions into a single pyramid level (multi-file SOP instances).
@@ -1043,9 +1049,11 @@ fn write_ome_tiff(
         for (_sub_idx, group) in groups[1..].iter().enumerate() {
             let metadata  = group[0];
             if metadata.tile_size.is_none() {
-                eprintln!("  [skip] SubIFD ({}x{}): no tile size — single-tile level omitted",
-                    metadata.px_columns.unwrap_or(0),
-                    metadata.px_rows.unwrap_or(0));
+                if verbose {
+                    eprintln!("  [skip] SubIFD ({}x{}): no tile size — single-tile level omitted",
+                        metadata.px_columns.unwrap_or(0),
+                        metadata.px_rows.unwrap_or(0));
+                }
                 continue;
             }
             let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
@@ -1264,6 +1272,7 @@ fn write_svs(
     overview_meta: Option<&DcmMetadata>,
     output_path: &str,
     pb: Option<&ProgressBar>,
+    verbose: bool,
 ) {
     // Determine SVS compression code and photometric from the full-res level.
     // For JPEG2000 source use Aperio proprietary codes; for JPEG use standard 7.
@@ -1368,9 +1377,11 @@ fn write_svs(
         let base_cols = base.px_columns.unwrap_or(1) as f64;
         for (_i, level) in slide_levels[1..].iter().enumerate() {
             if level.tile_size.is_none() {
-                eprintln!("  [skip] SVS level ({}x{}): no tile size — single-tile level omitted",
-                    level.px_columns.unwrap_or(0),
-                    level.px_rows.unwrap_or(0));
+                if verbose {
+                    eprintln!("  [skip] SVS level ({}x{}): no tile size — single-tile level omitted",
+                        level.px_columns.unwrap_or(0),
+                        level.px_rows.unwrap_or(0));
+                }
                 continue;
             }
 
@@ -1378,9 +1389,11 @@ fn write_svs(
             // If tiles are not multiples of 16, this mismatch causes an error, so we skip these levels.
             let (lvl_tile_w, lvl_tile_h) = level.tile_size.unwrap();
             if svs_compression == 7 && !is_jpeg_tile_aligned(lvl_tile_w, lvl_tile_h) {
-                eprintln!("  [skip] SVS level ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
-                    level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
-                    lvl_tile_w, lvl_tile_h);
+                if verbose {
+                    eprintln!("  [skip] SVS level ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
+                        level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
+                        lvl_tile_w, lvl_tile_h);
+                }
                 continue;
             }
             let ds = base_cols / level.px_columns.unwrap_or(1) as f64;
@@ -1541,8 +1554,10 @@ fn write_resampled_tiff(
             };
 
         if out_img_w.max(out_img_h) < MIN_PYRAMID_SIDE {
-            eprintln!("  [skip] level {} (target {:.4} µm/px) → {}x{}: below MIN_PYRAMID_SIDE ({})",
-                i, target_lv_mpp_x, out_img_w, out_img_h, MIN_PYRAMID_SIDE);
+            if verbose {
+                eprintln!("  [skip] level {} (target {:.4} µm/px) → {}x{}: below MIN_PYRAMID_SIDE ({})",
+                    i, target_lv_mpp_x, out_img_w, out_img_h, MIN_PYRAMID_SIDE);
+            }
             return None;
         }
 
@@ -2146,9 +2161,15 @@ fn convert_one_series(
                 overview_meta.as_ref(),
                 &tmp_path,
                 Some(&pb),
+                args.verbose,
             );
         } else {
-            write_flat_multipage_tiff(&slide_levels_owned, &tmp_path, Some(&pb));
+            write_flat_multipage_tiff(
+                &slide_levels_owned,
+                &tmp_path,
+                Some(&pb),
+                args.verbose,
+            );
         }
     } else {
         write_ome_tiff(
@@ -2158,6 +2179,7 @@ fn convert_one_series(
             label_meta.as_ref(),
             &tmp_path,
             Some(&pb),
+            args.verbose,
         );
     }
 
