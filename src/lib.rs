@@ -2193,8 +2193,8 @@ fn convert_one_series(
         .expect("Failed to rename tmp file to output");
 
     let elapsed = convert_start.elapsed();
-    pb.finish_with_message(format!("{} {:.2}s",
-        pb_msg, elapsed.as_millis() as f64 / 1000.0));
+    mp.println(format!("  {} {:.2}s", pb_msg, elapsed.as_millis() as f64 / 1000.0)).ok();
+    pb.finish_and_clear();
 }
 
 pub fn run(args: Args) {
