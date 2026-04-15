@@ -12,6 +12,7 @@ use walkdir::WalkDir;
 use image::imageops::FilterType;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use fast_image_resize as fir;
+use jpeg2k;
 
 use wsi_tools::bindings::{
     TIFF,
@@ -40,6 +41,14 @@ use wsi_tools::bindings::{
     FILETYPE_REDUCEDIMAGE,
 };
 use wsi_tools::{tile_align, nearest_16, MIN_PYRAMID_SIDE, xml_escape};
+
+const COMPRESSION_APERIO_JP2_YCBCR: u32 = 33003;
+const COMPRESSION_APERIO_JP2_RGB: u32   = 33005;
+const COMPRESSION_JP2000: u32           = 34712;
+
+fn is_jp2k(c: u32) -> bool {
+    matches!(c, COMPRESSION_APERIO_JP2_YCBCR | COMPRESSION_APERIO_JP2_RGB | COMPRESSION_JP2000)
+}
 
 // ─── Args ─────────────────────────────────────────────────────────────────────
 
@@ -424,83 +433,115 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
             let n_tiles  = src_lv.n_tiles;
             let tile_ids: Vec<u32> = (0..n_tiles).collect();
 
+            let pix_size    = src_lv.tile_w as usize
+                * src_lv.tile_h as usize
+                * src_lv.spp as usize;
+            let src_is_jp2k = is_jp2k(src_lv.compression as u32);
+            // For JP2K YCBCR (33003), the decoded components are in YCbCr space
+            // and need converting to RGB; 33005 / 34712 with RGB photometric do not.
+            let jp2k_needs_ycbcr_cvt =
+                src_is_jp2k && src_lv.photometric as u32 == PHOTOMETRIC_YCBCR;
+
             for chunk in tile_ids.chunks(chunk_size) {
-                // Sequential: read tiles from source
+                // Sequential: read tiles from source.
+                // JP2K tiles are read as raw bytes so that jpeg2k (OpenJPEG) can
+                // decode them in the parallel step.  All other compressions use
+                // TIFFReadEncodedTile so that libtiff handles JPEGTABLES and
+                // YCbCr→RGB internally.
                 let raw_chunk: Vec<(u32, Vec<u8>, bool)> = chunk.iter()
                     .map(|&tile_num| {
-                        let (data, is_jpeg) = if lv_out.passthrough
-                            || src_lv.compression as u32 == COMPRESSION_JPEG
-                        {
+                        let (data, is_jp2k_raw) = if lv_out.passthrough || src_is_jp2k {
                             let mut buf = vec![0u8; raw_buf_size];
                             let n = TIFFReadRawTile(src_tiff, tile_num,
                                 buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
                             if n > 0 {
                                 buf.truncate(n as usize);
-                                let looks_jpeg = buf.len() >= 2
-                                    && buf[0] == 0xFF && buf[1] == 0xD8;
-                                (buf, looks_jpeg)
+                                // Mark as jp2k raw only for the downsampling path
+                                (buf, src_is_jp2k && !lv_out.passthrough)
                             } else {
                                 (Vec::new(), false)
                             }
                         } else {
-                            // Non-JPEG source: read decoded pixels
-                            let pix_size = src_lv.tile_w as usize
-                                * src_lv.tile_h as usize
-                                * src_lv.spp as usize;
+                            // JPEG and other compressions: libtiff decodes for us
                             let mut buf = vec![0u8; pix_size];
                             let n = TIFFReadEncodedTile(src_tiff, tile_num,
                                 buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
-                            if n > 0 {
-                                buf.truncate(n as usize);
-                                (buf, false)
-                            } else {
-                                (Vec::new(), false)
-                            }
+                            if n > 0 { (buf, false) } else { (Vec::new(), false) }
                         };
-                        (tile_num, data, is_jpeg)
+                        (tile_num, data, is_jp2k_raw)
                     })
                     .collect();
 
-                // Parallel: decode → resize → encode
-                let quality     = args.quality;
-                let src_tile_w  = src_lv.tile_w;
-                let src_tile_h  = src_lv.tile_h;
-                let out_tile_w  = lv_out.out_tile_w;
-                let out_tile_h  = lv_out.out_tile_h;
-                let passthrough = lv_out.passthrough;
-                let spp         = out_spp;
-                let resize_opts = resize_opts.clone();
-                let fpt         = fir_pixel_type;
+                // Parallel: (JP2K decode →) resize → encode
+                let quality              = args.quality;
+                let src_tile_w           = src_lv.tile_w;
+                let src_tile_h           = src_lv.tile_h;
+                let out_tile_w           = lv_out.out_tile_w;
+                let out_tile_h           = lv_out.out_tile_h;
+                let passthrough          = lv_out.passthrough;
+                let spp                  = out_spp;
+                let resize_opts          = resize_opts.clone();
+                let fpt                  = fir_pixel_type;
 
                 let encoded: Vec<Option<(u32, Vec<u8>)>> = raw_chunk
                     .par_iter()
-                    .map(|(tile_num, data, is_jpeg_raw)| {
+                    .map(|(tile_num, data, is_jp2k_raw)| {
                         if data.is_empty() { return None; }
 
                         if passthrough {
-                            // Direct byte copy
                             return Some((*tile_num, data.clone()));
                         }
 
-                        // Decode to raw pixels
-                        let (pixels, pw, ph): (Vec<u8>, u32, u32) = if *is_jpeg_raw {
-                            let fmt = if spp == 1 {
-                                turbojpeg::PixelFormat::GRAY
+                        let (pixels, pw, ph): (Vec<u8>, u32, u32) = if *is_jp2k_raw {
+                            // Decode raw JP2K bytes with OpenJPEG (same logic as lib.rs)
+                            let img = jpeg2k::Image::from_bytes(data).ok()?;
+                            let comps = img.components();
+                            if comps.is_empty() { return None; }
+                            let luma_w = comps[0].width() as usize;
+                            let luma_h = comps[0].height() as usize;
+                            if luma_w == 0 || luma_h == 0 { return None; }
+
+                            let mut pix: Vec<u8> = if spp == 1 || comps.len() < 3 {
+                                comps[0].data().iter()
+                                    .map(|v| (*v).clamp(0, 255) as u8)
+                                    .collect()
                             } else {
-                                turbojpeg::PixelFormat::RGB
+                                let y_data  = comps[0].data();
+                                let cb_data = comps[1].data();
+                                let cr_data = comps[2].data();
+                                let cb_w = comps[1].width() as usize;
+                                let cb_h = comps[1].height() as usize;
+                                let cr_w = comps[2].width() as usize;
+                                let cr_h = comps[2].height() as usize;
+                                let mut buf = Vec::with_capacity(luma_w * luma_h * 3);
+                                for row in 0..luma_h {
+                                    for col in 0..luma_w {
+                                        let y = y_data[row * luma_w + col].clamp(0, 255) as u8;
+                                        let cb_col = (col * cb_w / luma_w).min(cb_w.saturating_sub(1));
+                                        let cb_row = (row * cb_h / luma_h).min(cb_h.saturating_sub(1));
+                                        let cb = cb_data[cb_row * cb_w + cb_col].clamp(0, 255) as u8;
+                                        let cr_col = (col * cr_w / luma_w).min(cr_w.saturating_sub(1));
+                                        let cr_row = (row * cr_h / luma_h).min(cr_h.saturating_sub(1));
+                                        let cr = cr_data[cr_row * cr_w + cr_col].clamp(0, 255) as u8;
+                                        buf.extend_from_slice(&[y, cb, cr]);
+                                    }
+                                }
+                                buf
                             };
-                            let dec = turbojpeg::decompress(data, fmt).ok()?;
-                            let (w, h, ch) = (dec.width, dec.height, spp as usize);
-                            let pixels = if dec.pitch == w * ch {
-                                dec.pixels
-                            } else {
-                                (0..h).flat_map(|r| {
-                                    dec.pixels[r*dec.pitch..r*dec.pitch+w*ch].iter().copied()
-                                }).collect()
-                            };
-                            (pixels, w as u32, h as u32)
+                            // YCbCr → RGB (Aperio 33003 stores YCbCr in the J2K stream)
+                            if jp2k_needs_ycbcr_cvt && spp == 3 {
+                                for c in pix.chunks_mut(3) {
+                                    let y  = c[0] as f32;
+                                    let cb = c[1] as f32 - 128.0;
+                                    let cr = c[2] as f32 - 128.0;
+                                    c[0] = (y + 1.40200 * cr).clamp(0.0, 255.0) as u8;
+                                    c[1] = (y - 0.34414 * cb - 0.71414 * cr).clamp(0.0, 255.0) as u8;
+                                    c[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
+                                }
+                            }
+                            (pix, luma_w as u32, luma_h as u32)
                         } else {
-                            // Already decoded pixels
+                            // Decoded pixels from TIFFReadEncodedTile
                             (data.clone(), src_tile_w, src_tile_h)
                         };
 
