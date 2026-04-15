@@ -5,7 +5,7 @@
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
-mod bindings;
+pub mod bindings;
 use bindings::{
     TIFF, TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteDirectory, TIFFClose,
     TIFFTAG_SUBFILETYPE, TIFFTAG_IMAGEWIDTH, TIFFTAG_IMAGELENGTH, TIFFTAG_TILEWIDTH,
@@ -44,7 +44,7 @@ const COMPRESSION_APERIO_JP2_RGB: u32 = 33005;
 /// Minimum length of the longer image side (pixels) required to include a
 /// pyramid level in the resampled output.  Levels below this threshold are
 /// skipped because they add no useful detail at typical screen resolutions.
-const MIN_PYRAMID_SIDE: u32 = 512;
+pub const MIN_PYRAMID_SIDE: u32 = 512;
 
 // ─── Compression type ───────────────────────────────────────────────────────
 
@@ -460,7 +460,7 @@ impl Args {
 /// Parse a JPEG byte stream and return the YCbCr chroma subsampling factors
 /// as (horiz, vert) for TIFF's YCbCrSubSampling tag.
 /// E.g. 4:2:2 → (2, 1), 4:2:0 → (2, 2), 4:4:4 → (1, 1).
-fn detect_jpeg_subsampling(data: &[u8]) -> Option<(u16, u16)> {
+pub fn detect_jpeg_subsampling(data: &[u8]) -> Option<(u16, u16)> {
     if data.len() < 2 || data[0] != 0xFF || data[1] != 0xD8 {
         return None;
     }
@@ -760,7 +760,7 @@ fn uid_to_uuid(uid: &str) -> String {
 /// Round `v` up to the nearest multiple of `align`.
 /// libtiff requires JPEG tile dimensions to be multiples of 16 (YCbCr MCU boundary).
 /// Applying this universally is safe: for other compressions it has no side-effects.
-fn tile_align(v: u32, align: u32) -> u32 {
+pub fn tile_align(v: u32, align: u32) -> u32 {
     (v + align - 1) / align * align
 }
 
@@ -776,12 +776,12 @@ fn is_jpeg_tile_aligned(tile_w: u32, tile_h: u32) -> bool {
 /// Round `v` to the nearest multiple of 16, with a minimum of 16.
 /// Used to compute the output tile size for resampled TIFF writing so that
 /// JPEG tiles always satisfy libtiff's MCU-boundary requirement.
-fn nearest_16(v: f64) -> u32 {
+pub fn nearest_16(v: f64) -> u32 {
     ((v / 16.0).round() as u32).max(1) * 16
 }
 
 /// Escape special XML characters in an attribute value.
-fn xml_escape(s: &str) -> String {
+pub fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
      .replace('<', "&lt;")
      .replace('>', "&gt;")

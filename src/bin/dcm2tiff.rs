@@ -1,4 +1,4 @@
-use dcm2tiff::{Args, run};
+use wsi_tools::{Args, run};
 
 fn main() {
     let start_time = std::time::Instant::now();
@@ -11,5 +11,4 @@ fn main() {
 
     let elapsed = start_time.elapsed();
     println!("Total execution time: {:.2?}", elapsed);
-
 }
