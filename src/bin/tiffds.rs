@@ -228,7 +228,14 @@ fn run(args: Args) {
         let src_path = entry.path().to_string_lossy().to_string();
         let src_name = entry.path().file_name().unwrap_or_default()
             .to_string_lossy().to_string();
-        let out_path = Path::new(&args.output_dir).join(&src_name)
+        let src_stem = Path::new(&src_name)
+            .file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let out_name = if args.legacy {
+            format!("{src_stem}.tiff")
+        } else {
+            format!("{src_stem}.ome.tiff")
+        };
+        let out_path = Path::new(&args.output_dir).join(&out_name)
             .to_string_lossy().to_string();
 
         if Path::new(&out_path).exists() {
@@ -315,12 +322,12 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
         None
     };
 
-    // Determine output photometric from base source level
+    // Determine output channels from SamplesPerPixel, not from photometric.
+    // Aperio JP2K (33005) stores RGB data but marks photometric as MINISBLACK,
+    // so photometric alone cannot be trusted to determine the channel count.
     let base_src = &src_levels[output_levels[0].src_idx];
-    let (out_photometric, out_spp) = match base_src.photometric as u32 {
-        p if p == PHOTOMETRIC_MINISBLACK => (PHOTOMETRIC_MINISBLACK, 1u32),
-        _                                => (PHOTOMETRIC_YCBCR,      3u32),
-    };
+    let out_spp: u32 = if base_src.spp >= 3 { 3 } else { 1 };
+    let out_photometric = if out_spp == 1 { PHOTOMETRIC_MINISBLACK } else { PHOTOMETRIC_YCBCR };
 
     // Setup fast_image_resize once
     let fir_alg = match args.filter {
@@ -436,43 +443,51 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
             let pix_size    = src_lv.tile_w as usize
                 * src_lv.tile_h as usize
                 * src_lv.spp as usize;
-            let src_is_jp2k = is_jp2k(src_lv.compression as u32);
-            // For JP2K YCBCR (33003), the decoded components are in YCbCr space
-            // and need converting to RGB; 33005 / 34712 with RGB photometric do not.
-            let jp2k_needs_ycbcr_cvt =
-                src_is_jp2k && src_lv.photometric as u32 == PHOTOMETRIC_YCBCR;
+            let src_is_jp2k   = is_jp2k(src_lv.compression as u32);
+            // Compression 33003 (J2K/YUV16) stores YCbCr data in the J2K
+            // codestream regardless of the TIFF photometric tag (which is often
+            // PHOTOMETRIC_RGB on Aperio files).  When OpenJPEG applies inverse ICT
+            // it returns SRGB; otherwise the components are still YCbCr and need
+            // a manual convert.  We also check for color_space == SYCC at decode
+            // time to catch standard JPEG-2000 YCbCr streams.
+            let src_jp2k_is_ycbcr =
+                src_is_jp2k
+                    && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
 
             for chunk in tile_ids.chunks(chunk_size) {
                 // Sequential: read tiles from source.
-                // JP2K tiles are read as raw bytes so that jpeg2k (OpenJPEG) can
-                // decode them in the parallel step.  All other compressions use
-                // TIFFReadEncodedTile so that libtiff handles JPEGTABLES and
-                // YCbCr→RGB internally.
+                // JP2K tiles are read as raw bytes for parallel decode by jpeg2k.
+                // JPEG and other compressions use TIFFReadEncodedTile so libtiff
+                // handles JPEGTABLES, partial SOF/SOS splits, and color conversion.
+                // (tile_num, bytes, is_jp2k_raw)
                 let raw_chunk: Vec<(u32, Vec<u8>, bool)> = chunk.iter()
                     .map(|&tile_num| {
-                        let (data, is_jp2k_raw) = if lv_out.passthrough || src_is_jp2k {
+                        if lv_out.passthrough || src_is_jp2k {
+                            // Passthrough or JP2K: always raw bytes
                             let mut buf = vec![0u8; raw_buf_size];
                             let n = TIFFReadRawTile(src_tiff, tile_num,
                                 buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
                             if n > 0 {
                                 buf.truncate(n as usize);
-                                // Mark as jp2k raw only for the downsampling path
-                                (buf, src_is_jp2k && !lv_out.passthrough)
+                                let is_jp2k_raw = src_is_jp2k && !lv_out.passthrough;
+                                (tile_num, buf, is_jp2k_raw)
                             } else {
-                                (Vec::new(), false)
+                                (tile_num, Vec::new(), false)
                             }
                         } else {
-                            // JPEG and other compressions: libtiff decodes for us
+                            // JPEG and all other compressions: let libtiff decode.
+                            // TIFFReadEncodedTile handles JPEGTABLES reconstruction
+                            // and always returns packed RGB (or grayscale) pixels.
                             let mut buf = vec![0u8; pix_size];
                             let n = TIFFReadEncodedTile(src_tiff, tile_num,
                                 buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
-                            if n > 0 { (buf, false) } else { (Vec::new(), false) }
-                        };
-                        (tile_num, data, is_jp2k_raw)
+                            if n > 0 { (tile_num, buf, false) }
+                            else { (tile_num, Vec::new(), false) }
+                        }
                     })
                     .collect();
 
-                // Parallel: (JP2K decode →) resize → encode
+                // Parallel: decode → resize → encode
                 let quality              = args.quality;
                 let src_tile_w           = src_lv.tile_w;
                 let src_tile_h           = src_lv.tile_h;
@@ -482,6 +497,7 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                 let spp                  = out_spp;
                 let resize_opts          = resize_opts.clone();
                 let fpt                  = fir_pixel_type;
+                let src_jp2k_is_ycbcr    = src_jp2k_is_ycbcr;
 
                 let encoded: Vec<Option<(u32, Vec<u8>)>> = raw_chunk
                     .par_iter()
@@ -501,14 +517,14 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                             let luma_h = comps[0].height() as usize;
                             if luma_w == 0 || luma_h == 0 { return None; }
 
+                            // Use data_u8() for correct scaling across all bit
+                            // depths (8, 12, 16 …) and proper signed/unsigned handling.
                             let mut pix: Vec<u8> = if spp == 1 || comps.len() < 3 {
-                                comps[0].data().iter()
-                                    .map(|v| (*v).clamp(0, 255) as u8)
-                                    .collect()
+                                comps[0].data_u8().collect()
                             } else {
-                                let y_data  = comps[0].data();
-                                let cb_data = comps[1].data();
-                                let cr_data = comps[2].data();
+                                let y_u8:  Vec<u8> = comps[0].data_u8().collect();
+                                let cb_u8: Vec<u8> = comps[1].data_u8().collect();
+                                let cr_u8: Vec<u8> = comps[2].data_u8().collect();
                                 let cb_w = comps[1].width() as usize;
                                 let cb_h = comps[1].height() as usize;
                                 let cr_w = comps[2].width() as usize;
@@ -516,20 +532,32 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                                 let mut buf = Vec::with_capacity(luma_w * luma_h * 3);
                                 for row in 0..luma_h {
                                     for col in 0..luma_w {
-                                        let y = y_data[row * luma_w + col].clamp(0, 255) as u8;
+                                        let y = y_u8[row * luma_w + col];
                                         let cb_col = (col * cb_w / luma_w).min(cb_w.saturating_sub(1));
                                         let cb_row = (row * cb_h / luma_h).min(cb_h.saturating_sub(1));
-                                        let cb = cb_data[cb_row * cb_w + cb_col].clamp(0, 255) as u8;
+                                        let cb = cb_u8[cb_row * cb_w + cb_col];
                                         let cr_col = (col * cr_w / luma_w).min(cr_w.saturating_sub(1));
                                         let cr_row = (row * cr_h / luma_h).min(cr_h.saturating_sub(1));
-                                        let cr = cr_data[cr_row * cr_w + cr_col].clamp(0, 255) as u8;
+                                        let cr = cr_u8[cr_row * cr_w + cr_col];
                                         buf.extend_from_slice(&[y, cb, cr]);
                                     }
                                 }
                                 buf
                             };
-                            // YCbCr → RGB (Aperio 33003 stores YCbCr in the J2K stream)
-                            if jp2k_needs_ycbcr_cvt && spp == 3 {
+                            // Apply BT.601 YCbCr → RGB when:
+                            //  a) OpenJPEG explicitly signals SYCC (YCbCr) output, OR
+                            //  b) source compression is 33003 (J2K/YUV16) AND OpenJPEG
+                            //     did NOT already apply inverse ICT (color_space != SRGB).
+                            // This is checked against the decoded color_space, NOT the TIFF
+                            // photometric tag, because Aperio 33003 files store YCbCr data
+                            // internally but declare PHOTOMETRIC_RGB in the TIFF header.
+                            let color_space = img.color_space();
+                            let needs_ycbcr_cvt = spp == 3 && (
+                                matches!(color_space, jpeg2k::ColorSpace::SYCC)
+                                || (src_jp2k_is_ycbcr
+                                    && !matches!(color_space, jpeg2k::ColorSpace::SRGB))
+                            );
+                            if needs_ycbcr_cvt {
                                 for c in pix.chunks_mut(3) {
                                     let y  = c[0] as f32;
                                     let cb = c[1] as f32 - 128.0;
