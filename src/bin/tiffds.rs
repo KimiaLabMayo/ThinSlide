@@ -32,10 +32,10 @@ use wsi_tools::bindings::{
     TIFFTAG_SAMPLESPERPIXEL, TIFFTAG_BITSPERSAMPLE,
     TIFFTAG_SAMPLEFORMAT, TIFFTAG_PLANARCONFIG, TIFFTAG_ORIENTATION,
     TIFFTAG_SUBFILETYPE, TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_ICCPROFILE,
-    TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_SUBIFD,
+    TIFFTAG_JPEGTABLES, TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_SUBIFD,
     TIFFTAG_XRESOLUTION, TIFFTAG_YRESOLUTION, TIFFTAG_RESOLUTIONUNIT,
     COMPRESSION_JPEG,
-    PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK,
+    PHOTOMETRIC_RGB, PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK,
     RESUNIT_CENTIMETER, RESUNIT_INCH,
     SAMPLEFORMAT_UINT, PLANARCONFIG_CONTIG, ORIENTATION_TOPLEFT,
     FILETYPE_REDUCEDIMAGE,
@@ -288,6 +288,11 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
     }
 
     let base = &src_levels[0];
+    if base.mpp_x <= 0.0 {
+        eprintln!("  [error] Cannot determine resolution for {src_path}: \
+            no XRESOLUTION tag and no 'MPP = <value>' in ImageDescription. Skipping.");
+        return;
+    }
     if args.verbose {
         println!("  Source: {}x{} px @ {:.4} µm/px, {} levels",
             base.img_w, base.img_h, base.mpp_x, src_levels.len());
@@ -359,6 +364,7 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
             return;
         }
 
+
         let n_subifds = output_levels.len() - 1;
         if ome && n_subifds > 0 {
             let zeros: Vec<u64> = vec![0u64; n_subifds];
@@ -372,7 +378,7 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
             let is_base    = lv_idx == 0;
             let subfile    = if is_base { 0u32 } else { FILETYPE_REDUCEDIMAGE };
 
-            // Navigate source TIFF to the chosen level
+            // Navigate source TIFF to the chosen level.
             navigate_to_level(src_tiff, &src_lv.nav);
 
             // Subsampling info from source (for passthrough JPEG)
@@ -413,6 +419,20 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                     TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING,
                         src_subsamp_h as u32, src_subsamp_v as u32);
                 }
+                // JPEG tiles store quantization/Huffman tables in JPEGTABLES rather than
+                // inside each tile.  Copy the tag verbatim so readers (libtiff, OpenSlide)
+                // can decode the raw tile bytes we are about to copy unchanged.
+                if src_lv.compression as u32 == COMPRESSION_JPEG {
+                    let mut tlen: u32 = 0;
+                    let mut tptr: *const u8 = std::ptr::null();
+                    let ok = TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
+                        &mut tlen as *mut u32,
+                        &mut tptr as *mut *const u8);
+                    if ok != 0 && !tptr.is_null() && tlen > 2 {
+                        TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES,
+                            tlen, tptr);
+                    }
+                }
             } else {
                 // Resample: output is JPEG-encoded
                 TIFFSetField(dst_tiff, TIFFTAG_COMPRESSION,  COMPRESSION_JPEG);
@@ -444,6 +464,7 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                 * src_lv.tile_h as usize
                 * src_lv.spp as usize;
             let src_is_jp2k   = is_jp2k(src_lv.compression as u32);
+            let src_is_jpeg   = src_lv.compression as u32 == COMPRESSION_JPEG;
             // Compression 33003 (J2K/YUV16) stores YCbCr data in the J2K
             // codestream regardless of the TIFF photometric tag (which is often
             // PHOTOMETRIC_RGB on Aperio files).  When OpenJPEG applies inverse ICT
@@ -454,30 +475,82 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                 src_is_jp2k
                     && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
 
+
+            // JP2K DWT reduction: decode at 1/2^n resolution to reduce work.
+            let n_reduce: u32 = if src_is_jp2k && !lv_out.passthrough {
+                let scale_down = (src_lv.tile_w as f64 / lv_out.out_tile_w as f64)
+                    .min(src_lv.tile_h as f64 / lv_out.out_tile_h as f64);
+                if scale_down > 1.0 { scale_down.log2().floor() as u32 } else { 0 }
+            } else {
+                0
+            };
+
+            // JPEG TIFF stores quantization/Huffman tables in the JPEGTABLES tag
+            // separately from the tile data.  Each raw tile contains SOI+SOF+SOS+data+EOI
+            // but is missing DQT, so it is not a self-contained JPEG stream.
+            // We read the tables once per level and prepend them when building the
+            // complete stream for turbojpeg:
+            //   combined = JPEGTABLES[0..len-2] + tile[2..]
+            //            = SOI + DQT + DHT + SOF + SOS + data + EOI  ✓
+            let jpeg_tables: Option<Vec<u8>> = if src_is_jpeg && !lv_out.passthrough {
+                let mut tlen: u32 = 0;
+                let mut tptr: *const u8 = std::ptr::null();
+                let ok = TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
+                    &mut tlen as *mut u32,
+                    &mut tptr as *mut *const u8);
+                if ok != 0 && !tptr.is_null() && tlen > 2 {
+                    Some(std::slice::from_raw_parts(tptr, tlen as usize).to_vec())
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let jpeg_tables_ref: Option<&[u8]> = jpeg_tables.as_deref();
+
             for chunk in tile_ids.chunks(chunk_size) {
                 // Sequential: read tiles from source.
-                // JP2K tiles are read as raw bytes for parallel decode by jpeg2k.
-                // JPEG and other compressions use TIFFReadEncodedTile so libtiff
-                // handles JPEGTABLES, partial SOF/SOS splits, and color conversion.
-                // (tile_num, bytes, is_jp2k_raw)
+                // JPEG and JP2K tiles are read as raw bytes for parallel decode.
+                // Other compressions use TIFFReadEncodedTile (handled by libtiff).
+                // (tile_num, bytes, is_raw_decode)
                 let raw_chunk: Vec<(u32, Vec<u8>, bool)> = chunk.iter()
                     .map(|&tile_num| {
                         if lv_out.passthrough || src_is_jp2k {
-                            // Passthrough or JP2K: always raw bytes
+                            // Passthrough or JP2K: raw bytes
                             let mut buf = vec![0u8; raw_buf_size];
                             let n = TIFFReadRawTile(src_tiff, tile_num,
                                 buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
                             if n > 0 {
                                 buf.truncate(n as usize);
-                                let is_jp2k_raw = src_is_jp2k && !lv_out.passthrough;
-                                (tile_num, buf, is_jp2k_raw)
+                                let is_raw_decode = src_is_jp2k && !lv_out.passthrough;
+                                (tile_num, buf, is_raw_decode)
                             } else {
                                 (tile_num, Vec::new(), false)
                             }
+                        } else if src_is_jpeg && !lv_out.passthrough {
+                            // JPEG non-passthrough: try raw read first.
+                            // Aperio SVS tiles are complete JPEG streams (SOI+SOF+SOS+EOI)
+                            // so TIFFReadRawTile → turbojpeg works.  If the raw bytes don't
+                            // begin with a SOI marker, fall back to TIFFReadEncodedTile
+                            // (handles JPEGTABLES reconstruction, but must be sequential).
+                            let mut raw_buf = vec![0u8; raw_buf_size];
+                            let raw_n = TIFFReadRawTile(src_tiff, tile_num,
+                                raw_buf.as_mut_ptr() as *mut c_void, raw_buf.len() as i64);
+                            if raw_n > 2 && raw_buf[0] == 0xFF && raw_buf[1] == 0xD8 {
+                                // Complete JPEG stream — turbojpeg path (is_raw_decode=true)
+                                raw_buf.truncate(raw_n as usize);
+                                (tile_num, raw_buf, true)
+                            } else {
+                                // Not a self-contained JPEG (JPEGTABLES-dependent or error):
+                                // decode in-place with libtiff (sequential, no thread-safety issue).
+                                let mut pix_buf = vec![0u8; pix_size];
+                                let n = TIFFReadEncodedTile(src_tiff, tile_num,
+                                    pix_buf.as_mut_ptr() as *mut c_void, pix_buf.len() as i64);
+                                if n > 0 { (tile_num, pix_buf, false) }
+                                else { (tile_num, Vec::new(), false) }
+                            }
                         } else {
-                            // JPEG and all other compressions: let libtiff decode.
-                            // TIFFReadEncodedTile handles JPEGTABLES reconstruction
-                            // and always returns packed RGB (or grayscale) pixels.
+                            // Other compressions: TIFFReadEncodedTile
                             let mut buf = vec![0u8; pix_size];
                             let n = TIFFReadEncodedTile(src_tiff, tile_num,
                                 buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
@@ -498,19 +571,94 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                 let resize_opts          = resize_opts.clone();
                 let fpt                  = fir_pixel_type;
                 let src_jp2k_is_ycbcr    = src_jp2k_is_ycbcr;
+                let src_is_jpeg          = src_is_jpeg;
+                let src_photometric      = src_lv.photometric as u32;
+                let n_reduce             = n_reduce;
+                let jpeg_tables_ref      = jpeg_tables_ref;
 
                 let encoded: Vec<Option<(u32, Vec<u8>)>> = raw_chunk
                     .par_iter()
-                    .map(|(tile_num, data, is_jp2k_raw)| {
+                    .map(|(tile_num, data, is_raw_decode)| {
                         if data.is_empty() { return None; }
 
                         if passthrough {
                             return Some((*tile_num, data.clone()));
                         }
 
-                        let (pixels, pw, ph): (Vec<u8>, u32, u32) = if *is_jp2k_raw {
+                        let (pixels, pw, ph): (Vec<u8>, u32, u32) = if *is_raw_decode && src_is_jpeg {
+                            // Assemble a complete JPEG stream.
+                            // JPEGTABLES layout: SOI + DQT + DHT + EOI
+                            // Tile layout:       SOI + SOF + SOS + data + EOI  (no DQT)
+                            // We insert SOI first, then optionally an APP14 Adobe marker to
+                            // tell libjpeg-turbo the colour space, then DQT+DHT from tables,
+                            // then SOF+SOS+data+EOI from the tile.
+                            //
+                            // Without APP14, libjpeg-turbo assumes YCbCr for 3-component JPEG
+                            // and applies an incorrect YCbCr→RGB conversion.  Aperio SVS files
+                            // with PHOTOMETRIC_RGB store tiles in RGB DCT encoding (no colour
+                            // transform), so we inject APP14 colorTransform=0 (RGB) in that case.
+                            // For PHOTOMETRIC_YCBCR the default assumption is correct.
+                            //
+                            // APP14 Adobe marker: FF EE + length(2) + "Adobe"(5) +
+                            //   version(2) + flags0(2) + flags1(2) + colorTransform(1)
+                            // colorTransform=0 → RGB (no conversion), =1 → YCbCr, =2 → YCCK
+                            const APP14_ADOBE_RGB: [u8; 16] = [
+                                0xFF, 0xEE,              // APP14 marker
+                                0x00, 0x0E,              // length = 14 (excludes SOI, includes self)
+                                b'A', b'd', b'o', b'b', b'e',  // "Adobe"
+                                0x00, 0x64,              // version = 100
+                                0x00, 0x00,              // flags0
+                                0x00, 0x00,              // flags1
+                                0x00,                    // colorTransform = 0 (RGB)
+                            ];
+                            let inject_app14 = spp == 3 && src_photometric == PHOTOMETRIC_RGB;
+
+                            let combined: Vec<u8> = if let Some(tables) = jpeg_tables_ref {
+                                // tables: [SOI(2)] [DQT...DHT...] [EOI(2)]
+                                // We want: SOI + [APP14] + DQT...DHT... + SOF+SOS+data+EOI
+                                let app14_len = if inject_app14 { APP14_ADOBE_RGB.len() } else { 0 };
+                                let mut v = Vec::with_capacity(
+                                    2 + app14_len + (tables.len() - 4) + (data.len() - 2));
+                                v.extend_from_slice(&tables[0..2]);              // SOI
+                                if inject_app14 { v.extend_from_slice(&APP14_ADOBE_RGB); }
+                                v.extend_from_slice(&tables[2..tables.len()-2]); // DQT + DHT (no SOI, no EOI)
+                                v.extend_from_slice(&data[2..]);                 // SOF + SOS + data + EOI
+                                v
+                            } else {
+                                data.clone()
+                            };
+
+                            let fmt = if spp == 1 {
+                                turbojpeg::PixelFormat::GRAY
+                            } else {
+                                turbojpeg::PixelFormat::RGB
+                            };
+                            let dec = match turbojpeg::decompress(&combined, fmt) {
+                                Ok(d) => d,
+                                Err(e) => {
+                                    eprintln!("[warn] tile {tile_num}: decompress failed: {e} \
+                                        (combined_len={})", combined.len());
+                                    return None;
+                                }
+                            };
+                            let (w, h) = (dec.width as u32, dec.height as u32);
+                            let ch = if spp == 1 { 1usize } else { 3usize };
+                            // turbojpeg may add row padding; strip it to get tight RGB rows.
+                            let pix = if dec.pitch == w as usize * ch {
+                                dec.pixels
+                            } else {
+                                (0..h as usize)
+                                    .flat_map(|r| {
+                                        let s = r * dec.pitch;
+                                        dec.pixels[s..s + w as usize * ch].iter().copied()
+                                    })
+                                    .collect()
+                            };
+                            (pix, w, h)
+                        } else if *is_raw_decode {
                             // Decode raw JP2K bytes with OpenJPEG (same logic as lib.rs)
-                            let img = jpeg2k::Image::from_bytes(data).ok()?;
+                            let params = jpeg2k::DecodeParameters::default().reduce(n_reduce);
+                            let img = jpeg2k::Image::from_bytes_with(data, params).ok()?;
                             let comps = img.components();
                             if comps.is_empty() { return None; }
                             let luma_w = comps[0].width() as usize;
@@ -569,7 +717,7 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                             }
                             (pix, luma_w as u32, luma_h as u32)
                         } else {
-                            // Decoded pixels from TIFFReadEncodedTile
+                            // Decoded pixels from TIFFReadEncodedTile (other compressions)
                             (data.clone(), src_tile_w, src_tile_h)
                         };
 
@@ -660,6 +808,15 @@ fn collect_pyramid_levels(tiff: *mut TIFF) -> Vec<LevelDesc> {
             &mut sub_ptr as *mut *const u64) != 0
     } && n_sub > 0 && !sub_ptr.is_null();
 
+    // If XRESOLUTION/YRESOLUTION are absent (common in SVS), try ImageDescription.
+    // Aperio format: "... |MPP = 0.4990| ..."
+    if lv0.mpp_x <= 0.0 {
+        if let Some(mpp) = parse_mpp_from_image_description(tiff) {
+            lv0.mpp_x = mpp;
+            lv0.mpp_y = mpp;
+        }
+    }
+
     lv0.nav = LevelNav::Dir(0);
     levels.push(lv0);
 
@@ -688,7 +845,26 @@ fn collect_pyramid_levels(tiff: *mut TIFF) -> Vec<LevelDesc> {
         unsafe { TIFFSetDirectory(tiff, 0); }
     }
 
-    // Sort by MPP ascending (highest resolution = lowest MPP first)
+    // Sort by image width descending to reliably identify the base (highest-resolution) level.
+    // This is more robust than sorting by mpp_x because sub-levels in SVS often lack
+    // XRESOLUTION/YRESOLUTION tags, causing mpp_from_resolution to return the same
+    // fallback value (0.25) for every level.
+    levels.sort_by(|a, b| b.img_w.cmp(&a.img_w));
+
+    // Derive sub-level MPPs from image-dimension ratios relative to the base level.
+    // The base level (largest image) has reliable XRESOLUTION; sub-levels often do not.
+    if levels.len() > 1 && levels[0].img_w > 0 {
+        let bw  = levels[0].img_w as f64;
+        let bh  = levels[0].img_h as f64;
+        let bmx = levels[0].mpp_x;
+        let bmy = levels[0].mpp_y;
+        for lv in levels.iter_mut().skip(1) {
+            if lv.img_w > 0 { lv.mpp_x = bmx * bw / lv.img_w as f64; }
+            if lv.img_h > 0 { lv.mpp_y = bmy * bh / lv.img_h as f64; }
+        }
+    }
+
+    // Re-sort by corrected MPP ascending (highest resolution = lowest MPP first)
     levels.sort_by(|a, b| a.mpp_x.partial_cmp(&b.mpp_x).unwrap());
     levels
 }
@@ -736,15 +912,38 @@ fn read_level_meta(tiff: *mut TIFF) -> Option<LevelDesc> {
 
 fn mpp_from_resolution(xres: f64, yres: f64, resunit: u32) -> (f64, f64) {
     if xres <= 0.0 || yres <= 0.0 {
-        return (0.25, 0.25);
+        // Signal "unknown": caller must try other sources (e.g. ImageDescription)
+        return (0.0, 0.0);
     }
     if resunit == RESUNIT_CENTIMETER {
         (10000.0 / xres, 10000.0 / yres)
     } else if resunit == RESUNIT_INCH {
         (25400.0 / xres, 25400.0 / yres)
     } else {
-        (0.25, 0.25)
+        // Unknown unit — signal unknown rather than guessing
+        (0.0, 0.0)
     }
+}
+
+/// Parse `MPP = <value>` from an Aperio-style ImageDescription string.
+fn parse_mpp_from_image_description(tiff: *mut TIFF) -> Option<f64> {
+    let mut desc_ptr: *const std::os::raw::c_char = std::ptr::null();
+    let ok = unsafe {
+        TIFFGetField(tiff, TIFFTAG_IMAGEDESCRIPTION,
+            &mut desc_ptr as *mut *const std::os::raw::c_char)
+    };
+    if ok == 0 || desc_ptr.is_null() { return None; }
+    let desc = unsafe { std::ffi::CStr::from_ptr(desc_ptr) }.to_string_lossy();
+    // Look for "MPP = <float>" (case-sensitive, Aperio convention)
+    for part in desc.split('|') {
+        let part = part.trim();
+        if let Some(val_str) = part.strip_prefix("MPP = ") {
+            if let Ok(mpp) = val_str.trim().parse::<f64>() {
+                if mpp > 0.0 { return Some(mpp); }
+            }
+        }
+    }
+    None
 }
 
 fn read_icc_profile(tiff: *mut TIFF, levels: &[LevelDesc]) -> Option<Vec<u8>> {
