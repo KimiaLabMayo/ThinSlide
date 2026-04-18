@@ -20,6 +20,7 @@ use bindings::{
     FILETYPE_REDUCEDIMAGE,
     TIFFTAG_ROWSPERSTRIP,
     TIFFTAG_ICCPROFILE,
+    TIFFTAG_JPEGTABLES,
 };
 
 use std::ffi::CString;
@@ -192,12 +193,75 @@ fn infer_color_space(dcm: &dicom::object::DefaultDicomObject) -> ColorSpace {
     ColorSpace::YCbCr
 }
 
+/// Split a complete JFIF stream produced by turbojpeg::compress into two parts:
+///   tables  = SOI + all DQT segments + all DHT segments + EOI
+///   stripped = SOI + SOF + SOS + scan data + EOI  (no DQT/DHT/APP)
+///
+/// When all tiles are encoded with the same quality setting, their DQT and DHT
+/// segments are identical.  Storing them once in TIFFTAG_JPEGTABLES and writing
+/// stripped tiles with TIFFWriteRawTile reduces file size by ~500 bytes/tile.
+///
+/// Returns None only if the input is not a valid JPEG (missing SOI or corrupt
+/// marker lengths).
+pub fn split_jpeg_to_tables_and_tile(jpeg: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    if jpeg.len() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
+        return None;
+    }
+    let mut tables  = vec![0xFF, 0xD8u8];  // SOI
+    let mut tile    = vec![0xFF, 0xD8u8];  // SOI
+    let mut i = 2;
+    while i + 1 < jpeg.len() {
+        if jpeg[i] != 0xFF {
+            // Not a marker — treat rest as scan data (shouldn't happen outside SOS)
+            tile.extend_from_slice(&jpeg[i..]);
+            break;
+        }
+        let marker = jpeg[i + 1];
+        match marker {
+            0xD8 => { i += 2; }  // Extra SOI — skip
+            0xD9 => break,        // EOI — stop
+            0xDA => {
+                // SOS: copy the SOS segment and all remaining bytes (entropy-coded data + EOI)
+                tile.extend_from_slice(&jpeg[i..]);
+                break;
+            }
+            0xDB | 0xC4 => {
+                // DQT / DHT → go into JPEGTABLES
+                if i + 3 >= jpeg.len() { return None; }
+                let seg_len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize + 2;
+                if i + seg_len > jpeg.len() { return None; }
+                tables.extend_from_slice(&jpeg[i..i + seg_len]);
+                i += seg_len;
+            }
+            0xE0..=0xEF => {
+                // APP markers (JFIF, Adobe, Exif, …) — drop from both parts
+                if i + 3 >= jpeg.len() { return None; }
+                let seg_len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize + 2;
+                if i + seg_len > jpeg.len() { return None; }
+                i += seg_len;
+            }
+            _ => {
+                // SOF, COM, DRI, etc. → keep in stripped tile
+                if i + 3 >= jpeg.len() { return None; }
+                let seg_len = u16::from_be_bytes([jpeg[i + 2], jpeg[i + 3]]) as usize + 2;
+                if i + seg_len > jpeg.len() { return None; }
+                tile.extend_from_slice(&jpeg[i..i + seg_len]);
+                i += seg_len;
+            }
+        }
+    }
+    tables.extend_from_slice(&[0xFF, 0xD9]);  // EOI for JPEGTABLES
+    Some((tables, tile))
+}
+
 /// Extract the ICC profile bytes from DICOM Tag (0028,2000), if present.
+/// Returns None (not Some([])) when the tag is absent or unreadable.
 fn extract_icc_profile(dcm: &dicom::object::DefaultDicomObject) -> Option<Vec<u8>> {
     use dicom_core::Tag;
-    dcm.element(Tag(0x0028, 0x2000)).ok()
+    let bytes = dcm.element(Tag(0x0028, 0x2000)).ok()
         .and_then(|e| e.to_bytes().ok())
-        .map(|b| b.into_owned())
+        .map(|b| b.into_owned())?;
+    if bytes.is_empty() { None } else { Some(bytes) }
 }
 
 // ─── Metadata ────────────────────────────────────────────────────────────────
@@ -681,6 +745,12 @@ fn write_flat_multipage_tiff(
             // Embed ICC profile from DICOM Tag (0028,2000) if present (first IFD only).
             if group_idx == 0 {
                 let icc_profile = extract_icc_profile(&first_dcm);
+                if verbose {
+                    match &icc_profile {
+                        Some(icc) => println!("  ICC profile: {} bytes (from DICOM tag 0028,2000)", icc.len()),
+                        None      => println!("  ICC profile: not found in DICOM tag 0028,2000"),
+                    }
+                }
                 if let Some(ref icc) = icc_profile {
                     TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
                         icc.len() as u32, icc.as_ptr() as *const c_void);
@@ -1015,6 +1085,12 @@ fn write_ome_tiff(
 
             // Embed ICC profile from DICOM Tag (0028,2000) if present.
             let icc_profile = extract_icc_profile(&first_dcm);
+            if verbose {
+                match &icc_profile {
+                    Some(icc) => println!("  ICC profile: {} bytes (from DICOM tag 0028,2000)", icc.len()),
+                    None      => println!("  ICC profile: not found in DICOM tag 0028,2000"),
+                }
+            }
             if let Some(ref icc) = icc_profile {
                 TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
                     icc.len() as u32, icc.as_ptr() as *const c_void);
@@ -1484,9 +1560,12 @@ fn write_resampled_tiff(
     let src_mpp_y = base.mpp_y.unwrap_or(src_mpp_x);
 
     // ── Determine which groups produce an active pyramid level ─────────────
-    // For each output level i, find the input group whose MPP is closest to
-    // the level's target output MPP.  If the closest group is within 10% →
-    // passthrough (raw tile copy); otherwise resample (decode→resize→encode).
+    // One output level is generated per DICOM resolution group.  The target
+    // output MPP for group i is scaled from target_mpp by the same ratio as
+    // the group's MPP to the base level's MPP, preserving the source pyramid
+    // structure (e.g. 1×/4×/8× or 1×/2×/4×/8× depending on the DICOM).
+    // For each target, the source group with the closest MPP is chosen.
+    // If within 10% → passthrough (raw tile copy); otherwise resample.
     struct LevelInfo<'a> {
         src_group:    &'a Vec<&'a DcmMetadata>,  // chosen source (closest by MPP)
         out_img_w:    u32,
@@ -1502,9 +1581,9 @@ fn write_resampled_tiff(
 
     let active_levels: Vec<LevelInfo> = groups.iter().enumerate().filter_map(|(i, _)| {
         // Target MPP for this output level: scale target_mpp by the ratio of
-        // this level's input MPP to the base level's MPP.
-        let group_mpp_x    = groups[i][0].mpp_x.unwrap_or(src_mpp_x);
-        let group_mpp_y    = groups[i][0].mpp_y.unwrap_or(src_mpp_y);
+        // this group's MPP to the base level's MPP.
+        let group_mpp_x     = groups[i][0].mpp_x.unwrap_or(src_mpp_x);
+        let group_mpp_y     = groups[i][0].mpp_y.unwrap_or(src_mpp_y);
         let target_lv_mpp_x = target_mpp * (group_mpp_x / src_mpp_x);
         let target_lv_mpp_y = target_mpp * (group_mpp_y / src_mpp_y);
 
@@ -1529,10 +1608,17 @@ fn write_resampled_tiff(
         let diff = (chosen_mpp_x - target_lv_mpp_x).abs() / target_lv_mpp_x;
         let mut passthrough = diff < 0.1;
 
-        // For JPEG sources with non-16-aligned tiles, raw copy is rejected by
-        // libtiff → fall back to resample so the level is still produced.
         if passthrough {
             let compr = tiff_compression_tag(&chosen_meta.transfer_syntax_uid);
+            // In --mpp resampling mode the output is always JPEG.  Passing through
+            // a non-JPEG source level (e.g. JP2K) would embed a different compression
+            // in the pyramid, which confuses readers such as QuPath.
+            // Force resample for any non-JPEG source so the pyramid stays uniformly JPEG.
+            if compr != 7 {
+                passthrough = false;
+            }
+            // For JPEG sources with non-16-aligned tiles, raw copy is rejected by
+            // libtiff → fall back to resample so the level is still produced.
             if compr == 7 && !is_jpeg_tile_aligned(chosen_tw, chosen_th) {
                 passthrough = false;
             }
@@ -1891,12 +1977,38 @@ fn write_resampled_tiff(
             // Sort by tile_num so writes are in file-offset order (sequential
             // stream on HDD; no extra seeks between tiles).
             level_tiles.sort_unstable_by_key(|(n, _)| *n);
+
+            // For resampled levels, extract DQT+DHT from the first tile into
+            // JPEGTABLES so the tables are stored once in the IFD rather than
+            // duplicated in every tile (~500 bytes saved per tile).
+            let mut jpegtables_set = lv.passthrough; // passthrough keeps full streams
             for (tile_num, jpeg_bytes) in &level_tiles {
+                let write_bytes: std::borrow::Cow<[u8]> = if lv.passthrough {
+                    std::borrow::Cow::Borrowed(jpeg_bytes.as_slice())
+                } else {
+                    match split_jpeg_to_tables_and_tile(jpeg_bytes) {
+                        Some((tables, stripped)) => {
+                            if !jpegtables_set {
+                                unsafe {
+                                    TIFFSetField(
+                                        tiff,
+                                        TIFFTAG_JPEGTABLES,
+                                        tables.len() as u32,
+                                        tables.as_ptr(),
+                                    );
+                                }
+                                jpegtables_set = true;
+                            }
+                            std::borrow::Cow::Owned(stripped)
+                        }
+                        None => std::borrow::Cow::Borrowed(jpeg_bytes.as_slice()),
+                    }
+                };
                 unsafe {
                     TIFFWriteRawTile(
                         tiff, *tile_num,
-                        jpeg_bytes.as_ptr() as *mut c_void,
-                        jpeg_bytes.len() as i64,
+                        write_bytes.as_ptr() as *mut c_void,
+                        write_bytes.len() as i64,
                     );
                 }
             }

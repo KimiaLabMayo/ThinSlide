@@ -40,7 +40,7 @@ use wsi_tools::bindings::{
     SAMPLEFORMAT_UINT, PLANARCONFIG_CONTIG, ORIENTATION_TOPLEFT,
     FILETYPE_REDUCEDIMAGE,
 };
-use wsi_tools::{tile_align, nearest_16, MIN_PYRAMID_SIDE, xml_escape};
+use wsi_tools::{tile_align, nearest_16, MIN_PYRAMID_SIDE, xml_escape, split_jpeg_to_tables_and_tile};
 
 const COMPRESSION_APERIO_JP2_YCBCR: u32 = 33003;
 const COMPRESSION_APERIO_JP2_RGB: u32   = 33005;
@@ -507,6 +507,9 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                 None
             };
             let jpeg_tables_ref: Option<&[u8]> = jpeg_tables.as_deref();
+            // For resampled levels, JPEGTABLES is set once per IFD on the first tile.
+            // Passthrough levels already have JPEGTABLES copied from the source IFD.
+            let mut jpegtables_set = lv_out.passthrough;
 
             for chunk in tile_ids.chunks(chunk_size) {
                 // Sequential: read tiles from source.
@@ -755,13 +758,35 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                     })
                     .collect();
 
-                // Sequential: write tiles + update progress bar
+                // Sequential: write tiles + update progress bar.
+                // For resampled levels, extract DQT+DHT from the first tile into
+                // JPEGTABLES so the tables are stored once in the IFD rather than
+                // duplicated in every tile (~500 bytes saved per tile).
                 for item in encoded {
                     if let Some((tile_num, jpeg_bytes)) = item {
+                        let write_bytes: std::borrow::Cow<[u8]> = if passthrough {
+                            std::borrow::Cow::Borrowed(jpeg_bytes.as_slice())
+                        } else {
+                            match split_jpeg_to_tables_and_tile(&jpeg_bytes) {
+                                Some((tables, stripped)) => {
+                                    if !jpegtables_set {
+                                        TIFFSetField(
+                                            dst_tiff,
+                                            TIFFTAG_JPEGTABLES,
+                                            tables.len() as u32,
+                                            tables.as_ptr(),
+                                        );
+                                        jpegtables_set = true;
+                                    }
+                                    std::borrow::Cow::Owned(stripped)
+                                }
+                                None => std::borrow::Cow::Borrowed(jpeg_bytes.as_slice()),
+                            }
+                        };
                         TIFFWriteRawTile(
                             dst_tiff, tile_num,
-                            jpeg_bytes.as_ptr() as *mut c_void,
-                            jpeg_bytes.len() as i64,
+                            write_bytes.as_ptr() as *mut c_void,
+                            write_bytes.len() as i64,
                         );
                     }
                     pb.inc(1);
