@@ -519,9 +519,6 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                 None
             };
             let jpeg_tables_ref: Option<&[u8]> = jpeg_tables.as_deref();
-            // For resampled levels, JPEGTABLES is set once per IFD on the first tile.
-            // Passthrough levels already have JPEGTABLES copied from the source IFD.
-            let mut jpegtables_set = lv_out.passthrough;
 
             // Variables captured by decode/encode closures
             let quality           = args.quality;
@@ -567,6 +564,10 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                 let out_ntx = (lv_out.out_img_w + out_tile_w - 1) / out_tile_w;
                 let out_nty = (lv_out.out_img_h + out_tile_h - 1) / out_tile_h;
                 let out_tile_ids: Vec<u32> = (0..out_ntx * out_nty).collect();
+                // Accumulate all encoded tiles before writing so that JPEGTABLES can be
+                // registered in the IFD before the first TIFFWriteRawTile call.
+                let mut all_tiles: Vec<(u32, Vec<u8>)> =
+                    Vec::with_capacity(out_ntx as usize * out_nty as usize);
 
                 for chunk in out_tile_ids.chunks(chunk_size) {
                     // Sequential: for each output tile read up to 4 source tiles.
@@ -821,28 +822,36 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                         })
                         .collect();
 
-                    // Sequential: write tiles + update JPEGTABLES + progress bar.
-                    // DQT+DHT extracted from the first tile into the IFD JPEGTABLES tag.
+                    // Accumulate encoded tiles; update progress bar per output tile.
                     for item in encoded {
-                        if let Some((out_id, jpeg_bytes)) = item {
-                            let write_bytes: std::borrow::Cow<[u8]> =
-                                match split_jpeg_to_tables_and_tile(&jpeg_bytes) {
-                                    Some((tables, stripped)) => {
-                                        if !jpegtables_set {
-                                            TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES,
-                                                tables.len() as u32, tables.as_ptr());
-                                            jpegtables_set = true;
-                                        }
-                                        std::borrow::Cow::Owned(stripped)
-                                    }
-                                    None => std::borrow::Cow::Borrowed(jpeg_bytes.as_slice()),
-                                };
-                            TIFFWriteRawTile(dst_tiff, out_id,
-                                write_bytes.as_ptr() as *mut c_void,
-                                write_bytes.len() as i64);
-                        }
+                        if let Some(pair) = item { all_tiles.push(pair); }
                         pb.inc(1);
                     }
+                }
+
+                // Sort by tile_num so writes are in file-offset order.
+                all_tiles.sort_unstable_by_key(|(n, _)| *n);
+
+                // Extract JPEGTABLES from the first encoded tile and register in the IFD
+                // before the first TIFFWriteRawTile.  All tiles share the same DQT/DHT
+                // tables because quality is fixed.
+                let jpegtables: Option<Vec<u8>> = all_tiles.first()
+                    .and_then(|(_, jpeg)| split_jpeg_to_tables_and_tile(jpeg))
+                    .map(|(tables, _)| tables);
+                if let Some(ref tables) = jpegtables {
+                    TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES,
+                        tables.len() as u32, tables.as_ptr());
+                }
+
+                // Write tiles: stripped when JPEGTABLES was registered, complete otherwise.
+                for (out_id, jpeg_bytes) in &all_tiles {
+                    let stripped = jpegtables.as_ref()
+                        .and_then(|_| split_jpeg_to_tables_and_tile(jpeg_bytes))
+                        .map(|(_, tile)| tile);
+                    let write_bytes = stripped.as_deref().unwrap_or(jpeg_bytes);
+                    TIFFWriteRawTile(dst_tiff, *out_id,
+                        write_bytes.as_ptr() as *mut c_void,
+                        write_bytes.len() as i64);
                 }
             }
 

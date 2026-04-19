@@ -2065,23 +2065,27 @@ fn write_resampled_tiff(
         // Sort by tile_num so writes are in file-offset order.
         level_tiles.sort_unstable_by_key(|(n, _)| *n);
 
-        // Extract DQT+DHT from the first tile into JPEGTABLES once per IFD.
-        let mut jpegtables_set = false;
+        // Extract JPEGTABLES from the first encoded tile (all tiles share the same
+        // DQT/DHT tables because quality is fixed).  Register in the IFD before the
+        // first TIFFWriteRawTile so libtiff writes tag 347.  This must come after
+        // TIFFSetField(COMPRESSION, JPEG) (which initialises the JPEG codec state)
+        // and before any TIFFWriteRawTile call.
+        let jpegtables: Option<Vec<u8>> = level_tiles.first()
+            .and_then(|(_, jpeg)| split_jpeg_to_tables_and_tile(jpeg))
+            .map(|(tables, _)| tables);
+        if let Some(ref tables) = jpegtables {
+            unsafe {
+                TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                    tables.len() as u32, tables.as_ptr());
+            }
+        }
+
+        // Write each tile: stripped when JPEGTABLES was registered, complete otherwise.
         for (tile_num, jpeg_bytes) in &level_tiles {
-            let write_bytes: std::borrow::Cow<[u8]> =
-                match split_jpeg_to_tables_and_tile(jpeg_bytes) {
-                    Some((tables, stripped)) => {
-                        if !jpegtables_set {
-                            unsafe {
-                                TIFFSetField(tiff, TIFFTAG_JPEGTABLES,
-                                    tables.len() as u32, tables.as_ptr());
-                            }
-                            jpegtables_set = true;
-                        }
-                        std::borrow::Cow::Owned(stripped)
-                    }
-                    None => std::borrow::Cow::Borrowed(jpeg_bytes.as_slice()),
-                };
+            let stripped = jpegtables.as_ref()
+                .and_then(|_| split_jpeg_to_tables_and_tile(jpeg_bytes))
+                .map(|(_, tile)| tile);
+            let write_bytes = stripped.as_deref().unwrap_or(jpeg_bytes);
             unsafe {
                 TIFFWriteRawTile(tiff, *tile_num,
                     write_bytes.as_ptr() as *mut c_void,
