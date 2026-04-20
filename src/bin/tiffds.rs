@@ -56,7 +56,8 @@ struct Args {
     input_dir:  String,
     output_dir: String,
     legacy:     bool,
-    mpp:        f64,
+    mpp:        Option<f64>,
+    half:       bool,
     quality:    u8,
     filter:     FilterType,
     verbose:    bool,
@@ -68,6 +69,7 @@ impl Args {
         let all: Vec<String> = args.collect();
         let legacy  = all.iter().any(|a| a == "--legacy");
         let verbose = all.iter().any(|a| a == "-v" || a == "--verbose");
+        let half    = all.iter().any(|a| a == "--half");
 
         let jobs = all.windows(2).find_map(|w| {
             if w[0] == "--jobs" || w[0] == "-j" { w[1].parse::<usize>().ok() } else { None }
@@ -75,7 +77,13 @@ impl Args {
 
         let mpp = all.windows(2).find_map(|w| {
             if w[0] == "--mpp" { w[1].parse::<f64>().ok() } else { None }
-        }).ok_or_else(|| "--mpp <value> is required".to_string())?;
+        });
+        if half && mpp.is_some() {
+            return Err("--half and --mpp are mutually exclusive".to_string());
+        }
+        if !half && mpp.is_none() {
+            return Err("--mpp <value> is required unless --half is specified".to_string());
+        }
 
         let quality = all.windows(2).find_map(|w| {
             if w[0] == "--quality" { w[1].parse::<u8>().ok() } else { None }
@@ -112,7 +120,7 @@ impl Args {
         let output_dir = positional.get(1)
             .ok_or_else(|| "Missing output directory".to_string())?.to_string();
 
-        Ok(Args { input_dir, output_dir, legacy, mpp, quality, filter, verbose, jobs })
+        Ok(Args { input_dir, output_dir, legacy, mpp, half, quality, filter, verbose, jobs })
     }
 }
 
@@ -154,9 +162,10 @@ fn main() {
     let start = std::time::Instant::now();
     let args = Args::build(std::env::args()).unwrap_or_else(|e| {
         eprintln!("Error: {e}");
-        eprintln!("Usage: tiffds <input_dir> <output_dir> --mpp <mpp> [OPTIONS]");
+        eprintln!("Usage: tiffds <input_dir> <output_dir> (--mpp <mpp> | --half) [OPTIONS]");
         eprintln!("Options:");
-        eprintln!("  --mpp <f>         Target microns-per-pixel (required)");
+        eprintln!("  --mpp <f>         Target microns-per-pixel (required unless --half)");
+        eprintln!("  --half            Halve width and height (fastest; mutually exclusive with --mpp)");
         eprintln!("  --legacy          Flat pyramidal BigTIFF instead of OME-TIFF");
         eprintln!("  --quality <n>     JPEG quality (default: 87)");
         eprintln!("  --filter <name>   nearest|triangle|catmullrom|gaussian|lanczos3 (default: nearest)");
@@ -178,7 +187,11 @@ fn run(args: Args) {
     if args.verbose {
         println!("Input:  {}", args.input_dir);
         println!("Output: {}", args.output_dir);
-        println!("Target MPP: {:.4} µm/px", args.mpp);
+        if let Some(mpp) = args.mpp {
+            println!("Target MPP: {:.4} µm/px", mpp);
+        } else {
+            println!("Target MPP: half (source × 2)");
+        }
     }
 
     if !Path::new(&args.output_dir).exists() {
@@ -230,15 +243,13 @@ fn run(args: Args) {
             .to_string_lossy().to_string();
         let src_stem = Path::new(&src_name)
             .file_stem().unwrap_or_default().to_string_lossy().to_string();
-        let out_name = if args.legacy {
-            format!("{src_stem}.tiff")
-        } else {
-            format!("{src_stem}.ome.tiff")
-        };
-        let out_path = Path::new(&args.output_dir).join(&out_name)
-            .to_string_lossy().to_string();
-
-        if Path::new(&out_path).exists() {
+        // Check all possible output variants (tiff, ome.tiff, svs for JP2K passthrough).
+        let already_exists = [
+            format!("{}.tiff",     src_stem),
+            format!("{}.ome.tiff", src_stem),
+            format!("{}.svs",      src_stem),
+        ].iter().any(|name| Path::new(&args.output_dir).join(name).exists());
+        if already_exists {
             if args.verbose { println!("  Skip (exists): {src_name}"); }
             skipped.fetch_add(1, Ordering::Relaxed);
             file_bar.inc(1);
@@ -249,7 +260,7 @@ fn run(args: Args) {
         pb.set_style(bar_style.clone());
         pb.set_message(src_name.clone());
 
-        process_file(&src_path, &out_path, &args, &pb);
+        process_file(&src_path, &args.output_dir, &src_stem, &args, &pb);
 
         pb.finish_and_clear();
         file_bar.inc(1);
@@ -263,13 +274,113 @@ fn run(args: Args) {
     }
 }
 
+// ─── JP2K SVS passthrough ─────────────────────────────────────────────────────
+
+// Write a BigTIFF SVS file by copying JP2K tiles verbatim from `src_path`.
+// `levels[0]` becomes the base IFD; `levels[1..]` become reduced-image IFDs.
+// Uses Aperio proprietary compression codes (33003/33005) so that OpenSlide
+// recognises the file as a valid JP2K SVS.
+fn write_jp2k_svs_from_tiff(
+    src_path: &str,
+    levels: &[LevelDesc],
+    dst_path: &str,
+    verbose: bool,
+    pb: &ProgressBar,
+) {
+    if levels.is_empty() { return; }
+    let base = &levels[0];
+
+    // Minimal Aperio-style ImageDescription (recognised by OpenSlide).
+    let img_desc = format!(
+        "Aperio Image Library\n{}x{} ({} x {})\nMPP = {:.6}",
+        base.img_w, base.img_h, base.tile_w, base.tile_h, base.mpp_x
+    );
+
+    let total_tiles: u64 = levels.iter().map(|lv| lv.n_tiles as u64).sum();
+    pb.set_length(total_tiles);
+
+    unsafe {
+        let src_c = CString::new(src_path).unwrap();
+        let dst_c = CString::new(dst_path).unwrap();
+        let r_mode  = CString::new("r").unwrap();
+        let w8_mode = CString::new("w8").unwrap();
+
+        let src_tiff = TIFFOpen(src_c.as_ptr(), r_mode.as_ptr());
+        if src_tiff.is_null() {
+            eprintln!("  [error] Cannot open source for JP2K passthrough: {src_path}");
+            return;
+        }
+        let dst_tiff = TIFFOpen(dst_c.as_ptr(), w8_mode.as_ptr());
+        if dst_tiff.is_null() {
+            eprintln!("  [error] Cannot create SVS: {dst_path}");
+            TIFFClose(src_tiff);
+            return;
+        }
+
+        for (idx, lv) in levels.iter().enumerate() {
+            navigate_to_level(src_tiff, &lv.nav);
+
+            // Aperio JP2K compression codes: 33003 = YCbCr, 33005 = RGB/gray.
+            let aperio_compr: u32 =
+                if lv.photometric as u32 == PHOTOMETRIC_YCBCR { COMPRESSION_APERIO_JP2_YCBCR }
+                else { COMPRESSION_APERIO_JP2_RGB };
+
+            let subfile: u32 = if idx == 0 { 0 } else { FILETYPE_REDUCEDIMAGE };
+            TIFFSetField(dst_tiff, TIFFTAG_SUBFILETYPE,     subfile);
+            TIFFSetField(dst_tiff, TIFFTAG_IMAGEWIDTH,      lv.img_w);
+            TIFFSetField(dst_tiff, TIFFTAG_IMAGELENGTH,     lv.img_h);
+            TIFFSetField(dst_tiff, TIFFTAG_TILEWIDTH,       lv.tile_w);
+            TIFFSetField(dst_tiff, TIFFTAG_TILELENGTH,      lv.tile_h);
+            TIFFSetField(dst_tiff, TIFFTAG_COMPRESSION,     aperio_compr);
+            TIFFSetField(dst_tiff, TIFFTAG_PHOTOMETRIC,     lv.photometric as u32);
+            if lv.photometric as u32 == PHOTOMETRIC_YCBCR {
+                TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING, 2u32, 2u32);
+            }
+            TIFFSetField(dst_tiff, TIFFTAG_SAMPLESPERPIXEL, lv.spp as u32);
+            TIFFSetField(dst_tiff, TIFFTAG_BITSPERSAMPLE,   8u32);
+            TIFFSetField(dst_tiff, TIFFTAG_SAMPLEFORMAT,    SAMPLEFORMAT_UINT as u32);
+            TIFFSetField(dst_tiff, TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG as u32);
+            TIFFSetField(dst_tiff, TIFFTAG_ORIENTATION,     ORIENTATION_TOPLEFT as u32);
+            TIFFSetField(dst_tiff, TIFFTAG_RESOLUTIONUNIT,  RESUNIT_CENTIMETER as u32);
+            TIFFSetField(dst_tiff, TIFFTAG_XRESOLUTION,     1e4 / lv.mpp_x);
+            TIFFSetField(dst_tiff, TIFFTAG_YRESOLUTION,     1e4 / lv.mpp_y);
+
+            if idx == 0 {
+                let desc_c = CString::new(img_desc.as_str()).unwrap();
+                TIFFSetField(dst_tiff, TIFFTAG_IMAGEDESCRIPTION, desc_c.as_ptr());
+            }
+
+            if verbose {
+                eprintln!("  [SVS] level {} {}x{} @ {:.4} µm/px ({} tiles)",
+                    idx, lv.img_w, lv.img_h, lv.mpp_x, lv.n_tiles);
+            }
+
+            // Allocate read buffer: use TIFFTileSize as upper bound for compressed tile size.
+            let raw_buf_size = (TIFFTileSize(src_tiff) as usize).max(1 << 17);
+            for tile_num in 0..lv.n_tiles {
+                let mut buf = vec![0u8; raw_buf_size];
+                let n = TIFFReadRawTile(src_tiff, tile_num,
+                    buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
+                if n > 0 {
+                    TIFFWriteRawTile(dst_tiff, tile_num,
+                        buf.as_ptr() as *mut c_void, n);
+                }
+                pb.inc(1);
+            }
+
+            TIFFWriteDirectory(dst_tiff);
+        }
+
+        TIFFClose(dst_tiff);
+        TIFFClose(src_tiff);
+    }
+}
+
 // ─── Per-file processing ──────────────────────────────────────────────────────
 
-fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
-    let tmp_path = format!("{out_path}.tmp");
-
+fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &Args, pb: &ProgressBar) {
     // Read source pyramid structure
-    let (src_levels, icc_profile) = {
+    let (mut src_levels, icc_profile) = {
         let src_c = CString::new(src_path).unwrap();
         let tiff = unsafe { TIFFOpen(src_c.as_ptr(), CString::new("r").unwrap().as_ptr()) };
         if tiff.is_null() {
@@ -287,19 +398,75 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
         return;
     }
 
-    let base = &src_levels[0];
-    if base.mpp_x <= 0.0 {
+    let mpp_unknown = src_levels[0].mpp_x <= 0.0;
+    if mpp_unknown && !args.half {
         eprintln!("  [error] Cannot determine resolution for {src_path}: \
             no XRESOLUTION tag and no 'MPP = <value>' in ImageDescription. Skipping.");
         return;
     }
+    // When --half with unknown MPP: assign synthetic MPPs from dimension ratios so
+    // that compute_output_levels can work; actual_mpp will be zeroed in output.
+    if args.half && mpp_unknown {
+        let bw = src_levels[0].img_w as f64;
+        let bh = src_levels[0].img_h as f64;
+        src_levels[0].mpp_x = 1.0;
+        src_levels[0].mpp_y = 1.0;
+        for lv in src_levels.iter_mut().skip(1) {
+            if lv.img_w > 0 { lv.mpp_x = bw / lv.img_w as f64; }
+            if lv.img_h > 0 { lv.mpp_y = bh / lv.img_h as f64; }
+        }
+    }
+    let base = &src_levels[0];
     if args.verbose {
         println!("  Source: {}x{} px @ {:.4} µm/px, {} levels",
             base.img_w, base.img_h, base.mpp_x, src_levels.len());
     }
 
+    // JP2K passthrough: when source is JP2K and a level close to the target exists,
+    // skip higher-res levels and write SVS without decode/encode.
+    // OpenSlide recognises JP2K tiles in SVS but not in plain TIFF/OME-TIFF.
+    let target_mpp = if args.half { base.mpp_x * 2.0 } else { args.mpp.unwrap() };
+    let jp2k_svs_skip: Option<usize> = if is_jp2k(base.compression as u32) {
+        let skip = src_levels.iter()
+            .take_while(|lv| lv.mpp_x < target_mpp * 0.9)
+            .count();
+        let has_match = src_levels.get(skip)
+            .map(|lv| (lv.mpp_x - target_mpp).abs() / target_mpp < 0.1)
+            .unwrap_or(false);
+        if skip > 0 && has_match { Some(skip) } else { None }
+    } else {
+        None
+    };
+
+    // Determine actual output path now that we know whether SVS passthrough applies.
+    let out_path = if jp2k_svs_skip.is_some() {
+        format!("{out_dir}/{out_stem}.svs")
+    } else if args.legacy {
+        format!("{out_dir}/{out_stem}.tiff")
+    } else {
+        format!("{out_dir}/{out_stem}.ome.tiff")
+    };
+    let tmp_path = format!("{out_path}.tmp");
+
+    if let Some(skip) = jp2k_svs_skip {
+        if args.verbose {
+            println!("  [JP2K passthrough] skipping {} high-res level(s), SVS base {:.4} µm/px",
+                skip, src_levels[skip].mpp_x);
+        }
+        write_jp2k_svs_from_tiff(src_path, &src_levels[skip..], &tmp_path, args.verbose, pb);
+        std::fs::rename(&tmp_path, &out_path)
+            .expect("Failed to rename tmp to output");
+        return;
+    }
+
     // Compute output pyramid levels
-    let output_levels = compute_output_levels(&src_levels, args.mpp, args.verbose);
+    let mut output_levels = compute_output_levels(&src_levels, target_mpp, args.verbose);
+    if mpp_unknown {
+        for lv in output_levels.iter_mut() {
+            lv.actual_mpp_x = 0.0;
+            lv.actual_mpp_y = 0.0;
+        }
+    }
     if output_levels.is_empty() {
         eprintln!("  [warn] No output levels produced for {src_path}");
         return;
@@ -416,8 +583,10 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
             TIFFSetField(dst_tiff, TIFFTAG_PLANARCONFIG,     PLANARCONFIG_CONTIG as u32);
             TIFFSetField(dst_tiff, TIFFTAG_ORIENTATION,      ORIENTATION_TOPLEFT as u32);
             TIFFSetField(dst_tiff, TIFFTAG_RESOLUTIONUNIT,   RESUNIT_CENTIMETER as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_XRESOLUTION,      1e4 / lv_out.actual_mpp_x);
-            TIFFSetField(dst_tiff, TIFFTAG_YRESOLUTION,      1e4 / lv_out.actual_mpp_y);
+            if lv_out.actual_mpp_x > 0.0 {
+                TIFFSetField(dst_tiff, TIFFTAG_XRESOLUTION,  1e4 / lv_out.actual_mpp_x);
+                TIFFSetField(dst_tiff, TIFFTAG_YRESOLUTION,  1e4 / lv_out.actual_mpp_y);
+            }
 
             if lv_out.passthrough {
                 // Passthrough: preserve source compression and photometric
@@ -533,6 +702,7 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
             let src_photometric   = src_lv.photometric as u32;
             let n_reduce          = n_reduce;
             let jpeg_tables_ref   = jpeg_tables_ref;
+            let half              = args.half;
 
             if lv_out.passthrough {
                 // Passthrough: copy source tiles to the output IFD unchanged.
@@ -643,44 +813,85 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                                 std::array::from_fn(|qi| {
                                     let (data, is_raw_decode) = quads[qi].as_ref()?;
                                     if *is_raw_decode && src_is_jpeg {
-                                        let inject_app14 =
-                                            spp == 3 && src_photometric == PHOTOMETRIC_RGB;
-                                        let combined: Vec<u8> =
-                                            if let Some(tables) = jpeg_tables_ref {
-                                                let app14_len = if inject_app14 {
-                                                    APP14_ADOBE_RGB.len()
-                                                } else { 0 };
-                                                let mut v = Vec::with_capacity(
-                                                    2 + app14_len
-                                                    + (tables.len() - 4)
-                                                    + (data.len() - 2));
-                                                v.extend_from_slice(&tables[0..2]);
-                                                if inject_app14 {
-                                                    v.extend_from_slice(&APP14_ADOBE_RGB);
-                                                }
-                                                v.extend_from_slice(
-                                                    &tables[2..tables.len()-2]);
-                                                v.extend_from_slice(&data[2..]);
-                                                v
-                                            } else { data.clone() };
                                         let fmt = if spp == 1 {
                                             turbojpeg::PixelFormat::GRAY
                                         } else {
                                             turbojpeg::PixelFormat::RGB
                                         };
-                                        let dec =
-                                            turbojpeg::decompress(&combined, fmt).ok()?;
-                                        let (w, h) = (dec.width as u32, dec.height as u32);
-                                        let pitch = w as usize * ch;
-                                        let pix = if dec.pitch == pitch {
-                                            dec.pixels
+                                        if half {
+                                            // DCT-domain 1/2 scaling: decode at half
+                                            // resolution without a full IDCT.
+                                            // JPEGTABLES must be prepended if present.
+                                            let inject_app14 =
+                                                spp == 3 && src_photometric == PHOTOMETRIC_RGB;
+                                            let combined: Vec<u8> =
+                                                if let Some(tables) = jpeg_tables_ref {
+                                                    let app14_len = if inject_app14 {
+                                                        APP14_ADOBE_RGB.len()
+                                                    } else { 0 };
+                                                    let mut v = Vec::with_capacity(
+                                                        2 + app14_len
+                                                        + (tables.len() - 4)
+                                                        + (data.len() - 2));
+                                                    v.extend_from_slice(&tables[0..2]);
+                                                    if inject_app14 {
+                                                        v.extend_from_slice(&APP14_ADOBE_RGB);
+                                                    }
+                                                    v.extend_from_slice(
+                                                        &tables[2..tables.len()-2]);
+                                                    v.extend_from_slice(&data[2..]);
+                                                    v
+                                                } else { data.clone() };
+                                            let mut dec =
+                                                turbojpeg::Decompressor::new().ok()?;
+                                            dec.set_scaling_factor(
+                                                turbojpeg::ScalingFactor::ONE_HALF).ok()?;
+                                            let header = dec.read_header(&combined).ok()?;
+                                            let scaled = header.scaled(
+                                                turbojpeg::ScalingFactor::ONE_HALF);
+                                            let (w, h) = (scaled.width, scaled.height);
+                                            let pitch = w * ch;
+                                            let mut pixels = vec![0u8; h * pitch];
+                                            dec.decompress(&combined, turbojpeg::Image {
+                                                pixels: pixels.as_mut_slice(),
+                                                width: w, pitch, height: h, format: fmt,
+                                            }).ok()?;
+                                            Some((pixels, w as u32, h as u32))
                                         } else {
-                                            (0..h as usize).flat_map(|r| {
-                                                let s = r * dec.pitch;
-                                                dec.pixels[s..s+pitch].iter().copied()
-                                            }).collect()
-                                        };
-                                        Some((pix, w, h))
+                                            let inject_app14 =
+                                                spp == 3 && src_photometric == PHOTOMETRIC_RGB;
+                                            let combined: Vec<u8> =
+                                                if let Some(tables) = jpeg_tables_ref {
+                                                    let app14_len = if inject_app14 {
+                                                        APP14_ADOBE_RGB.len()
+                                                    } else { 0 };
+                                                    let mut v = Vec::with_capacity(
+                                                        2 + app14_len
+                                                        + (tables.len() - 4)
+                                                        + (data.len() - 2));
+                                                    v.extend_from_slice(&tables[0..2]);
+                                                    if inject_app14 {
+                                                        v.extend_from_slice(&APP14_ADOBE_RGB);
+                                                    }
+                                                    v.extend_from_slice(
+                                                        &tables[2..tables.len()-2]);
+                                                    v.extend_from_slice(&data[2..]);
+                                                    v
+                                                } else { data.clone() };
+                                            let dec =
+                                                turbojpeg::decompress(&combined, fmt).ok()?;
+                                            let (w, h) = (dec.width as u32, dec.height as u32);
+                                            let pitch = w as usize * ch;
+                                            let pix = if dec.pitch == pitch {
+                                                dec.pixels
+                                            } else {
+                                                (0..h as usize).flat_map(|r| {
+                                                    let s = r * dec.pitch;
+                                                    dec.pixels[s..s+pitch].iter().copied()
+                                                }).collect()
+                                            };
+                                            Some((pix, w, h))
+                                        }
                                     } else if *is_raw_decode {
                                         // JP2K
                                         let params = jpeg2k::DecodeParameters::default()
@@ -784,14 +995,21 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
                                 }
                             }
 
-                            // Resize stitch canvas → output tile dimensions
-                            let src_fir = fir::images::Image::from_vec_u8(
-                                canvas_w, canvas_h, canvas, fpt).ok()?;
-                            let mut dst_fir =
-                                fir::images::Image::new(out_tile_w, out_tile_h, fpt);
-                            fir::Resizer::new()
-                                .resize(&src_fir, &mut dst_fir, &resize_opts).ok()?;
-                            let resized = dst_fir.into_vec();
+                            // Resize stitch canvas → output tile dimensions.
+                            // Skip when canvas already matches (e.g. JPEG/JP2K decoded at
+                            // 1/2 in --half mode: 2×2 × (src/2) = src = out_tile).
+                            let resized: Vec<u8> =
+                                if canvas_w == out_tile_w && canvas_h == out_tile_h {
+                                    canvas
+                                } else {
+                                    let src_fir = fir::images::Image::from_vec_u8(
+                                        canvas_w, canvas_h, canvas, fpt).ok()?;
+                                    let mut dst_fir =
+                                        fir::images::Image::new(out_tile_w, out_tile_h, fpt);
+                                    fir::Resizer::new()
+                                        .resize(&src_fir, &mut dst_fir, &resize_opts).ok()?;
+                                    dst_fir.into_vec()
+                                };
 
                             // JPEG encode
                             let jpeg = if spp == 1 {
@@ -863,7 +1081,7 @@ fn process_file(src_path: &str, out_path: &str, args: &Args, pb: &ProgressBar) {
     }
 
     // Atomic rename: .tmp → final path
-    if let Err(e) = std::fs::rename(&tmp_path, out_path) {
+    if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
         eprintln!("  [error] Failed to rename {tmp_path} → {out_path}: {e}");
         let _ = std::fs::remove_file(&tmp_path);
     }

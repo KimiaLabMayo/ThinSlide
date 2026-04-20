@@ -53,6 +53,7 @@ dcm2tiff <input_dir> <output_dir> [OPTIONS]
 | Option | Description | Default |
 |---|---|---|
 | `--mpp <N>` | Downsample to this resolution (µm/pixel) | off (passthrough) |
+| `--half` | Halve width and height (fastest downsampling; mutually exclusive with `--mpp`) | off |
 | `--legacy` | Write BigTIFF or SVS instead of OME-TIFF | off |
 | `-j` / `--jobs <N>` | Number of parallel threads | all CPUs |
 | `--quality <N>` | JPEG quality for downsampling (1–100) | 87 |
@@ -77,6 +78,9 @@ dcm2tiff <input_dir> <output_dir> [OPTIONS]
 
 # On HDD: process one series at a time to avoid seek contention
 ./target/release/dcm2tiff /data/dicoms /data/output -j 1
+
+# Halve width and height (fastest for JPEG sources: DCT-domain 1/2 decode + no resize)
+./target/release/dcm2tiff /data/dicoms /data/output --half
 ```
 
 ### Parallelism
@@ -84,7 +88,7 @@ dcm2tiff <input_dir> <output_dir> [OPTIONS]
 | Mode | `-j N` controls |
 |---|---|
 | Passthrough | Number of series processed concurrently (use `-j 1` on HDD) |
-| `--mpp` (downsampling) | Tile-level parallelism within one series (all CPUs is fine) |
+| `--mpp` / `--half` (downsampling) | Tile-level parallelism within one series (all CPUs is fine) |
 
 ---
 
@@ -92,17 +96,18 @@ dcm2tiff <input_dir> <output_dir> [OPTIONS]
 
 Downsamples existing TIFF / SVS files to a target resolution. Reads every `.tiff` / `.svs` file under the input directory and writes a pyramidal OME-TIFF (default) or BigTIFF (`--legacy`).
 
-`--mpp` is required.
+Either `--mpp` or `--half` is required.
 
 ### Usage
 
 ```
-tiffds <input_dir> <output_dir> --mpp <N> [OPTIONS]
+tiffds <input_dir> <output_dir> (--mpp <N> | --half) [OPTIONS]
 ```
 
 | Option | Description | Default |
 |---|---|---|
-| `--mpp <N>` | **Required.** Target resolution (µm/pixel) | — |
+| `--mpp <N>` | Target resolution (µm/pixel); required unless `--half` | — |
+| `--half` | Halve width and height (fastest downsampling; mutually exclusive with `--mpp`) | off |
 | `--legacy` | Write flat pyramidal BigTIFF instead of OME-TIFF | off |
 | `-j` / `--jobs <N>` | Number of parallel threads | all CPUs |
 | `--quality <N>` | JPEG quality (1–100) | 87 |
@@ -120,6 +125,9 @@ tiffds <input_dir> <output_dir> --mpp <N> [OPTIONS]
 
 # Write flat BigTIFF instead of OME-TIFF
 ./target/release/tiffds /data/slides /data/output --mpp 2.0 --legacy
+
+# Halve width and height (fastest for JPEG sources)
+./target/release/tiffds /data/slides /data/output --half
 ```
 
 ---

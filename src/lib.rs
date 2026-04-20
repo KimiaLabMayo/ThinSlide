@@ -450,6 +450,10 @@ pub struct Args {
     /// When true, use the parent directory name of the DICOM files as the
     /// output filename instead of the Series Instance UID.
     pub use_parent_name: bool,
+    /// When true, halve both width and height (1/4 area).
+    /// JPEG tiles are decoded at 1/2 via DCT-domain scaling; JP2K uses n_reduce=1.
+    /// Mutually exclusive with --mpp.
+    pub half: bool,
 }
 
 impl Args {
@@ -458,6 +462,7 @@ impl Args {
         let legacy          = all.iter().any(|a| a == "--legacy");
         let verbose         = all.iter().any(|a| a == "-v" || a == "--verbose");
         let use_parent_name = all.iter().any(|a| a == "--use-parent-name");
+        let half            = all.iter().any(|a| a == "--half");
 
         // Parse --jobs N or -j N
         let jobs = all.windows(2).find_map(|w| {
@@ -515,7 +520,10 @@ impl Args {
         }
         let input_dir  = positional.get(0).ok_or("Didn't get an input directory path")?.to_string();
         let output_dir = positional.get(1).ok_or("Didn't get an output directory path")?.to_string();
-        Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter, use_parent_name })
+        if half && mpp.is_some() {
+            return Err("--half and --mpp are mutually exclusive");
+        }
+        Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter, use_parent_name, half })
     }
 }
 
@@ -1530,6 +1538,7 @@ fn write_resampled_tiff(
     ome: bool,
     pb: Option<&ProgressBar>,
     verbose: bool,
+    half: bool,
 ) {
 
     // ── Group DICOM files by resolution level ─────────────────────────────
@@ -1777,7 +1786,7 @@ fn write_resampled_tiff(
     let fir_pixel_type = if spp == 1 { fir::PixelType::U8 } else { fir::PixelType::U8x3 };
     let resize_opts = fir::ResizeOptions::new().resize_alg(fir_alg);
 
-    let write_level_tiles = |tiff: *mut TIFF, lv: &LevelInfo| {
+    let write_level_tiles = |tiff: *mut TIFF, lv: &LevelInfo, half: bool| {
         let chunk_size = (rayon::current_num_threads() * 4).max(1);
 
         // n_reduce for JP2K DWT: each source tile is scaled to nat_otw = out_tile_w/2
@@ -1899,24 +1908,32 @@ fn write_resampled_tiff(
                         std::array::from_fn(|qi| {
                             let data = quads[qi].as_ref()?;
                             if is_jpeg_src {
-                                if spp == 1 {
-                                    let dec = turbojpeg::decompress(
-                                        data, turbojpeg::PixelFormat::GRAY).ok()?;
-                                    let (w, h) = (dec.width as u32, dec.height as u32);
-                                    let pix = if dec.pitch == dec.width {
-                                        dec.pixels
-                                    } else {
-                                        (0..h as usize).flat_map(|r| {
-                                            dec.pixels[r*dec.pitch..r*dec.pitch+dec.width]
-                                                .iter().copied()
-                                        }).collect()
-                                    };
-                                    Some((pix, w, h))
+                                let fmt = if spp == 1 {
+                                    turbojpeg::PixelFormat::GRAY
                                 } else {
-                                    let dec = turbojpeg::decompress(
-                                        data, turbojpeg::PixelFormat::RGB).ok()?;
+                                    turbojpeg::PixelFormat::RGB
+                                };
+                                if half {
+                                    // DCT-domain 1/2 scaling: decode directly at half
+                                    // resolution without a full IDCT, then skip resize.
+                                    let mut dec = turbojpeg::Decompressor::new().ok()?;
+                                    dec.set_scaling_factor(
+                                        turbojpeg::ScalingFactor::ONE_HALF).ok()?;
+                                    let header = dec.read_header(data).ok()?;
+                                    let scaled = header.scaled(
+                                        turbojpeg::ScalingFactor::ONE_HALF);
+                                    let (w, h) = (scaled.width, scaled.height);
+                                    let pitch = w * ch;
+                                    let mut pixels = vec![0u8; h * pitch];
+                                    dec.decompress(data, turbojpeg::Image {
+                                        pixels: pixels.as_mut_slice(),
+                                        width: w, pitch, height: h, format: fmt,
+                                    }).ok()?;
+                                    Some((pixels, w as u32, h as u32))
+                                } else {
+                                    let dec = turbojpeg::decompress(data, fmt).ok()?;
                                     let (w, h) = (dec.width as u32, dec.height as u32);
-                                    let pitch = dec.width * 3;
+                                    let pitch = w as usize * ch;
                                     let pix = if dec.pitch == pitch {
                                         dec.pixels
                                     } else {
@@ -2021,12 +2038,20 @@ fn write_resampled_tiff(
                     }
 
                     // ── Resize stitch canvas → output tile dimensions ──────
-                    let src_fir = fir::images::Image::from_vec_u8(
-                        canvas_w, canvas_h, canvas, fir_pixel_type).ok()?;
-                    let mut dst_fir = fir::images::Image::new(
-                        lv.out_tile_w, lv.out_tile_h, fir_pixel_type);
-                    fir::Resizer::new().resize(&src_fir, &mut dst_fir, &resize_opts).ok()?;
-                    let resized_raw = dst_fir.into_vec();
+                    // Skip when canvas already matches the output tile (e.g. JPEG/JP2K
+                    // decoded at 1/2 in --half mode: 2×2 × (src/2) = src = out_tile).
+                    let resized_raw: Vec<u8> =
+                        if canvas_w == lv.out_tile_w && canvas_h == lv.out_tile_h {
+                            canvas
+                        } else {
+                            let src_fir = fir::images::Image::from_vec_u8(
+                                canvas_w, canvas_h, canvas, fir_pixel_type).ok()?;
+                            let mut dst_fir = fir::images::Image::new(
+                                lv.out_tile_w, lv.out_tile_h, fir_pixel_type);
+                            fir::Resizer::new()
+                                .resize(&src_fir, &mut dst_fir, &resize_opts).ok()?;
+                            dst_fir.into_vec()
+                        };
 
                     // ── JPEG encode ───────────────────────────────────────
                     let jpeg_bytes = if spp == 1 {
@@ -2223,7 +2248,7 @@ fn write_resampled_tiff(
                     }
                 }
 
-                write_level_tiles(tiff, lv);
+                write_level_tiles(tiff, lv, half);
             }
 
             TIFFWriteDirectory(tiff);
@@ -2262,26 +2287,58 @@ fn convert_one_series(
     let series_id     = &slide_levels_owned[0].series_instance_uid;
     let ts_uid        = &slide_levels_owned[0].transfer_syntax_uid;
     let comp          = map_transfer_syntax_to_compression(ts_uid);
-    let src_mpp       = slide_levels_owned[0].mpp_x.unwrap_or(0.25);
+    let src_mpp_opt   = slide_levels_owned[0].mpp_x;
+    let src_mpp       = src_mpp_opt.unwrap_or(0.25);
 
-    // if effective_mpp/src_mpp is <10% difference, treat as effectively the same to avoid unnecessary resampling.
-    let mut effective_mpp = args.mpp.filter(|&t| t > src_mpp);
-    if let Some(val) = effective_mpp {
-        if (val - src_mpp).abs() / src_mpp < 0.1 {
+    // --half: always downsample to exactly 2× the source MPP (no 10% tolerance check).
+    //         Proceeds even when source MPP is unknown (dimension halving still works).
+    // --mpp:  skip resampling when source MPP is unknown or within 10% of the source.
+    let effective_mpp: Option<f64> = if args.half {
+        Some(src_mpp * 2.0)
+    } else {
+        if src_mpp_opt.is_none() {
             if args.verbose {
-                println!(
-                    "  [info] requested MPP {:.4} µm/px is within 10% of source MPP {:.4} µm/px; skipping resampling",
-                    val, src_mpp
-                );
+                println!("  [info] source MPP unknown; skipping (--mpp requires known source MPP)");
             }
-            effective_mpp = None;
+            None
+        } else {
+            let mut em = args.mpp.filter(|&t| t > src_mpp);
+            if let Some(val) = em {
+                if (val - src_mpp).abs() / src_mpp < 0.1 {
+                    if args.verbose {
+                        println!(
+                            "  [info] requested MPP {:.4} µm/px is within 10% of source MPP {:.4} µm/px; skipping resampling",
+                            val, src_mpp
+                        );
+                    }
+                    em = None;
+                }
+            }
+            em
         }
-    }
+    };
 
     if args.verbose {
         println!(" - Series {}: {} levels \n - Src MPP: {:.4} µm/px \n - Compression: {} \n - Effective MPP: {:?}",
             series_id, slide_levels_owned.len(), src_mpp, comp, effective_mpp);
     }
+
+    // When the source is JP2K and a level close to the target exists, passthrough the
+    // matching level and all coarser levels as SVS without any decode or re-encode.
+    // OpenSlide recognises JP2K tiles in SVS but not in plain TIFF/OME-TIFF.
+    let jp2k_svs_skip: Option<usize> = effective_mpp.and_then(|target| {
+        if !is_jpeg2000(&comp) { return None; }
+        // Count levels finer than target (smaller mpp = higher resolution).
+        let skip = slide_levels_owned.iter()
+            .take_while(|m| m.mpp_x.unwrap_or(f64::MAX) < target * 0.9)
+            .count();
+        // The first kept level must be within 10% of the target MPP.
+        let has_match = slide_levels_owned.get(skip)
+            .and_then(|m| m.mpp_x)
+            .map(|mpp| (mpp - target).abs() / target < 0.1)
+            .unwrap_or(false);
+        if skip > 0 && has_match { Some(skip) } else { None }
+    });
 
     // Resolve the stem used for the output filename.
     let file_stem: String = if args.use_parent_name {
@@ -2295,7 +2352,10 @@ fn convert_one_series(
         series_id.clone()
     };
 
-    let output_path = if effective_mpp.is_some() {
+    let output_path = if jp2k_svs_skip.is_some() {
+        // JP2K passthrough: always SVS (OpenSlide requires SVS for JP2K, not plain TIFF).
+        format!("{}/{}.svs", args.output_dir, file_stem)
+    } else if effective_mpp.is_some() {
         if args.legacy {
             format!("{}/{}.tiff", args.output_dir, file_stem)
         } else {
@@ -2338,7 +2398,24 @@ fn convert_one_series(
 
     let tmp_path = format!("{}.tmp", output_path);
 
-    if let Some(target_mpp) = effective_mpp {
+    if let Some(skip) = jp2k_svs_skip {
+        // JP2K passthrough: skip the high-res level(s) and write SVS from the matching
+        // level onward. write_svs treats slide_levels[0] as the new base IFD.
+        if args.verbose {
+            let base_mpp = slide_levels_owned[skip].mpp_x.unwrap_or(0.0);
+            println!("  [JP2K passthrough] skipping {} high-res level(s), SVS base {:.4} µm/px",
+                skip, base_mpp);
+        }
+        write_svs(
+            &slide_levels_owned[skip..],
+            thumbnail_meta.as_ref(),
+            label_meta.as_ref(),
+            overview_meta.as_ref(),
+            &tmp_path,
+            Some(&pb),
+            args.verbose,
+        );
+    } else if let Some(target_mpp) = effective_mpp {
         if args.verbose {
             println!("  [resample] Requested MPP: {:.4} µm/px", target_mpp);
         }
@@ -2348,6 +2425,7 @@ fn convert_one_series(
             !args.legacy,
             Some(&pb),
             args.verbose,
+            args.half,
         );
     } else if args.legacy {
         if is_jpeg2000(&comp) {
@@ -2531,7 +2609,7 @@ pub fn run(args: Args) {
 
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            if args_ref.mpp.is_some() {
+            if args_ref.mpp.is_some() || args_ref.half {
                 if args.verbose {
                     println!("Resampling mode");
                 }
