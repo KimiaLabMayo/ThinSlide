@@ -6,6 +6,7 @@
 use std::ffi::CString;
 use std::os::raw::c_void;
 use std::path::Path;
+use std::sync::{Arc, mpsc};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use rayon::prelude::*;
 use walkdir::WalkDir;
@@ -154,6 +155,229 @@ struct OutputLevel {
     actual_mpp_y: f64,
     src_idx:     usize,
     passthrough: bool,
+}
+
+// ─── Pipeline types ───────────────────────────────────────────────────────────
+
+type RawQuad  = [Option<(Vec<u8>, bool)>; 4];
+type RawChunk = Vec<(u32, RawQuad)>;
+type EncChunk = Vec<(u32, Vec<u8>)>;
+
+struct EncodeParams {
+    quality:           u8,
+    src_tile_w:        u32,
+    src_tile_h:        u32,
+    out_tile_w:        u32,
+    out_tile_h:        u32,
+    spp:               u32,
+    resize_opts:       fir::ResizeOptions,
+    fpt:               fir::PixelType,
+    src_is_jpeg:       bool,
+    src_jp2k_is_ycbcr: bool,
+    src_photometric:   u32,
+    n_reduce:          u32,
+    half:              bool,
+    jpeg_tables:       Option<Arc<Vec<u8>>>,
+}
+
+fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u32, Vec<u8>)> {
+    let ch = p.spp as usize;
+    const APP14_ADOBE_RGB: [u8; 16] = [
+        0xFF, 0xEE, 0x00, 0x0E,
+        b'A', b'd', b'o', b'b', b'e',
+        0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    let decoded: [Option<(Vec<u8>, u32, u32)>; 4] = std::array::from_fn(|qi| {
+        let (data, is_raw_decode) = quads[qi].as_ref()?;
+        if *is_raw_decode && p.src_is_jpeg {
+            let fmt = if p.spp == 1 { turbojpeg::PixelFormat::GRAY } else { turbojpeg::PixelFormat::RGB };
+            let inject_app14 = p.spp == 3 && p.src_photometric == PHOTOMETRIC_RGB;
+            let combined: Vec<u8> = if let Some(ref tables) = p.jpeg_tables {
+                let app14_len = if inject_app14 { APP14_ADOBE_RGB.len() } else { 0 };
+                let mut v = Vec::with_capacity(2 + app14_len + (tables.len() - 4) + (data.len() - 2));
+                v.extend_from_slice(&tables[0..2]);
+                if inject_app14 { v.extend_from_slice(&APP14_ADOBE_RGB); }
+                v.extend_from_slice(&tables[2..tables.len()-2]);
+                v.extend_from_slice(&data[2..]);
+                v
+            } else { data.clone() };
+
+            if p.half {
+                let mut dec = turbojpeg::Decompressor::new().ok()?;
+                dec.set_scaling_factor(turbojpeg::ScalingFactor::ONE_HALF).ok()?;
+                let header = dec.read_header(&combined).ok()?;
+                let scaled = header.scaled(turbojpeg::ScalingFactor::ONE_HALF);
+                let (w, h) = (scaled.width, scaled.height);
+                let pitch = w * ch;
+                let mut pixels = vec![0u8; h * pitch];
+                dec.decompress(&combined, turbojpeg::Image {
+                    pixels: pixels.as_mut_slice(), width: w, pitch, height: h, format: fmt,
+                }).ok()?;
+                Some((pixels, w as u32, h as u32))
+            } else {
+                let dec = turbojpeg::decompress(&combined, fmt).ok()?;
+                let (w, h) = (dec.width as u32, dec.height as u32);
+                let pitch = w as usize * ch;
+                let pix = if dec.pitch == pitch {
+                    dec.pixels
+                } else {
+                    (0..h as usize).flat_map(|r| {
+                        let s = r * dec.pitch;
+                        dec.pixels[s..s+pitch].iter().copied()
+                    }).collect()
+                };
+                Some((pix, w, h))
+            }
+        } else if *is_raw_decode {
+            // JP2K
+            let params = jpeg2k::DecodeParameters::default().reduce(p.n_reduce);
+            let img = jpeg2k::Image::from_bytes_with(data, params).ok()?;
+            let comps = img.components();
+            if comps.is_empty() { return None; }
+            let luma_w = comps[0].width() as usize;
+            let luma_h = comps[0].height() as usize;
+            if luma_w == 0 || luma_h == 0 { return None; }
+            let mut pix: Vec<u8> = if p.spp == 1 || comps.len() < 3 {
+                comps[0].data_u8().collect()
+            } else {
+                let y_u8: Vec<u8>  = comps[0].data_u8().collect();
+                let cb_u8: Vec<u8> = comps[1].data_u8().collect();
+                let cr_u8: Vec<u8> = comps[2].data_u8().collect();
+                let cb_w = comps[1].width() as usize;
+                let cb_h = comps[1].height() as usize;
+                let cr_w = comps[2].width() as usize;
+                let cr_h = comps[2].height() as usize;
+                let mut buf = Vec::with_capacity(luma_w * luma_h * 3);
+                for row in 0..luma_h {
+                    for col in 0..luma_w {
+                        let y = y_u8[row*luma_w+col];
+                        let cb_col = (col*cb_w/luma_w).min(cb_w.saturating_sub(1));
+                        let cb_row = (row*cb_h/luma_h).min(cb_h.saturating_sub(1));
+                        let cb = cb_u8[cb_row*cb_w+cb_col];
+                        let cr_col = (col*cr_w/luma_w).min(cr_w.saturating_sub(1));
+                        let cr_row = (row*cr_h/luma_h).min(cr_h.saturating_sub(1));
+                        let cr = cr_u8[cr_row*cr_w+cr_col];
+                        buf.extend_from_slice(&[y, cb, cr]);
+                    }
+                }
+                buf
+            };
+            let color_space = img.color_space();
+            let needs_ycbcr_cvt = p.spp == 3 && (
+                matches!(color_space, jpeg2k::ColorSpace::SYCC)
+                || (p.src_jp2k_is_ycbcr && !matches!(color_space, jpeg2k::ColorSpace::SRGB))
+            );
+            if needs_ycbcr_cvt {
+                for c in pix.chunks_mut(3) {
+                    let y  = c[0] as f32;
+                    let cb = c[1] as f32 - 128.0;
+                    let cr = c[2] as f32 - 128.0;
+                    c[0] = (y + 1.40200 * cr).clamp(0.0, 255.0) as u8;
+                    c[1] = (y - 0.34414*cb - 0.71414*cr).clamp(0.0, 255.0) as u8;
+                    c[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
+                }
+            }
+            Some((pix, luma_w as u32, luma_h as u32))
+        } else {
+            Some((data.clone(), p.src_tile_w, p.src_tile_h))
+        }
+    });
+
+    if decoded.iter().all(|d| d.is_none()) { return None; }
+
+    let (slot_w, slot_h) = decoded.iter()
+        .filter_map(|d| d.as_ref().map(|(_, pw, ph)| (*pw, *ph)))
+        .fold((1u32, 1u32), |(mw, mh), (w, h)| (mw.max(w), mh.max(h)));
+    let canvas_w = slot_w * 2;
+    let canvas_h = slot_h * 2;
+    let mut canvas = vec![0u8; canvas_w as usize * canvas_h as usize * ch];
+
+    for qi in 0..4usize {
+        let Some((pixels, pw, ph)) = &decoded[qi] else { continue; };
+        let dc = qi % 2;
+        let dr = qi / 2;
+        let ox = dc * slot_w as usize;
+        let oy = dr * slot_h as usize;
+        for row in 0..(*ph as usize) {
+            let src_start = row * *pw as usize * ch;
+            let dst_start = (oy + row) * canvas_w as usize * ch + ox * ch;
+            let copy_len  = *pw as usize * ch;
+            canvas[dst_start..dst_start + copy_len]
+                .copy_from_slice(&pixels[src_start..src_start + copy_len]);
+        }
+    }
+
+    let resized: Vec<u8> = if canvas_w == p.out_tile_w && canvas_h == p.out_tile_h {
+        canvas
+    } else {
+        let src_fir = fir::images::Image::from_vec_u8(canvas_w, canvas_h, canvas, p.fpt).ok()?;
+        let mut dst_fir = fir::images::Image::new(p.out_tile_w, p.out_tile_h, p.fpt);
+        fir::Resizer::new().resize(&src_fir, &mut dst_fir, &p.resize_opts).ok()?;
+        dst_fir.into_vec()
+    };
+
+    let jpeg = if p.spp == 1 {
+        turbojpeg::compress(
+            turbojpeg::Image::<&[u8]> {
+                pixels: &resized, width: p.out_tile_w as usize,
+                pitch: p.out_tile_w as usize, height: p.out_tile_h as usize,
+                format: turbojpeg::PixelFormat::GRAY,
+            },
+            p.quality as i32, turbojpeg::Subsamp::Gray,
+        ).ok()?.to_vec()
+    } else {
+        turbojpeg::compress(
+            turbojpeg::Image::<&[u8]> {
+                pixels: &resized, width: p.out_tile_w as usize,
+                pitch: p.out_tile_w as usize * 3, height: p.out_tile_h as usize,
+                format: turbojpeg::PixelFormat::RGB,
+            },
+            p.quality as i32, turbojpeg::Subsamp::Sub2x2,
+        ).ok()?.to_vec()
+    };
+
+    Some((out_id, jpeg))
+}
+
+fn compute_thread_body(
+    raw_rx: mpsc::Receiver<RawChunk>,
+    enc_tx: mpsc::SyncSender<EncChunk>,
+    params: Arc<EncodeParams>,
+) {
+    for raw_chunk in raw_rx {
+        let mut encoded: EncChunk = raw_chunk
+            .par_iter()
+            .filter_map(|(id, quads)| encode_one_tile(*id, quads, &params))
+            .collect();
+        encoded.sort_unstable_by_key(|(n, _)| *n);
+        if enc_tx.send(encoded).is_err() { break; }
+    }
+}
+
+unsafe fn write_enc_chunk(
+    tiff: *mut TIFF,
+    chunk: &EncChunk,
+    jpegtables_registered: &mut bool,
+) {
+    for (id, jpeg) in chunk {
+        let split = split_jpeg_to_tables_and_tile(jpeg);
+        if !*jpegtables_registered {
+            if let Some((ref tables, _)) = split {
+                unsafe {
+                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES,
+                        tables.len() as u32, tables.as_ptr());
+                }
+                *jpegtables_registered = true;
+            }
+        }
+        let write_bytes = split.as_ref().map(|(_, t)| t.as_slice()).unwrap_or(jpeg.as_slice());
+        unsafe {
+            TIFFWriteRawTile(tiff, *id,
+                write_bytes.as_ptr() as *mut c_void,
+                write_bytes.len() as i64);
+        }
+    }
 }
 
 // ─── Entry point ──────────────────────────────────────────────────────────────
@@ -673,36 +897,20 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &Args, pb: 
             // complete stream for turbojpeg:
             //   combined = JPEGTABLES[0..len-2] + tile[2..]
             //            = SOI + DQT + DHT + SOF + SOS + data + EOI  ✓
-            let jpeg_tables: Option<Vec<u8>> = if src_is_jpeg && !lv_out.passthrough {
+            let jpeg_tables_arc: Option<Arc<Vec<u8>>> = if src_is_jpeg && !lv_out.passthrough {
                 let mut tlen: u32 = 0;
                 let mut tptr: *const u8 = std::ptr::null();
                 let ok = TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
                     &mut tlen as *mut u32,
                     &mut tptr as *mut *const u8);
                 if ok != 0 && !tptr.is_null() && tlen > 2 {
-                    Some(std::slice::from_raw_parts(tptr, tlen as usize).to_vec())
+                    Some(Arc::new(std::slice::from_raw_parts(tptr, tlen as usize).to_vec()))
                 } else {
                     None
                 }
             } else {
                 None
             };
-            let jpeg_tables_ref: Option<&[u8]> = jpeg_tables.as_deref();
-
-            // Variables captured by decode/encode closures
-            let quality           = args.quality;
-            let src_tile_w        = src_lv.tile_w;
-            let src_tile_h        = src_lv.tile_h;
-            let out_tile_w        = lv_out.out_tile_w;
-            let out_tile_h        = lv_out.out_tile_h;
-            let spp               = out_spp;
-            let resize_opts       = resize_opts.clone();
-            let fpt               = fir_pixel_type;
-            let src_jp2k_is_ycbcr = src_jp2k_is_ycbcr;
-            let src_photometric   = src_lv.photometric as u32;
-            let n_reduce          = n_reduce;
-            let jpeg_tables_ref   = jpeg_tables_ref;
-            let half              = args.half;
 
             if lv_out.passthrough {
                 // Passthrough: copy source tiles to the output IFD unchanged.
@@ -726,29 +934,55 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &Args, pb: 
                     }
                 }
             } else {
-                // Resample: stitch a 2×2 block of source tiles into each output tile.
-                // Output tile (oc, or) is produced from source tiles (2*oc+dc, 2*or+dr)
-                // for dc,dr ∈ {0,1}.  Source tiles out of image bounds are left as zero.
+                // Resample: producer-consumer pipeline.
+                // Main thread reads source tiles and writes encoded tiles to dst_tiff.
+                // Compute thread (Rayon) decodes + stitches + resizes + encodes.
+                // Chunk N-1 HDD write overlaps with chunk N encoding.
+                let src_tile_w = src_lv.tile_w;
+                let src_tile_h = src_lv.tile_h;
+                let out_tile_w = lv_out.out_tile_w;
+                let out_tile_h = lv_out.out_tile_h;
                 let src_ntx = (src_lv.img_w + src_tile_w - 1) / src_tile_w;
                 let src_nty = (src_lv.img_h + src_tile_h - 1) / src_tile_h;
                 let out_ntx = (lv_out.out_img_w + out_tile_w - 1) / out_tile_w;
                 let out_nty = (lv_out.out_img_h + out_tile_h - 1) / out_tile_h;
                 let out_tile_ids: Vec<u32> = (0..out_ntx * out_nty).collect();
-                // Accumulate all encoded tiles before writing so that JPEGTABLES can be
-                // registered in the IFD before the first TIFFWriteRawTile call.
-                let mut all_tiles: Vec<(u32, Vec<u8>)> =
-                    Vec::with_capacity(out_ntx as usize * out_nty as usize);
+
+                let enc_params = Arc::new(EncodeParams {
+                    quality:           args.quality,
+                    src_tile_w,
+                    src_tile_h,
+                    out_tile_w,
+                    out_tile_h,
+                    spp:               out_spp,
+                    resize_opts:       resize_opts.clone(),
+                    fpt:               fir_pixel_type,
+                    src_is_jpeg,
+                    src_jp2k_is_ycbcr,
+                    src_photometric:   src_lv.photometric as u32,
+                    n_reduce,
+                    half:              args.half,
+                    jpeg_tables:       jpeg_tables_arc.clone(),
+                });
+
+                let (raw_tx, raw_rx) = mpsc::sync_channel::<RawChunk>(2);
+                let (enc_tx, enc_rx) = mpsc::sync_channel::<EncChunk>(2);
+                let params_t = Arc::clone(&enc_params);
+                let compute_handle = std::thread::spawn(move || {
+                    compute_thread_body(raw_rx, enc_tx, params_t);
+                });
+
+                let mut jpegtables_registered = false;
+                let mut pending_write: Option<EncChunk> = None;
 
                 for chunk in out_tile_ids.chunks(chunk_size) {
-                    // Sequential: for each output tile read up to 4 source tiles.
+                    // Read source tiles for this chunk (main thread, src_tiff).
                     // qi = dr*2 + dc  →  (dc=qi%2, dr=qi/2)
-                    // Each slot: Option<(raw_bytes, is_raw_decode)>
-                    let raw_chunk: Vec<(u32, [Option<(Vec<u8>, bool)>; 4])> = chunk.iter()
+                    let raw_chunk: RawChunk = chunk.iter()
                         .map(|&out_id| {
                             let oc  = out_id % out_ntx;
                             let or_ = out_id / out_ntx;
-                            let mut quads: [Option<(Vec<u8>, bool)>; 4] =
-                                [None, None, None, None];
+                            let mut quads: RawQuad = [None, None, None, None];
                             for qi in 0..4usize {
                                 let dc = (qi % 2) as u32;
                                 let dr = (qi / 2) as u32;
@@ -765,7 +999,6 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &Args, pb: 
                                         quads[qi] = Some((buf, true));
                                     }
                                 } else if src_is_jpeg {
-                                    // Try raw read first (complete JPEG stream).
                                     let mut raw_buf = vec![0u8; raw_buf_size];
                                     let raw_n = TIFFReadRawTile(src_tiff, tile_num,
                                         raw_buf.as_mut_ptr() as *mut c_void,
@@ -776,7 +1009,6 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &Args, pb: 
                                         raw_buf.truncate(raw_n as usize);
                                         quads[qi] = Some((raw_buf, true));
                                     } else {
-                                        // Fall back to libtiff decode (JPEGTABLES path).
                                         let mut pix_buf = vec![0u8; pix_size];
                                         let n = TIFFReadEncodedTile(src_tiff, tile_num,
                                             pix_buf.as_mut_ptr() as *mut c_void,
@@ -794,283 +1026,33 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &Args, pb: 
                         })
                         .collect();
 
-                    // Parallel: decode all 4 quads → stitch canvas → resize → encode.
-                    // Decode first so canvas is sized to actual decoded tile dimensions.
-                    // JP2K n_reduce > 0 produces smaller decoded tiles; canvas must use
-                    // decoded size (not src_tile_w) to avoid black padding.
-                    let encoded: Vec<Option<(u32, Vec<u8>)>> = raw_chunk
-                        .par_iter()
-                        .map(|(out_id, quads)| {
-                            let ch = spp as usize;
+                    // Send to compute thread (blocks if queue full — backpressure).
+                    raw_tx.send(raw_chunk).expect("compute thread dropped");
 
-                            // ── Decode each quadrant → Option<(pixels, pw, ph)> ─
-                            const APP14_ADOBE_RGB: [u8; 16] = [
-                                0xFF, 0xEE, 0x00, 0x0E,
-                                b'A', b'd', b'o', b'b', b'e',
-                                0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00,
-                            ];
-                            let decoded: [Option<(Vec<u8>, u32, u32)>; 4] =
-                                std::array::from_fn(|qi| {
-                                    let (data, is_raw_decode) = quads[qi].as_ref()?;
-                                    if *is_raw_decode && src_is_jpeg {
-                                        let fmt = if spp == 1 {
-                                            turbojpeg::PixelFormat::GRAY
-                                        } else {
-                                            turbojpeg::PixelFormat::RGB
-                                        };
-                                        if half {
-                                            // DCT-domain 1/2 scaling: decode at half
-                                            // resolution without a full IDCT.
-                                            // JPEGTABLES must be prepended if present.
-                                            let inject_app14 =
-                                                spp == 3 && src_photometric == PHOTOMETRIC_RGB;
-                                            let combined: Vec<u8> =
-                                                if let Some(tables) = jpeg_tables_ref {
-                                                    let app14_len = if inject_app14 {
-                                                        APP14_ADOBE_RGB.len()
-                                                    } else { 0 };
-                                                    let mut v = Vec::with_capacity(
-                                                        2 + app14_len
-                                                        + (tables.len() - 4)
-                                                        + (data.len() - 2));
-                                                    v.extend_from_slice(&tables[0..2]);
-                                                    if inject_app14 {
-                                                        v.extend_from_slice(&APP14_ADOBE_RGB);
-                                                    }
-                                                    v.extend_from_slice(
-                                                        &tables[2..tables.len()-2]);
-                                                    v.extend_from_slice(&data[2..]);
-                                                    v
-                                                } else { data.clone() };
-                                            let mut dec =
-                                                turbojpeg::Decompressor::new().ok()?;
-                                            dec.set_scaling_factor(
-                                                turbojpeg::ScalingFactor::ONE_HALF).ok()?;
-                                            let header = dec.read_header(&combined).ok()?;
-                                            let scaled = header.scaled(
-                                                turbojpeg::ScalingFactor::ONE_HALF);
-                                            let (w, h) = (scaled.width, scaled.height);
-                                            let pitch = w * ch;
-                                            let mut pixels = vec![0u8; h * pitch];
-                                            dec.decompress(&combined, turbojpeg::Image {
-                                                pixels: pixels.as_mut_slice(),
-                                                width: w, pitch, height: h, format: fmt,
-                                            }).ok()?;
-                                            Some((pixels, w as u32, h as u32))
-                                        } else {
-                                            let inject_app14 =
-                                                spp == 3 && src_photometric == PHOTOMETRIC_RGB;
-                                            let combined: Vec<u8> =
-                                                if let Some(tables) = jpeg_tables_ref {
-                                                    let app14_len = if inject_app14 {
-                                                        APP14_ADOBE_RGB.len()
-                                                    } else { 0 };
-                                                    let mut v = Vec::with_capacity(
-                                                        2 + app14_len
-                                                        + (tables.len() - 4)
-                                                        + (data.len() - 2));
-                                                    v.extend_from_slice(&tables[0..2]);
-                                                    if inject_app14 {
-                                                        v.extend_from_slice(&APP14_ADOBE_RGB);
-                                                    }
-                                                    v.extend_from_slice(
-                                                        &tables[2..tables.len()-2]);
-                                                    v.extend_from_slice(&data[2..]);
-                                                    v
-                                                } else { data.clone() };
-                                            let dec =
-                                                turbojpeg::decompress(&combined, fmt).ok()?;
-                                            let (w, h) = (dec.width as u32, dec.height as u32);
-                                            let pitch = w as usize * ch;
-                                            let pix = if dec.pitch == pitch {
-                                                dec.pixels
-                                            } else {
-                                                (0..h as usize).flat_map(|r| {
-                                                    let s = r * dec.pitch;
-                                                    dec.pixels[s..s+pitch].iter().copied()
-                                                }).collect()
-                                            };
-                                            Some((pix, w, h))
-                                        }
-                                    } else if *is_raw_decode {
-                                        // JP2K
-                                        let params = jpeg2k::DecodeParameters::default()
-                                            .reduce(n_reduce);
-                                        let img =
-                                            jpeg2k::Image::from_bytes_with(data, params)
-                                                .ok()?;
-                                        let comps = img.components();
-                                        if comps.is_empty() { return None; }
-                                        let luma_w = comps[0].width() as usize;
-                                        let luma_h = comps[0].height() as usize;
-                                        if luma_w == 0 || luma_h == 0 { return None; }
-                                        let mut pix: Vec<u8> =
-                                            if spp == 1 || comps.len() < 3 {
-                                                comps[0].data_u8().collect()
-                                            } else {
-                                                let y_u8: Vec<u8> =
-                                                    comps[0].data_u8().collect();
-                                                let cb_u8: Vec<u8> =
-                                                    comps[1].data_u8().collect();
-                                                let cr_u8: Vec<u8> =
-                                                    comps[2].data_u8().collect();
-                                                let cb_w = comps[1].width() as usize;
-                                                let cb_h = comps[1].height() as usize;
-                                                let cr_w = comps[2].width() as usize;
-                                                let cr_h = comps[2].height() as usize;
-                                                let mut buf = Vec::with_capacity(
-                                                    luma_w * luma_h * 3);
-                                                for row in 0..luma_h {
-                                                    for col in 0..luma_w {
-                                                        let y = y_u8[row*luma_w+col];
-                                                        let cb_col = (col*cb_w/luma_w)
-                                                            .min(cb_w.saturating_sub(1));
-                                                        let cb_row = (row*cb_h/luma_h)
-                                                            .min(cb_h.saturating_sub(1));
-                                                        let cb = cb_u8[cb_row*cb_w+cb_col];
-                                                        let cr_col = (col*cr_w/luma_w)
-                                                            .min(cr_w.saturating_sub(1));
-                                                        let cr_row = (row*cr_h/luma_h)
-                                                            .min(cr_h.saturating_sub(1));
-                                                        let cr = cr_u8[cr_row*cr_w+cr_col];
-                                                        buf.extend_from_slice(&[y, cb, cr]);
-                                                    }
-                                                }
-                                                buf
-                                            };
-                                        let color_space = img.color_space();
-                                        let needs_ycbcr_cvt = spp == 3 && (
-                                            matches!(color_space, jpeg2k::ColorSpace::SYCC)
-                                            || (src_jp2k_is_ycbcr && !matches!(
-                                                color_space, jpeg2k::ColorSpace::SRGB))
-                                        );
-                                        if needs_ycbcr_cvt {
-                                            for c in pix.chunks_mut(3) {
-                                                let y  = c[0] as f32;
-                                                let cb = c[1] as f32 - 128.0;
-                                                let cr = c[2] as f32 - 128.0;
-                                                c[0] = (y + 1.40200 * cr)
-                                                    .clamp(0.0, 255.0) as u8;
-                                                c[1] = (y - 0.34414*cb - 0.71414*cr)
-                                                    .clamp(0.0, 255.0) as u8;
-                                                c[2] = (y + 1.77200 * cb)
-                                                    .clamp(0.0, 255.0) as u8;
-                                            }
-                                        }
-                                        Some((pix, luma_w as u32, luma_h as u32))
-                                    } else {
-                                        // Pre-decoded pixels from TIFFReadEncodedTile
-                                        Some((data.clone(), src_tile_w, src_tile_h))
-                                    }
-                                });
-
-                            if decoded.iter().all(|d| d.is_none()) { return None; }
-
-                            // ── Canvas sized to decoded tile dims, not src_tile_w ─
-                            let (slot_w, slot_h) = decoded.iter()
-                                .filter_map(|d| d.as_ref().map(|(_, pw, ph)| (*pw, *ph)))
-                                .fold((1u32, 1u32), |(mw, mh), (w, h)|
-                                    (mw.max(w), mh.max(h)));
-                            let canvas_w = slot_w * 2;
-                            let canvas_h = slot_h * 2;
-                            let mut canvas =
-                                vec![0u8; canvas_w as usize * canvas_h as usize * ch];
-
-                            // ── Paste each decoded quadrant into the canvas ─────
-                            for qi in 0..4usize {
-                                let Some((pixels, pw, ph)) = &decoded[qi]
-                                    else { continue; };
-                                let dc = qi % 2;
-                                let dr = qi / 2;
-                                let ox = dc * slot_w as usize;
-                                let oy = dr * slot_h as usize;
-                                for row in 0..(*ph as usize) {
-                                    let src_start = row * *pw as usize * ch;
-                                    let dst_start =
-                                        (oy + row) * canvas_w as usize * ch + ox * ch;
-                                    let copy_len = *pw as usize * ch;
-                                    canvas[dst_start..dst_start + copy_len]
-                                        .copy_from_slice(
-                                            &pixels[src_start..src_start + copy_len]);
-                                }
-                            }
-
-                            // Resize stitch canvas → output tile dimensions.
-                            // Skip when canvas already matches (e.g. JPEG/JP2K decoded at
-                            // 1/2 in --half mode: 2×2 × (src/2) = src = out_tile).
-                            let resized: Vec<u8> =
-                                if canvas_w == out_tile_w && canvas_h == out_tile_h {
-                                    canvas
-                                } else {
-                                    let src_fir = fir::images::Image::from_vec_u8(
-                                        canvas_w, canvas_h, canvas, fpt).ok()?;
-                                    let mut dst_fir =
-                                        fir::images::Image::new(out_tile_w, out_tile_h, fpt);
-                                    fir::Resizer::new()
-                                        .resize(&src_fir, &mut dst_fir, &resize_opts).ok()?;
-                                    dst_fir.into_vec()
-                                };
-
-                            // JPEG encode
-                            let jpeg = if spp == 1 {
-                                let img = turbojpeg::Image::<&[u8]> {
-                                    pixels: &resized,
-                                    width:  out_tile_w as usize,
-                                    pitch:  out_tile_w as usize,
-                                    height: out_tile_h as usize,
-                                    format: turbojpeg::PixelFormat::GRAY,
-                                };
-                                turbojpeg::compress(
-                                    img, quality as i32, turbojpeg::Subsamp::Gray)
-                                    .ok()?.to_vec()
-                            } else {
-                                let img = turbojpeg::Image::<&[u8]> {
-                                    pixels: &resized,
-                                    width:  out_tile_w as usize,
-                                    pitch:  out_tile_w as usize * 3,
-                                    height: out_tile_h as usize,
-                                    format: turbojpeg::PixelFormat::RGB,
-                                };
-                                turbojpeg::compress(
-                                    img, quality as i32, turbojpeg::Subsamp::Sub2x2)
-                                    .ok()?.to_vec()
-                            };
-
-                            Some((*out_id, jpeg))
-                        })
-                        .collect();
-
-                    // Accumulate encoded tiles; update progress bar per output tile.
-                    for item in encoded {
-                        if let Some(pair) = item { all_tiles.push(pair); }
-                        pb.inc(1);
+                    // Write previous chunk to HDD while compute thread encodes current.
+                    if let Some(prev) = pending_write.take() {
+                        let n = prev.len() as u64;
+                        write_enc_chunk(dst_tiff, &prev, &mut jpegtables_registered);
+                        pb.inc(n);
                     }
+
+                    // Receive encoded results for this chunk.
+                    pending_write = enc_rx.recv().ok();
                 }
 
-                // Sort by tile_num so writes are in file-offset order.
-                all_tiles.sort_unstable_by_key(|(n, _)| *n);
+                drop(raw_tx);
 
-                // Extract JPEGTABLES from the first encoded tile and register in the IFD
-                // before the first TIFFWriteRawTile.  All tiles share the same DQT/DHT
-                // tables because quality is fixed.
-                let jpegtables: Option<Vec<u8>> = all_tiles.first()
-                    .and_then(|(_, jpeg)| split_jpeg_to_tables_and_tile(jpeg))
-                    .map(|(tables, _)| tables);
-                if let Some(ref tables) = jpegtables {
-                    TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES,
-                        tables.len() as u32, tables.as_ptr());
+                if let Some(last) = pending_write.take() {
+                    let n = last.len() as u64;
+                    write_enc_chunk(dst_tiff, &last, &mut jpegtables_registered);
+                    pb.inc(n);
                 }
-
-                // Write tiles: stripped when JPEGTABLES was registered, complete otherwise.
-                for (out_id, jpeg_bytes) in &all_tiles {
-                    let stripped = jpegtables.as_ref()
-                        .and_then(|_| split_jpeg_to_tables_and_tile(jpeg_bytes))
-                        .map(|(_, tile)| tile);
-                    let write_bytes = stripped.as_deref().unwrap_or(jpeg_bytes);
-                    TIFFWriteRawTile(dst_tiff, *out_id,
-                        write_bytes.as_ptr() as *mut c_void,
-                        write_bytes.len() as i64);
+                for enc in enc_rx {
+                    let n = enc.len() as u64;
+                    write_enc_chunk(dst_tiff, &enc, &mut jpegtables_registered);
+                    pb.inc(n);
                 }
+                compute_handle.join().expect("compute thread panicked");
             }
 
             TIFFWriteDirectory(dst_tiff);
