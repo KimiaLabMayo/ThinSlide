@@ -465,6 +465,20 @@ pub fn split_jpeg_to_tables_and_tile(jpeg: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> 
 /// Returns None (not Some([])) when the tag is absent or unreadable.
 fn extract_icc_profile(dcm: &dicom::object::DefaultDicomObject) -> Option<Vec<u8>> {
     use dicom_core::Tag;
+
+    // Standard DICOM WSI: OpticalPathSequence[0].ICCProfile
+    let from_optical = (|| -> Option<Vec<u8>> {
+        let seq  = dcm.element_by_name("OpticalPathSequence").ok()?;
+        let item = seq.items()?.first()?;
+        let bytes = item.element_by_name("ICCProfile").ok()
+            .and_then(|e| e.to_bytes().ok())
+            .map(|b| b.into_owned())
+            .filter(|b| !b.is_empty())?;
+        Some(bytes)
+    })();
+    if from_optical.is_some() { return from_optical; }
+
+    // Fallback: top-level tag (0028,2000)
     let bytes = dcm.element(Tag(0x0028, 0x2000)).ok()
         .and_then(|e| e.to_bytes().ok())
         .map(|b| b.into_owned())?;
@@ -859,6 +873,31 @@ fn write_flat_multipage_tiff(
         }
         groups.push(vec![meta]);
     }
+    // Extract ICC profile before activating the progress bar so the message isn't overwritten.
+    // (group_idx == 0 may be skipped if tile_size is None or tiles aren't JPEG-aligned)
+    let icc_profile: Option<Vec<u8>> = groups.iter().find_map(|g| {
+        let meta = g[0];
+        let Some((tw, th)) = meta.tile_size else { return None; };
+        let dcm = dicom::object::open_file(&meta.file_path).ok()?;
+        let ts  = dcm.meta().transfer_syntax();
+        let cmp: u32 = match map_transfer_syntax_to_compression(ts) {
+            CompressionType::JpegBaseline
+            | CompressionType::JpegExtended
+            | CompressionType::JpegLossless
+            | CompressionType::JpegLosslessNonHierarchical => 7,
+            _ => 0,
+        };
+        if cmp == 7 && !is_jpeg_tile_aligned(tw, th) { return None; }
+        extract_icc_profile(&dcm)
+    });
+    if verbose {
+        let msg = match &icc_profile {
+            Some(icc) => format!("  ICC profile: {} bytes (from DICOM tag 0028,2000)", icc.len()),
+            None      => "  ICC profile: not found in DICOM tag (0028,2000)".to_string(),
+        };
+        if let Some(p) = pb { p.println(&msg); } else { println!("{}", msg); }
+    }
+
     let total_tiles: u64 = groups.iter()
         .filter(|g| g[0].tile_size.is_some())
         .map(|g| g.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum::<u64>())
@@ -871,6 +910,7 @@ fn write_flat_multipage_tiff(
             CString::new("w8").unwrap().as_ptr(),
         );
 
+        let mut icc_written = false;
         for (group_idx, group) in groups.iter().enumerate() {
             let metadata  = group[0];
             // Skip resolution levels where the entire image fits in a single tile
@@ -957,19 +997,12 @@ fn write_flat_multipage_tiff(
                 }
             }
 
-            // Embed ICC profile from DICOM Tag (0028,2000) if present (first IFD only).
-            if group_idx == 0 {
-                let icc_profile = extract_icc_profile(&first_dcm);
-                if verbose {
-                    match &icc_profile {
-                        Some(icc) => println!("  ICC profile: {} bytes (from DICOM tag 0028,2000)", icc.len()),
-                        None      => println!("  ICC profile: not found in DICOM tag 0028,2000"),
-                    }
-                }
+            if !icc_written {
                 if let Some(ref icc) = icc_profile {
                     TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
                         icc.len() as u32, icc.as_ptr() as *const c_void);
                 }
+                icc_written = true;
             }
 
             drop(first_dcm);
@@ -1581,6 +1614,14 @@ fn write_svs(
     let base = &slide_levels[0];
     let dcm0 = dicom::object::open_file(&base.file_path).unwrap();
     let color_space = infer_color_space(&dcm0);
+    let icc_profile = extract_icc_profile(&dcm0);
+    if verbose {
+        let msg = match &icc_profile {
+            Some(icc) => format!("  ICC profile: {} bytes (from DICOM tag 0028,2000)", icc.len()),
+            None      => "  ICC profile: not found in DICOM tag (0028,2000)".to_string(),
+        };
+        if let Some(p) = pb { p.println(&msg); } else { println!("{}", msg); }
+    }
     let ts_uid = dcm0.meta().transfer_syntax();
     let is_jp2 = is_jpeg2000(&map_transfer_syntax_to_compression(ts_uid));
     // Read raw PhotometricInterpretation to distinguish YBR_ICT/YBR_RCT from RGB.
@@ -1653,6 +1694,10 @@ fn write_svs(
             0,  // SubFileType: full image
             Some(&image_desc_c),
         );
+        if let Some(ref icc) = icc_profile {
+            TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                icc.len() as u32, icc.as_ptr() as *const c_void);
+        }
         TIFFWriteDirectory(tiff);
         if let Some(p) = pb { p.inc(base.n_frames.unwrap_or(0) as u64); }
 
