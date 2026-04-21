@@ -47,6 +47,11 @@ const COMPRESSION_APERIO_JP2_YCBCR: u32 = 33003;
 const COMPRESSION_APERIO_JP2_RGB: u32   = 33005;
 const COMPRESSION_JP2000: u32           = 34712;
 
+fn vlog(pb: Option<&ProgressBar>, msg: impl AsRef<str>) {
+    if let Some(p) = pb { p.println(msg.as_ref()); }
+    else { eprintln!("{}", msg.as_ref()); }
+}
+
 fn is_jp2k(c: u32) -> bool {
     matches!(c, COMPRESSION_APERIO_JP2_YCBCR | COMPRESSION_APERIO_JP2_RGB | COMPRESSION_JP2000)
 }
@@ -409,12 +414,12 @@ fn run(args: Args) {
     }
 
     if args.verbose {
-        println!("Input:  {}", args.input_dir);
-        println!("Output: {}", args.output_dir);
+        vlog(None, format!("[src] {}", args.input_dir));
+        vlog(None, format!("[out] {}", args.output_dir));
         if let Some(mpp) = args.mpp {
-            println!("Target MPP: {:.4} µm/px", mpp);
+            vlog(None, format!("[mpp] {:.4} µm/px", mpp));
         } else {
-            println!("Target MPP: half (source × 2)");
+            vlog(None, "[mpp] half (source × 2)");
         }
     }
 
@@ -474,7 +479,7 @@ fn run(args: Args) {
             format!("{}.svs",      src_stem),
         ].iter().any(|name| Path::new(&args.output_dir).join(name).exists());
         if already_exists {
-            if args.verbose { println!("  Skip (exists): {src_name}"); }
+            if args.verbose { vlog(None, format!("  [skip ] exists: {src_name}")); }
             skipped.fetch_add(1, Ordering::Relaxed);
             file_bar.inc(1);
             continue;
@@ -575,8 +580,8 @@ fn write_jp2k_svs_from_tiff(
             }
 
             if verbose {
-                eprintln!("  [SVS] level {} {}x{} @ {:.4} µm/px ({} tiles)",
-                    idx, lv.img_w, lv.img_h, lv.mpp_x, lv.n_tiles);
+                vlog(Some(pb), format!("  [pass ] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                    idx, lv.img_w, lv.img_h, lv.mpp_x, lv.tile_w, lv.tile_h, lv.n_tiles));
             }
 
             // Allocate read buffer: use TIFFTileSize as upper bound for compressed tile size.
@@ -642,8 +647,13 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &Args, pb: 
     }
     let base = &src_levels[0];
     if args.verbose {
-        println!("  Source: {}x{} px @ {:.4} µm/px, {} levels",
-            base.img_w, base.img_h, base.mpp_x, src_levels.len());
+        vlog(Some(pb), format!("[src] {}  {}x{}  {:.4} µm/px  {} levels",
+            src_path, base.img_w, base.img_h, base.mpp_x, src_levels.len()));
+        let icc_msg = match &icc_profile {
+            Some(icc) => format!("  [icc  ] {} bytes", icc.len()),
+            None      => "  [icc  ] not found".to_string(),
+        };
+        vlog(Some(pb), &icc_msg);
     }
 
     // JP2K passthrough: when source is JP2K and a level close to the target exists,
@@ -673,10 +683,6 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &Args, pb: 
     let tmp_path = format!("{out_path}.tmp");
 
     if let Some(skip) = jp2k_svs_skip {
-        if args.verbose {
-            println!("  [JP2K passthrough] skipping {} high-res level(s), SVS base {:.4} µm/px",
-                skip, src_levels[skip].mpp_x);
-        }
         write_jp2k_svs_from_tiff(src_path, &src_levels[skip..], &tmp_path, args.verbose, pb);
         std::fs::rename(&tmp_path, &out_path)
             .expect("Failed to rename tmp to output");
@@ -1309,19 +1315,22 @@ fn compute_output_levels(
 
         if out_img_w.max(out_img_h) < MIN_PYRAMID_SIDE {
             if verbose {
-                eprintln!("  [skip] level {i}: {}x{} below MIN_PYRAMID_SIDE ({})",
-                    out_img_w, out_img_h, MIN_PYRAMID_SIDE);
+                vlog(None, format!("  [skip ] lv{}  {}x{}  below MIN_PYRAMID_SIDE ({})",
+                    i, out_img_w, out_img_h, MIN_PYRAMID_SIDE));
             }
             continue;
         }
 
         if verbose {
-            eprintln!("  [level {}] {}{}x{} @ {:.4} µm/px  (src level {} @ {:.4} µm/px, tile {}x{} → {}x{})",
-                i,
-                if passthrough { "passthrough " } else { "" },
-                out_img_w, out_img_h, actual_mpp_x,
-                best_idx, best.mpp_x,
-                best.tile_w, best.tile_h, out_tile_w, out_tile_h);
+            let tag = if passthrough { "[pass ]" } else { "[resamp]" };
+            if passthrough {
+                vlog(None, format!("  {} lv{}  {}x{}  {:.4} µm/px  tile {}x{}",
+                    tag, i, out_img_w, out_img_h, actual_mpp_x, out_tile_w, out_tile_h));
+            } else {
+                vlog(None, format!("  {} lv{}  {}x{}  {:.4} µm/px  src tile {}x{}→{}x{}",
+                    tag, i, out_img_w, out_img_h, actual_mpp_x,
+                    best.tile_w, best.tile_h, out_tile_w, out_tile_h));
+            }
         }
 
         out.push(OutputLevel {

@@ -37,6 +37,11 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use fast_image_resize as fir;
 use std::path::Path;
 
+fn vlog(pb: Option<&ProgressBar>, msg: impl AsRef<str>) {
+    if let Some(p) = pb { p.println(msg.as_ref()); }
+    else { eprintln!("{}", msg.as_ref()); }
+}
+
 const PWSI_CLASS_UID: &str = "1.2.840.10008.5.1.4.1.1.77.1.6";
 
 // SVS (Aperio) JPEG 2000 proprietary compression codes recognized by OpenSlide
@@ -892,10 +897,10 @@ fn write_flat_multipage_tiff(
     });
     if verbose {
         let msg = match &icc_profile {
-            Some(icc) => format!("  ICC profile: {} bytes (from DICOM tag 0028,2000)", icc.len()),
-            None      => "  ICC profile: not found in DICOM tag (0028,2000)".to_string(),
+            Some(icc) => format!("  [icc  ] {} bytes", icc.len()),
+            None      => "  [icc  ] not found".to_string(),
         };
-        if let Some(p) = pb { p.println(&msg); } else { println!("{}", msg); }
+        vlog(pb, &msg);
     }
 
     let total_tiles: u64 = groups.iter()
@@ -919,10 +924,10 @@ fn write_flat_multipage_tiff(
             // dimensions that libtiff rejects for JPEG tiles.
             if metadata.tile_size.is_none() {
                 if verbose {
-                    eprintln!("  [info] IFD {} ({}x{}): no tile size — single-tile level included but may be incompatible with JPEG",
+                    vlog(pb, format!("  [skip ] lv{}  {}x{}  no tile size",
                         group_idx,
                         metadata.px_columns.unwrap_or(0),
-                        metadata.px_rows.unwrap_or(0));
+                        metadata.px_rows.unwrap_or(0)));
                 }
                 continue;
             }
@@ -958,14 +963,20 @@ fn write_flat_multipage_tiff(
             // If tiles are not multiples of 16, this mismatch causes an error, so we skip these levels.
             if compression == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
                 if verbose {
-                    eprintln!("  [skip] IFD {} ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
-                        group_idx, ifd_width, ifd_height, tile_w, tile_h);
+                    vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
+                        group_idx, ifd_width, ifd_height, tile_w, tile_h));
                 }
                 continue;
             }
 
             let mpp = metadata.mpp_x.unwrap_or(0.25);
             let res = 1e4 / mpp;
+
+            let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+            if verbose {
+                vlog(pb, format!("  [pass ] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                    group_idx, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+            }
 
             let subfile_type: u32 = if group_idx == 0 { 0 } else { FILETYPE_REDUCEDIMAGE };
             TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
@@ -1292,6 +1303,12 @@ fn write_ome_tiff(
             let mpp       = metadata.mpp_x.unwrap_or(0.25);
             let res       = 1e4 / mpp;
 
+            if verbose {
+                let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+                vlog(pb, format!("  [pass ] lv0  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                    ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+            }
+
             // Declare the SubIFD chain BEFORE calling TIFFWriteDirectory.
             // libtiff copies the offset array; we only need it alive until
             // TIFFSetField returns.  The actual offsets are back-patched by
@@ -1334,10 +1351,11 @@ fn write_ome_tiff(
             // Embed ICC profile from DICOM Tag (0028,2000) if present.
             let icc_profile = extract_icc_profile(&first_dcm);
             if verbose {
-                match &icc_profile {
-                    Some(icc) => println!("  ICC profile: {} bytes (from DICOM tag 0028,2000)", icc.len()),
-                    None      => println!("  ICC profile: not found in DICOM tag 0028,2000"),
-                }
+                let msg = match &icc_profile {
+                    Some(icc) => format!("  [icc  ] {} bytes", icc.len()),
+                    None      => "  [icc  ] not found".to_string(),
+                };
+                vlog(pb, &msg);
             }
             if let Some(ref icc) = icc_profile {
                 TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
@@ -1370,13 +1388,14 @@ fn write_ome_tiff(
         // ── SubIFDs: pyramid sub-resolutions (chained from IFD 0) ─────────
         // libtiff automatically routes the next n_subifds WriteDirectory calls
         // to the SubIFD chain declared above.  No special API call needed here.
-        for (_sub_idx, group) in groups[1..].iter().enumerate() {
+        for (sub_idx, group) in groups[1..].iter().enumerate() {
             let metadata  = group[0];
             if metadata.tile_size.is_none() {
                 if verbose {
-                    eprintln!("  [skip] SubIFD ({}x{}): no tile size — single-tile level omitted",
+                    vlog(pb, format!("  [skip ] lv{}  {}x{}  no tile size",
+                        sub_idx + 1,
                         metadata.px_columns.unwrap_or(0),
-                        metadata.px_rows.unwrap_or(0));
+                        metadata.px_rows.unwrap_or(0)));
                 }
                 continue;
             }
@@ -1402,14 +1421,20 @@ fn write_ome_tiff(
             // this mismatch causes a "Bad value N for tileWidth/tileLength tag" error.
             if compr == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
                 if verbose {
-                    eprintln!("  [skip] SubIFD ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
-                        ifd_width, ifd_height, tile_w, tile_h);
+                    vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
+                        sub_idx + 1, ifd_width, ifd_height, tile_w, tile_h));
                 }
                 continue;
             }
 
             let mpp    = metadata.mpp_x.unwrap_or(0.25);
             let res    = 1e4 / mpp;
+
+            if verbose {
+                let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+                vlog(pb, format!("  [pass ] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                    sub_idx + 1, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+            }
 
             // SubFileType = REDUCEDIMAGE signals a lower-resolution version.
             TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     FILETYPE_REDUCEDIMAGE);
@@ -1617,10 +1642,10 @@ fn write_svs(
     let icc_profile = extract_icc_profile(&dcm0);
     if verbose {
         let msg = match &icc_profile {
-            Some(icc) => format!("  ICC profile: {} bytes (from DICOM tag 0028,2000)", icc.len()),
-            None      => "  ICC profile: not found in DICOM tag (0028,2000)".to_string(),
+            Some(icc) => format!("  [icc  ] {} bytes", icc.len()),
+            None      => "  [icc  ] not found".to_string(),
         };
-        if let Some(p) = pb { p.println(&msg); } else { println!("{}", msg); }
+        vlog(pb, &msg);
     }
     let ts_uid = dcm0.meta().transfer_syntax();
     let is_jp2 = is_jpeg2000(&map_transfer_syntax_to_compression(ts_uid));
@@ -1687,6 +1712,12 @@ fn write_svs(
         );
 
         // ── IFD 0: Full resolution ────────────────────────────────────────
+        if verbose {
+            let (btw, bth) = base.tile_size.unwrap_or((256, 256));
+            vlog(pb, format!("  [pass ] lv0  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                img_w, img_h, base_mpp_x, btw, bth,
+                base.n_frames.unwrap_or(0)));
+        }
         write_svs_tiled_level(
             tiff, base,
             svs_compression, photometric,
@@ -1716,9 +1747,10 @@ fn write_svs(
         for (_i, level) in slide_levels[1..].iter().enumerate() {
             if level.tile_size.is_none() {
                 if verbose {
-                    eprintln!("  [skip] SVS level ({}x{}): no tile size — single-tile level omitted",
+                    vlog(pb, format!("  [skip ] lv{}  {}x{}  no tile size",
+                        _i + 1,
                         level.px_columns.unwrap_or(0),
-                        level.px_rows.unwrap_or(0));
+                        level.px_rows.unwrap_or(0)));
                 }
                 continue;
             }
@@ -1728,13 +1760,21 @@ fn write_svs(
             let (lvl_tile_w, lvl_tile_h) = level.tile_size.unwrap();
             if svs_compression == 7 && !is_jpeg_tile_aligned(lvl_tile_w, lvl_tile_h) {
                 if verbose {
-                    eprintln!("  [skip] SVS level ({}x{}): tile {}x{} not 16-aligned for JPEG — omitted",
-                        level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
-                        lvl_tile_w, lvl_tile_h);
+                    vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
+                        _i + 1, level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
+                        lvl_tile_w, lvl_tile_h));
                 }
                 continue;
             }
             let ds = base_cols / level.px_columns.unwrap_or(1) as f64;
+            let lv_mpp = base_mpp_x * ds;
+            if verbose {
+                vlog(pb, format!("  [pass ] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                    _i + 1,
+                    level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
+                    lv_mpp, lvl_tile_w, lvl_tile_h,
+                    level.n_frames.unwrap_or(0)));
+            }
             write_svs_tiled_level(
                 tiff, level,
                 svs_compression, photometric,
@@ -1809,14 +1849,7 @@ fn write_resampled_tiff(
     let base      = groups[0][0];
     let base_w    = base.px_columns.unwrap_or(0);
     let base_h    = base.px_rows.unwrap_or(0);
-    if verbose {
-        println!("Base level: {}x{} px, MPP={:.6} µm/px, tile size={:?}",
-            base_w, base_h, base.mpp_x.unwrap_or(0.25), base.tile_size);
-    }
-    let (in_tile_w, in_tile_h) = base.tile_size.unwrap_or((base_w, base_h));
-    if verbose {
-        println!("Input tile size: {}x{} px", in_tile_w, in_tile_h);
-    }
+    let (_in_tile_w, _in_tile_h) = base.tile_size.unwrap_or((base_w, base_h));
     let src_mpp_x = base.mpp_x.unwrap_or(0.25);
     let src_mpp_y = base.mpp_y.unwrap_or(src_mpp_x);
 
@@ -1908,16 +1941,30 @@ fn write_resampled_tiff(
 
         if out_img_w.max(out_img_h) < MIN_PYRAMID_SIDE {
             if verbose {
-                eprintln!("  [skip] level {} (target {:.4} µm/px) → {}x{}: below MIN_PYRAMID_SIDE ({})",
-                    i, target_lv_mpp_x, out_img_w, out_img_h, MIN_PYRAMID_SIDE);
+                eprintln!("  [skip ] lv{}  {}x{}  below MIN_PYRAMID_SIDE ({})",
+                    i, out_img_w, out_img_h, MIN_PYRAMID_SIDE);
             }
             return None;
         }
 
         if verbose {
-            eprintln!("  [{}] level {}: source {:.4} µm/px → output {:.4} µm/px ({}x{})",
-                if passthrough { "passthrough" } else { "resample" },
-                i, chosen_mpp_x, actual_mpp_x, out_img_w, out_img_h);
+            let tag = if passthrough { "[pass ]" } else { "[resamp]" };
+            let n_tiles: u64 = if passthrough {
+                chosen.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum()
+            } else {
+                let out_ntx = (out_img_w + out_tile_w - 1) / out_tile_w;
+                let out_nty = (out_img_h + out_tile_h - 1) / out_tile_h;
+                (out_ntx * out_nty) as u64
+            };
+            if passthrough {
+                eprintln!("  {} lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                    tag, i, out_img_w, out_img_h, actual_mpp_x,
+                    out_tile_w, out_tile_h, n_tiles);
+            } else {
+                eprintln!("  {} lv{}  {}x{}  {:.4} µm/px  src {}x{}→tile {}x{}  ({} tiles)",
+                    tag, i, out_img_w, out_img_h, actual_mpp_x,
+                    chosen_tw, chosen_th, out_tile_w, out_tile_h, n_tiles);
+            }
         }
 
         Some(LevelInfo {
@@ -1945,26 +1992,19 @@ fn write_resampled_tiff(
             (out_ntx * out_nty) as u64
         }
     }).sum();
-    if verbose {
-        println!("Total active levels: {}, total tiles: {}", active_levels.len(), total_tiles);
-    }
     if let Some(p) = pb { p.set_length(total_tiles); }
 
     // ── Color space from the base level ───────────────────────────────────
     let first_dcm   = dicom::object::open_file(&base.file_path).unwrap();
     let color_space = infer_color_space(&first_dcm);
 
-    if verbose {
-        println!("Inferred color space: {}", color_space);
-    }
-
     let icc_profile = extract_icc_profile(&first_dcm);
     if verbose {
-        if let Some(profile) = &icc_profile {
-            println!("Extracted ICC profile: {} bytes", profile.len());
-        } else {
-            println!("No ICC profile found in the base level.");
-        }
+        let msg = match &icc_profile {
+            Some(icc) => format!("  [icc  ] {} bytes", icc.len()),
+            None      => "  [icc  ] not found".to_string(),
+        };
+        vlog(pb, &msg);
     }
 
     // The jp2k crate (OpenJPEG) does NOT automatically reverse the JPEG 2000
@@ -1976,18 +2016,8 @@ fn write_resampled_tiff(
         .ok()
         .and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
         .unwrap_or_default();
-    if verbose {
-        println!("Source PhotometricInterpretation: {}", src_photometric_interp);
-    }
 
     let jp2k_has_ict_rct = matches!(src_photometric_interp.as_str(), "YBR_ICT" | "YBR_RCT");
-    if verbose {
-        if jp2k_has_ict_rct {
-            println!("JPEG 2000 source has YBR_ICT/YBR_RCT photometric interpretation; will apply inverse color transform after decoding.");
-        } else {
-            println!("JPEG 2000 source does not have YBR_ICT/YBR_RCT photometric interpretation; no color transform needed after decoding.");
-        }
-    }
 
     // turbojpeg always produces JFIF JPEG (YCbCr encoded internally), regardless
     // of the source color space.  PHOTOMETRIC_YCBCR is the standard convention
@@ -2063,13 +2093,6 @@ fn write_resampled_tiff(
             | CompressionType::Jpeg2000Part2MulticomponentLossless
             | CompressionType::Jpeg2000Part2Multicomponent
         );
-
-        if verbose && is_jpeg_src {
-            println!("Level {}: detected JPEG source", lv.out_img_w);
-        }
-        if verbose && is_jp2k_src {
-            println!("Level {}: detected JPEG 2000 source", lv.out_img_w);
-        }
 
         // Phase 1: aggregate all source tile data keyed by TIFF tile_num.
         // JPEG / JP2K: store raw encoded bytes (decoded in parallel during stitch).
@@ -2222,11 +2245,6 @@ fn write_resampled_tiff(
                 };
                 let spp_lv: u32 = if matches!(cs_lv, ColorSpace::Grayscale) { 1 } else { 3 };
 
-                if verbose {
-                    eprintln!("  [passthrough] {}{}x{} @ {:.4} µm/px",
-                        if is_base { "" } else { "SubIFD " },
-                        lv.out_img_w, lv.out_img_h, lv.actual_mpp_x);
-                }
 
                 TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
                 TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      lv.out_img_w);
@@ -2285,13 +2303,6 @@ fn write_resampled_tiff(
                 }
             } else {
                 // ── Resample: decode → resize → JPEG re-encode ───────────
-                if verbose {
-                    eprintln!("  [resample] {}{}x{} @ {:.4} µm/px  (tile {}x{} → {}x{})",
-                        if is_base { "" } else { "SubIFD " },
-                        lv.out_img_w, lv.out_img_h, lv.actual_mpp_x,
-                        lv.src_tile_w, lv.src_tile_h, lv.out_tile_w, lv.out_tile_h);
-                }
-
                 TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
                 TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      lv.out_img_w);
                 TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     lv.out_img_h);
@@ -2370,7 +2381,7 @@ fn convert_one_series(
     } else {
         if src_mpp_opt.is_none() {
             if args.verbose {
-                println!("  [info] source MPP unknown; skipping (--mpp requires known source MPP)");
+                eprintln!("  [warn ] source MPP unknown; skipping (--mpp requires known source MPP)");
             }
             None
         } else {
@@ -2378,8 +2389,8 @@ fn convert_one_series(
             if let Some(val) = em {
                 if (val - src_mpp).abs() / src_mpp < 0.1 {
                     if args.verbose {
-                        println!(
-                            "  [info] requested MPP {:.4} µm/px is within 10% of source MPP {:.4} µm/px; skipping resampling",
+                        eprintln!(
+                            "  [warn ] requested MPP {:.4} µm/px within 10% of source {:.4} µm/px; skipping",
                             val, src_mpp
                         );
                     }
@@ -2391,8 +2402,12 @@ fn convert_one_series(
     };
 
     if args.verbose {
-        println!(" - Series {}: {} levels \n - Src MPP: {:.4} µm/px \n - Compression: {} \n - Effective MPP: {:?}",
-            series_id, slide_levels_owned.len(), src_mpp, comp, effective_mpp);
+        let mode = match effective_mpp {
+            Some(m) => format!("→ {:.4} µm/px", m),
+            None    => "passthrough".to_string(),
+        };
+        eprintln!("({}) {}  {}  {:.4} µm/px  {} levels  {}",
+            series_idx, series_id, comp, src_mpp, slide_levels_owned.len(), mode);
     }
 
     // When the source is JP2K and a level close to the target exists, passthrough the
@@ -2471,13 +2486,6 @@ fn convert_one_series(
     let tmp_path = format!("{}.tmp", output_path);
 
     if let Some(skip) = jp2k_svs_skip {
-        // JP2K passthrough: skip the high-res level(s) and write SVS from the matching
-        // level onward. write_svs treats slide_levels[0] as the new base IFD.
-        if args.verbose {
-            let base_mpp = slide_levels_owned[skip].mpp_x.unwrap_or(0.0);
-            println!("  [JP2K passthrough] skipping {} high-res level(s), SVS base {:.4} µm/px",
-                skip, base_mpp);
-        }
         write_svs(
             &slide_levels_owned[skip..],
             thumbnail_meta.as_ref(),
@@ -2488,9 +2496,6 @@ fn convert_one_series(
             args.verbose,
         );
     } else if let Some(target_mpp) = effective_mpp {
-        if args.verbose {
-            println!("  [resample] Requested MPP: {:.4} µm/px", target_mpp);
-        }
         write_resampled_tiff(
             &slide_levels_owned, &tmp_path,
             target_mpp, args.quality, args.filter,
@@ -2549,8 +2554,8 @@ pub fn run(args: Args) {
     }
 
     if args.verbose {
-        println!("Input:  {}", args.input_dir);
-        println!("Output: {}", args.output_dir);
+        eprintln!("[src] {}", args.input_dir);
+        eprintln!("[out] {}", args.output_dir);
     }
 
     // if output directory doesn't exist, create it
@@ -2563,9 +2568,6 @@ pub fn run(args: Args) {
         let p = entry.path();
         if p.extension().map_or(false, |e| e == "tmp") {
             let _ = std::fs::remove_file(&p);
-            if args.verbose {
-                println!("Removed stale tmp file: {}", p.display());
-            }
         }
     }
 
@@ -2612,7 +2614,7 @@ pub fn run(args: Args) {
     let total_files = total_file_count as u64;
 
     if args.verbose {
-        println!("Found {} DICOM files in {} directories",
+        eprintln!("Found {} DICOM files in {} directories",
             total_files, dir_groups.len());
     }
 
@@ -2682,17 +2684,11 @@ pub fn run(args: Args) {
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
             if args_ref.mpp.is_some() || args_ref.half {
-                if args.verbose {
-                    println!("Resampling mode");
-                }
                 // Resampling: CPU-bound (decode + resize + encode).
                 // Process one WSI at a time so all n_jobs threads concentrate on
                 // tile-level parallelism inside write_resampled_tiff.
                 convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
             } else if n_concurrent <= 1 {
-                if args.verbose {
-                    println!("Passthrough mode");
-                }
                 // n_concurrent == 1: run inline on the main thread.
                 // Spawning via s.spawn() and then blocking the calling thread on
                 // cvar.wait() inside rayon::scope can deadlock because the OS-level
