@@ -57,7 +57,7 @@ dcm2tiff <input_dir> <output_dir> [OPTIONS]
 | `--legacy` | Write BigTIFF or SVS instead of OME-TIFF | off |
 | `-j` / `--jobs <N>` | Number of parallel threads | all CPUs |
 | `--quality <N>` | JPEG quality for downsampling (1–100) | 87 |
-| `--filter <NAME>` | Downsampling filter: `nearest`, `triangle`, `catmullrom`, `gaussian`, `lanczos3` | `nearest` |
+| `--filter <NAME>` | Downsampling filter: `nearest`, `triangle`, `catmullrom`, `lanczos3` | `nearest` |
 | `--use-parent-name` | Name output files after parent directory instead of Series Instance UID | off |
 | `-v` / `--verbose` | Print input/output paths and scan summary | off |
 
@@ -111,7 +111,7 @@ tiffds <input_dir> <output_dir> (--mpp <N> | --half) [OPTIONS]
 | `--legacy` | Write flat pyramidal BigTIFF instead of OME-TIFF | off |
 | `-j` / `--jobs <N>` | Number of parallel threads | all CPUs |
 | `--quality <N>` | JPEG quality (1–100) | 87 |
-| `--filter <NAME>` | Downsampling filter: `nearest`, `triangle`, `catmullrom`, `gaussian`, `lanczos3` | `nearest` |
+| `--filter <NAME>` | Downsampling filter: `nearest`, `triangle`, `catmullrom`, `lanczos3` | `nearest` |
 | `-v` / `--verbose` | Print input/output paths | off |
 
 ### Examples
@@ -148,7 +148,6 @@ If the requested `--mpp` is finer than the source base resolution, the tool fall
 | `nearest` | Nearest-neighbour | Fastest; default |
 | `triangle` | Bilinear | Smooth, slight blur |
 | `catmullrom` | Bicubic | Sharp, good general-purpose |
-| `gaussian` | Gaussian | Soft |
 | `lanczos3` | Lanczos (a=3) | Highest quality, slowest |
 
 ## Dependencies

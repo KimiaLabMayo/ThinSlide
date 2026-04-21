@@ -1155,7 +1155,7 @@ fn generate_OME_XML(metadata_list: &[DcmMetadata]) -> String {
     // For interleaved colour (RGB / YCbCr) the OME convention used by BioFormats
     // is: SizeC = SamplesPerPixel, one <Channel> element with SamplesPerPixel,
     // Interleaved="true".  For grayscale: SizeC=1, SamplesPerPixel=1, no interleave.
-    let (size_c, channel_spp, interleaved) = if spp >= 3 {
+    let (_size_c, channel_spp, interleaved) = if spp >= 3 {
         (spp, spp, "true")
     } else {
         (1u32, 1u32, "false")
@@ -2062,7 +2062,6 @@ fn write_resampled_tiff(
         image::imageops::FilterType::CatmullRom => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
         image::imageops::FilterType::Gaussian   => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
         image::imageops::FilterType::Lanczos3   => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
-        _                                       => fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3),
     };
     let fir_pixel_type = if spp == 1 { fir::PixelType::U8 } else { fir::PixelType::U8x3 };
     let resize_opts = fir::ResizeOptions::new().resize_alg(fir_alg);
