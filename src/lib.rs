@@ -1020,6 +1020,9 @@ fn write_flat_multipage_tiff(
 
             // Write tiles from every DICOM file in this resolution group, placing
             // each tile at its correct position within the shared pixel matrix.
+            // For JPEG sources, strip redundant DQT/DHT from each tile and store
+            // them once in TIFFTAG_JPEGTABLES (~550 bytes saved per tile).
+            let mut jpegtables_registered = false;
             for dcm_meta in group.iter() {
                 let dicom_obj   = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                 let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
@@ -1030,10 +1033,23 @@ fn write_flat_multipage_tiff(
                     if !fragment.is_empty() {
                         let tile_num = tile_indices.get(frag_idx).copied()
                             .unwrap_or(frag_idx as u32);
+                        let split = (compression == 7)
+                            .then(|| split_jpeg_to_tables_and_tile(fragment))
+                            .flatten();
+                        if !jpegtables_registered {
+                            if let Some((ref tables, _)) = split {
+                                TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                    tables.len() as u32, tables.as_ptr());
+                                jpegtables_registered = true;
+                            }
+                        }
+                        let write_bytes = split.as_ref()
+                            .map(|(_, t)| t.as_slice())
+                            .unwrap_or(fragment.as_slice());
                         TIFFWriteRawTile(
                             tiff, tile_num,
-                            fragment.as_ptr() as *mut c_void,
-                            fragment.len() as i64,
+                            write_bytes.as_ptr() as *mut c_void,
+                            write_bytes.len() as i64,
                         );
                     }
                 }
@@ -2285,6 +2301,9 @@ fn write_resampled_tiff(
                 drop(first_dcm);
 
                 // Write raw tiles from every DICOM file in the source group.
+                // For JPEG sources, strip redundant DQT/DHT from each tile and store
+                // them once in TIFFTAG_JPEGTABLES (~550 bytes saved per tile).
+                let mut jpegtables_registered = false;
                 for dcm_meta in lv.src_group.iter() {
                     let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                     let ifd_w        = dcm_meta.px_columns.unwrap_or(0);
@@ -2296,8 +2315,21 @@ fn write_resampled_tiff(
                     for (fi, fragment) in fragments.iter().enumerate() {
                         if !fragment.is_empty() {
                             let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
+                            let split = (compr == 7)
+                                .then(|| split_jpeg_to_tables_and_tile(fragment))
+                                .flatten();
+                            if !jpegtables_registered {
+                                if let Some((ref tables, _)) = split {
+                                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                        tables.len() as u32, tables.as_ptr());
+                                    jpegtables_registered = true;
+                                }
+                            }
+                            let write_bytes = split.as_ref()
+                                .map(|(_, t)| t.as_slice())
+                                .unwrap_or(fragment.as_slice());
                             TIFFWriteRawTile(tiff, tile_num,
-                                fragment.as_ptr() as *mut c_void, fragment.len() as i64);
+                                write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
                         }
                     }
                     if let Some(p) = pb {
