@@ -1923,9 +1923,16 @@ fn write_resampled_tiff(
                 // No scaling: output dimensions equal the source dimensions.
                 (chosen_w, chosen_h, chosen_tw, chosen_th, chosen_mpp_x, chosen_mpp_y)
             } else {
-                // Natural single-tile output size (1 source tile → 1 output tile).
-                let nat_otw = nearest_16(chosen_tw as f64 * chosen_mpp_x / target_lv_mpp_x);
-                let nat_oth = nearest_16(chosen_th as f64 * chosen_mpp_y / target_lv_mpp_y);
+                // Output tile covers a 2×2 block of source tiles (one source tile maps to
+                // nat_otw_f × nat_oth_f output pixels); apply nearest_16 to the full output
+                // tile size so that rounding on the doubled value is more accurate than
+                // rounding each half and doubling (e.g. nearest_16(120)*2=256 vs nearest_16(240)=240).
+                let nat_otw_f = chosen_tw as f64 * chosen_mpp_x / target_lv_mpp_x;
+                let nat_oth_f = chosen_th as f64 * chosen_mpp_y / target_lv_mpp_y;
+                let otw = nearest_16(nat_otw_f * 2.0);
+                let oth = nearest_16(nat_oth_f * 2.0);
+                let nat_otw = (otw / 2).max(1);
+                let nat_oth = (oth / 2).max(1);
                 // Image dimensions and actual MPP derived from the natural tile scale.
                 let scale_x = if chosen_tw > 0 { nat_otw as f64 / chosen_tw as f64 } else { 1.0 };
                 let scale_y = if chosen_th > 0 { nat_oth as f64 / chosen_th as f64 } else { 1.0 };
@@ -1933,9 +1940,6 @@ fn write_resampled_tiff(
                 let oih = (chosen_h as f64 * scale_y).round() as u32;
                 let amx = if nat_otw > 0 { chosen_mpp_x * chosen_tw as f64 / nat_otw as f64 } else { chosen_mpp_x };
                 let amy = if nat_oth > 0 { chosen_mpp_y * chosen_th as f64 / nat_oth as f64 } else { chosen_mpp_y };
-                // Output tile: 2× natural size for 2×2 source tile stitch.
-                let otw = nat_otw * 2;
-                let oth = nat_oth * 2;
                 (oiw, oih, otw, oth, amx, amy)
             };
 
