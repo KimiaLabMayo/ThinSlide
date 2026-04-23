@@ -42,6 +42,94 @@ fn vlog(pb: Option<&ProgressBar>, msg: impl AsRef<str>) {
     else { eprintln!("{}", msg.as_ref()); }
 }
 
+// ─── ICC color management ─────────────────────────────────────────────────────
+
+struct IccTransform(lcms2::Transform<u8, u8>);
+// SAFETY: lcms2 transforms are thread-safe for concurrent cmsDoTransform calls (LCMS2 >= 2.8).
+unsafe impl Send for IccTransform {}
+unsafe impl Sync for IccTransform {}
+
+fn build_icc_transform(icc_data: &[u8]) -> Option<Arc<IccTransform>> {
+    let src = lcms2::Profile::new_icc(icc_data).ok()?;
+    let dst = lcms2::Profile::new_srgb();
+    let xform = lcms2::Transform::new(
+        &src, lcms2::PixelFormat::RGB_8,
+        &dst, lcms2::PixelFormat::RGB_8,
+        lcms2::Intent::Perceptual,
+    ).ok()?;
+    Some(Arc::new(IccTransform(xform)))
+}
+
+fn apply_icc(xform: &IccTransform, src: &[u8], dst: &mut [u8]) {
+    xform.0.transform_pixels(src, dst);
+}
+
+fn bake_jpeg_tile(fragment: &[u8], xform: &IccTransform, quality: u8) -> Option<Vec<u8>> {
+    let img = turbojpeg::decompress(fragment, turbojpeg::PixelFormat::RGB).ok()?;
+    let (w, h) = (img.width, img.height);
+    let pitch = w * 3;
+    let src_pix: Vec<u8> = if img.pitch == pitch {
+        img.pixels
+    } else {
+        (0..h).flat_map(|r| img.pixels[r*img.pitch..r*img.pitch+pitch].iter().copied()).collect()
+    };
+    let mut dst_pix = vec![0u8; src_pix.len()];
+    apply_icc(xform, &src_pix, &mut dst_pix);
+    let tj = turbojpeg::Image::<&[u8]> {
+        pixels: &dst_pix, width: w, pitch, height: h,
+        format: turbojpeg::PixelFormat::RGB,
+    };
+    turbojpeg::compress(tj, quality as i32, turbojpeg::Subsamp::Sub2x2)
+        .map(|b| b.to_vec()).ok()
+}
+
+fn decode_jp2k_to_rgb(fragment: &[u8], has_ict_rct: bool) -> Option<(Vec<u8>, u32, u32)> {
+    let j2k = jpeg2k::Image::from_bytes_with(fragment, jpeg2k::DecodeParameters::default()).ok()?;
+    let comps = j2k.components();
+    if comps.is_empty() { return None; }
+    let w = comps[0].width() as usize;
+    let h = comps[0].height() as usize;
+    if w == 0 || h == 0 { return None; }
+    let mut pixels: Vec<u8> = if comps.len() < 3 {
+        comps[0].data().iter().map(|v| (*v).clamp(0, 255) as u8).collect()
+    } else {
+        let yd = comps[0].data();
+        let cbd = comps[1].data(); let cbw = comps[1].width() as usize; let cbh = comps[1].height() as usize;
+        let crd = comps[2].data(); let crw = comps[2].width() as usize; let crh = comps[2].height() as usize;
+        let mut buf = Vec::with_capacity(w * h * 3);
+        for row in 0..h {
+            for col in 0..w {
+                let y  = yd[row*w+col].clamp(0, 255) as u8;
+                let cb = cbd[(row*cbh/h).min(cbh.saturating_sub(1))*cbw + (col*cbw/w).min(cbw.saturating_sub(1))].clamp(0, 255) as u8;
+                let cr = crd[(row*crh/h).min(crh.saturating_sub(1))*crw + (col*crw/w).min(crw.saturating_sub(1))].clamp(0, 255) as u8;
+                buf.extend_from_slice(&[y, cb, cr]);
+            }
+        }
+        buf
+    };
+    if has_ict_rct && comps.len() >= 3 {
+        for c in pixels.chunks_mut(3) {
+            let y = c[0] as f32; let cb = c[1] as f32 - 128.0; let cr = c[2] as f32 - 128.0;
+            c[0] = (y + 1.40200 * cr).clamp(0.0, 255.0) as u8;
+            c[1] = (y - 0.34414*cb - 0.71414*cr).clamp(0.0, 255.0) as u8;
+            c[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
+        }
+    }
+    Some((pixels, w as u32, h as u32))
+}
+
+fn bake_jp2k_tile(fragment: &[u8], has_ict_rct: bool, xform: &IccTransform, quality: u8) -> Option<Vec<u8>> {
+    let (src, w, h) = decode_jp2k_to_rgb(fragment, has_ict_rct)?;
+    let mut dst = vec![0u8; src.len()];
+    apply_icc(xform, &src, &mut dst);
+    let tj = turbojpeg::Image::<&[u8]> {
+        pixels: &dst, width: w as usize, pitch: w as usize * 3, height: h as usize,
+        format: turbojpeg::PixelFormat::RGB,
+    };
+    turbojpeg::compress(tj, quality as i32, turbojpeg::Subsamp::Sub2x2)
+        .map(|b| b.to_vec()).ok()
+}
+
 const PWSI_CLASS_UID: &str = "1.2.840.10008.5.1.4.1.1.77.1.6";
 
 // SVS (Aperio) JPEG 2000 proprietary compression codes recognized by OpenSlide
@@ -156,6 +244,7 @@ struct LibEncodeParams {
     color_space:      ColorSpace,
     n_reduce:         u32,
     half:             bool,
+    icc_transform:    Option<Arc<IccTransform>>,
 }
 
 fn encode_one_tile_lib(
@@ -263,6 +352,14 @@ fn encode_one_tile_lib(
             let dst_start = (oy + row) * canvas_w as usize * ch + ox * ch;
             canvas[dst_start..dst_start + *pw as usize * ch]
                 .copy_from_slice(&pixels[src_start..src_start + *pw as usize * ch]);
+        }
+    }
+
+    if let Some(ref xform) = p.icc_transform {
+        if ch == 3 {
+            let mut dst = vec![0u8; canvas.len()];
+            apply_icc(xform, &canvas, &mut dst);
+            canvas = dst;
         }
     }
 
@@ -680,6 +777,9 @@ pub struct Args {
     /// JPEG tiles are decoded at 1/2 via DCT-domain scaling; JP2K uses n_reduce=1.
     /// Mutually exclusive with --mpp.
     pub half: bool,
+    /// Apply ICC color profile to pixel data, converting to sRGB.
+    /// The ICC profile tag is omitted from the output.
+    pub icc_bake: bool,
 }
 
 impl Args {
@@ -689,6 +789,7 @@ impl Args {
         let verbose         = all.iter().any(|a| a == "-v" || a == "--verbose");
         let use_parent_name = all.iter().any(|a| a == "--use-parent-name");
         let half            = all.iter().any(|a| a == "--half");
+        let icc_bake        = all.iter().any(|a| a == "--icc-bake");
 
         // Parse --jobs N or -j N
         let jobs = all.windows(2).find_map(|w| {
@@ -749,7 +850,7 @@ impl Args {
         if half && mpp.is_some() {
             return Err("--half and --mpp are mutually exclusive");
         }
-        Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter, use_parent_name, half })
+        Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter, use_parent_name, half, icc_bake })
     }
 }
 
@@ -864,6 +965,8 @@ fn write_flat_multipage_tiff(
     output_path: &str,
     pb: Option<&ProgressBar>,
     verbose: bool,
+    quality: u8,
+    icc_bake: bool,
 ) {
     // A single resolution level may be split across multiple DICOM SOP instances
     // (common for large slides). Group consecutive entries that share the same
@@ -899,6 +1002,19 @@ fn write_flat_multipage_tiff(
         let msg = match &icc_profile {
             Some(icc) => format!("  [icc  ] {} bytes", icc.len()),
             None      => "  [icc  ] not found".to_string(),
+        };
+        vlog(pb, &msg);
+    }
+    let icc_transform: Option<Arc<IccTransform>> = if icc_bake {
+        icc_profile.as_deref().and_then(build_icc_transform)
+    } else {
+        None
+    };
+    if icc_bake && verbose {
+        let msg = if icc_transform.is_some() {
+            "  [icc  ] baking → sRGB".to_string()
+        } else {
+            "  [icc  ] bake skipped (no profile or build failed)".to_string()
         };
         vlog(pb, &msg);
     }
@@ -938,10 +1054,15 @@ fn write_flat_multipage_tiff(
             let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
 
             let color_space = infer_color_space(&first_dcm);
-            let photometric = match color_space {
-                ColorSpace::RGB       => PHOTOMETRIC_RGB,
-                ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
-                ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
+            let baking = icc_transform.is_some() && !matches!(color_space, ColorSpace::Grayscale);
+            let photometric = if baking {
+                PHOTOMETRIC_YCBCR  // turbojpeg re-encodes as YCbCr JFIF
+            } else {
+                match color_space {
+                    ColorSpace::RGB       => PHOTOMETRIC_RGB,
+                    ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
+                    ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
+                }
             };
 
             let ts_uid = first_dcm.meta().transfer_syntax();
@@ -974,8 +1095,9 @@ fn write_flat_multipage_tiff(
 
             let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
             if verbose {
-                vlog(pb, format!("  [pass ] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                    group_idx, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+                let tag = if baking { "bake " } else { "pass " };
+                vlog(pb, format!("  [{}] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                    tag, group_idx, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
             }
 
             let subfile_type: u32 = if group_idx == 0 { 0 } else { FILETYPE_REDUCEDIMAGE };
@@ -995,11 +1117,14 @@ fn write_flat_multipage_tiff(
             TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     res);
             TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     res);
 
-            // For YCbCr JPEG, detect actual subsampling from the first tile so
-            // the TIFF tag matches the JPEG payload (otherwise libtiff defaults
-            // to [2,2] regardless of the stream content, confusing QuPath).
-            if matches!(color_space, ColorSpace::YCbCr) {
-                let px_tmp   = first_dcm.element_by_name("PixelData").expect("No PixelData");
+            if baking {
+                // Baked tiles are re-encoded with turbojpeg Sub2x2 (4:2:0).
+                TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
+            } else if matches!(color_space, ColorSpace::YCbCr) {
+                // For YCbCr JPEG passthrough, detect actual subsampling from the first tile so
+                // the TIFF tag matches the JPEG payload (otherwise libtiff defaults
+                // to [2,2] regardless of the stream content, confusing QuPath).
+                let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
                 let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
                 if let Some(first) = frags_tmp.iter().find(|f| !f.is_empty()) {
                     if let Some((h, v)) = detect_jpeg_subsampling(first) {
@@ -1009,32 +1134,39 @@ fn write_flat_multipage_tiff(
             }
 
             if !icc_written {
-                if let Some(ref icc) = icc_profile {
-                    TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                        icc.len() as u32, icc.as_ptr() as *const c_void);
+                if !baking {
+                    if let Some(ref icc) = icc_profile {
+                        TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                            icc.len() as u32, icc.as_ptr() as *const c_void);
+                    }
                 }
                 icc_written = true;
             }
 
             drop(first_dcm);
 
-            // Write tiles from every DICOM file in this resolution group, placing
-            // each tile at its correct position within the shared pixel matrix.
-            // For JPEG sources, strip redundant DQT/DHT from each tile and store
-            // them once in TIFFTAG_JPEGTABLES (~550 bytes saved per tile).
+            // Write tiles from every DICOM file in this resolution group.
+            // When baking: decode JPEG → apply ICC transform → re-encode JPEG.
+            // Otherwise: passthrough raw bytes with JPEGTABLES optimisation.
             let mut jpegtables_registered = false;
             for dcm_meta in group.iter() {
-                let dicom_obj   = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+                let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                 let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-                let px_elem     = dicom_obj.element_by_name("PixelData").expect("No PixelData");
-                let fragments   = px_elem.fragments().expect("Not encapsulated pixel data");
+                let px_elem      = dicom_obj.element_by_name("PixelData").expect("No PixelData");
+                let fragments    = px_elem.fragments().expect("Not encapsulated pixel data");
 
                 for (frag_idx, fragment) in fragments.iter().enumerate() {
                     if !fragment.is_empty() {
                         let tile_num = tile_indices.get(frag_idx).copied()
                             .unwrap_or(frag_idx as u32);
+                        let baked: Option<Vec<u8>> = if baking && compression == 7 {
+                            icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality))
+                        } else {
+                            None
+                        };
+                        let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
                         let split = (compression == 7)
-                            .then(|| split_jpeg_to_tables_and_tile(fragment))
+                            .then(|| split_jpeg_to_tables_and_tile(src_bytes))
                             .flatten();
                         if !jpegtables_registered {
                             if let Some((ref tables, _)) = split {
@@ -1045,7 +1177,7 @@ fn write_flat_multipage_tiff(
                         }
                         let write_bytes = split.as_ref()
                             .map(|(_, t)| t.as_slice())
-                            .unwrap_or(fragment.as_slice());
+                            .unwrap_or(src_bytes);
                         TIFFWriteRawTile(
                             tiff, tile_num,
                             write_bytes.as_ptr() as *mut c_void,
@@ -1264,6 +1396,8 @@ fn write_ome_tiff(
     output_path: &str,
     pb: Option<&ProgressBar>,
     verbose: bool,
+    quality: u8,
+    icc_bake: bool,
 ) {
     // Group consecutive DcmMetadata entries that share the same total pixel
     // matrix dimensions into a single pyramid level (multi-file SOP instances).
@@ -1306,11 +1440,40 @@ fn write_ome_tiff(
             let ifd_height = metadata.px_rows.unwrap_or(0);
             let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
 
-            let color_space = infer_color_space(&first_dcm);
-            let photometric = match color_space {
-                ColorSpace::RGB       => PHOTOMETRIC_RGB,
-                ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
-                ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
+            let color_space  = infer_color_space(&first_dcm);
+            let icc_profile  = extract_icc_profile(&first_dcm);
+            if verbose {
+                let msg = match &icc_profile {
+                    Some(icc) => format!("  [icc  ] {} bytes", icc.len()),
+                    None      => "  [icc  ] not found".to_string(),
+                };
+                vlog(pb, &msg);
+            }
+            let icc_transform: Option<Arc<IccTransform>> = if icc_bake {
+                icc_profile.as_deref().and_then(build_icc_transform)
+            } else {
+                None
+            };
+            if icc_bake && verbose {
+                vlog(pb, if icc_transform.is_some() {
+                    "  [icc  ] baking → sRGB"
+                } else {
+                    "  [icc  ] bake skipped (no profile or build failed)"
+                });
+            }
+            let jp2k_has_ict_rct = first_dcm.element_by_name("PhotometricInterpretation")
+                .ok().and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
+                .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT"))
+                .unwrap_or(false);
+            let baking = icc_transform.is_some() && !matches!(color_space, ColorSpace::Grayscale);
+            let photometric = if baking {
+                PHOTOMETRIC_YCBCR
+            } else {
+                match color_space {
+                    ColorSpace::RGB       => PHOTOMETRIC_RGB,
+                    ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
+                    ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
+                }
             };
             let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
 
@@ -1321,8 +1484,9 @@ fn write_ome_tiff(
 
             if verbose {
                 let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
-                vlog(pb, format!("  [pass ] lv0  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                    ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+                let tag = if baking { "bake " } else { "pass " };
+                vlog(pb, format!("  [{}] lv0  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                    tag, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
             }
 
             // Declare the SubIFD chain BEFORE calling TIFFWriteDirectory.
@@ -1340,7 +1504,7 @@ fn write_ome_tiff(
             TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     ifd_height);
             TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_align(tile_w, 16));
             TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_align(tile_h, 16));
-            TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     compr);
+            TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     if baking { 7u32 } else { compr });
             TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
             TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
             TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
@@ -1353,8 +1517,9 @@ fn write_ome_tiff(
             // OME-XML in ImageDescription marks this as an OME-TIFF.
             TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, image_desc_c.as_ptr());
 
-            // Mirror actual YCbCr chroma subsampling from the JPEG stream.
-            if matches!(color_space, ColorSpace::YCbCr) {
+            if baking {
+                TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
+            } else if matches!(color_space, ColorSpace::YCbCr) {
                 let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
                 let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
                 if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
@@ -1364,22 +1529,16 @@ fn write_ome_tiff(
                 }
             }
 
-            // Embed ICC profile from DICOM Tag (0028,2000) if present.
-            let icc_profile = extract_icc_profile(&first_dcm);
-            if verbose {
-                let msg = match &icc_profile {
-                    Some(icc) => format!("  [icc  ] {} bytes", icc.len()),
-                    None      => "  [icc  ] not found".to_string(),
-                };
-                vlog(pb, &msg);
-            }
-            if let Some(ref icc) = icc_profile {
-                TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                    icc.len() as u32, icc.as_ptr() as *const c_void);
+            if !baking {
+                if let Some(ref icc) = icc_profile {
+                    TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                        icc.len() as u32, icc.as_ptr() as *const c_void);
+                }
             }
 
             drop(first_dcm);
 
+            let mut jpegtables_registered_lv0 = false;
             for dcm_meta in group.iter() {
                 let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                 let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
@@ -1388,8 +1547,28 @@ fn write_ome_tiff(
                 for (fi, fragment) in fragments.iter().enumerate() {
                     if !fragment.is_empty() {
                         let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
+                        let baked: Option<Vec<u8>> = if baking {
+                            if compr == 7 {
+                                icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality))
+                            } else {
+                                icc_transform.as_deref().and_then(|xf| bake_jp2k_tile(fragment, jp2k_has_ict_rct, xf, quality))
+                            }
+                        } else { None };
+                        let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
+                        let split = (if baking { true } else { compr == 7 })
+                            .then(|| split_jpeg_to_tables_and_tile(src_bytes))
+                            .flatten();
+                        if !jpegtables_registered_lv0 {
+                            if let Some((ref tables, _)) = split {
+                                TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                    tables.len() as u32, tables.as_ptr());
+                                jpegtables_registered_lv0 = true;
+                            }
+                        }
+                        let write_bytes = split.as_ref()
+                            .map(|(_, t)| t.as_slice()).unwrap_or(src_bytes);
                         TIFFWriteRawTile(tiff, tile_num,
-                            fragment.as_ptr() as *mut c_void, fragment.len() as i64);
+                            write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
                     }
                 }
             }
@@ -1422,24 +1601,32 @@ fn write_ome_tiff(
             let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
 
             let color_space = infer_color_space(&first_dcm);
-            let photometric = match color_space {
-                ColorSpace::RGB       => PHOTOMETRIC_RGB,
-                ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
-                ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
+            let jp2k_has_ict_rct_sub = first_dcm.element_by_name("PhotometricInterpretation")
+                .ok().and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
+                .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT"))
+                .unwrap_or(false);
+            let baking_sub = icc_bake && !matches!(color_space, ColorSpace::Grayscale);
+            let photometric = if baking_sub {
+                PHOTOMETRIC_YCBCR
+            } else {
+                match color_space {
+                    ColorSpace::RGB       => PHOTOMETRIC_RGB,
+                    ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
+                    ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
+                }
             };
             let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
 
             let ts_uid = first_dcm.meta().transfer_syntax();
             let compr  = tiff_compression_tag(ts_uid);
 
-            // When using `TIFFWriteRawTile` for pass-through, libtiff checks that the JPEG SOF header dimensions match
-            // the TIFF tile declaration (after tile_align). If the JPEG dimensions are not multiples of 16,
-            // this mismatch causes a "Bad value N for tileWidth/tileLength tag" error.
-            if compr == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
+            // For JPEG passthrough, libtiff checks that JPEG SOF dimensions match the TIFF tile declaration.
+            if !baking_sub && compr == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
                 if verbose {
                     vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
                         sub_idx + 1, ifd_width, ifd_height, tile_w, tile_h));
                 }
+                drop(first_dcm);
                 continue;
             }
 
@@ -1448,17 +1635,17 @@ fn write_ome_tiff(
 
             if verbose {
                 let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
-                vlog(pb, format!("  [pass ] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                    sub_idx + 1, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+                let tag = if baking_sub { "bake " } else { "pass " };
+                vlog(pb, format!("  [{}] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                    tag, sub_idx + 1, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
             }
 
-            // SubFileType = REDUCEDIMAGE signals a lower-resolution version.
             TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     FILETYPE_REDUCEDIMAGE);
             TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      ifd_width);
             TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     ifd_height);
             TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_align(tile_w, 16));
             TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_align(tile_h, 16));
-            TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     compr);
+            TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     if baking_sub { 7u32 } else { compr });
             TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
             TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
             TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
@@ -1469,7 +1656,9 @@ fn write_ome_tiff(
             TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     res);
             TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     res);
 
-            if matches!(color_space, ColorSpace::YCbCr) {
+            if baking_sub {
+                TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
+            } else if matches!(color_space, ColorSpace::YCbCr) {
                 let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
                 let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
                 if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
@@ -1480,6 +1669,18 @@ fn write_ome_tiff(
             }
             drop(first_dcm);
 
+            // Build sub-level ICC transform on demand (reuse icc_profile from IFD 0 scope is not in scope here;
+            // re-extract from the first file in this group for the baking path).
+            let sub_icc_transform: Option<Arc<IccTransform>> = if baking_sub {
+                let dcm_tmp = dicom::object::open_file(&metadata.file_path).ok();
+                dcm_tmp.as_ref()
+                    .and_then(|d| extract_icc_profile(d))
+                    .and_then(|icc| build_icc_transform(&icc))
+            } else {
+                None
+            };
+
+            let mut jpegtables_reg_sub = false;
             for dcm_meta in group.iter() {
                 let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                 let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
@@ -1488,8 +1689,28 @@ fn write_ome_tiff(
                 for (fi, fragment) in fragments.iter().enumerate() {
                     if !fragment.is_empty() {
                         let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
+                        let baked: Option<Vec<u8>> = if baking_sub {
+                            if compr == 7 {
+                                sub_icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality))
+                            } else {
+                                sub_icc_transform.as_deref().and_then(|xf| bake_jp2k_tile(fragment, jp2k_has_ict_rct_sub, xf, quality))
+                            }
+                        } else { None };
+                        let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
+                        let split = (if baking_sub { true } else { compr == 7 })
+                            .then(|| split_jpeg_to_tables_and_tile(src_bytes))
+                            .flatten();
+                        if !jpegtables_reg_sub {
+                            if let Some((ref tables, _)) = split {
+                                TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                    tables.len() as u32, tables.as_ptr());
+                                jpegtables_reg_sub = true;
+                            }
+                        }
+                        let write_bytes = split.as_ref()
+                            .map(|(_, t)| t.as_slice()).unwrap_or(src_bytes);
                         TIFFWriteRawTile(tiff, tile_num,
-                            fragment.as_ptr() as *mut c_void, fragment.len() as i64);
+                            write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
                     }
                 }
             }
@@ -1556,6 +1777,9 @@ unsafe fn write_svs_tiled_level(
     res_y: f64,
     subfile_type: u32,
     image_desc: Option<&CString>,
+    icc_transform: Option<&IccTransform>,
+    quality: u8,
+    jp2k_has_ict_rct: bool,
 ) { unsafe {
     let dicom_obj  = dicom::object::open_file(&metadata.file_path).unwrap();
     let px_elem    = dicom_obj.element_by_name("PixelData").expect("No PixelData");
@@ -1565,13 +1789,18 @@ unsafe fn write_svs_tiled_level(
     let ifd_height = metadata.px_rows.unwrap_or(0);
     let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
 
+    // When ICC baking, override compression to standard JPEG (7) and photometric to YCBCR.
+    let baking = icc_transform.is_some();
+    let out_compression = if baking { 7u32 } else { svs_compression };
+    let out_photometric = if baking { PHOTOMETRIC_YCBCR as u32 } else { photometric };
+
     TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
     TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      ifd_width);
     TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     ifd_height);
     TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_align(tile_w, 16));
     TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_align(tile_h, 16));
-    TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     svs_compression);
-    TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
+    TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     out_compression);
+    TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     out_photometric);
     TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, 3u32);
     TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
     TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
@@ -1585,8 +1814,10 @@ unsafe fn write_svs_tiled_level(
         TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
     }
 
-    // For YCbCr JPEG, detect actual subsampling from the first tile.
-    if photometric == PHOTOMETRIC_YCBCR as u32 && svs_compression == 7 {
+    if baking {
+        // Baked tiles are re-encoded with turbojpeg Sub2x2 (4:2:0).
+        TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
+    } else if out_photometric == PHOTOMETRIC_YCBCR as u32 && svs_compression == 7 {
         if let Some(first) = fragments.iter().find(|f| !f.is_empty()) {
             if let Some((h, v)) = detect_jpeg_subsampling(first) {
                 TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
@@ -1595,13 +1826,35 @@ unsafe fn write_svs_tiled_level(
     }
 
     let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
+    let mut jpegtables_registered = false;
     for (i, fragment) in fragments.iter().enumerate() {
         if !fragment.is_empty() {
             let tile_num = tile_indices.get(i).copied().unwrap_or(i as u32);
+            let baked: Option<Vec<u8>> = icc_transform.and_then(|xf| {
+                if svs_compression == 7 {
+                    bake_jpeg_tile(fragment, xf, quality)
+                } else {
+                    bake_jp2k_tile(fragment, jp2k_has_ict_rct, xf, quality)
+                }
+            });
+            let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
+            // For baked (or already-JPEG passthrough) tiles, use JPEGTABLES optimization.
+            let split = (out_compression == 7)
+                .then(|| split_jpeg_to_tables_and_tile(src_bytes))
+                .flatten();
+            if !jpegtables_registered {
+                if let Some((ref tables, _)) = split {
+                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                        tables.len() as u32, tables.as_ptr());
+                    jpegtables_registered = true;
+                }
+            }
+            let write_bytes = split.as_ref()
+                .map(|(_, t)| t.as_slice()).unwrap_or(src_bytes);
             TIFFWriteRawTile(
                 tiff, tile_num,
-                fragment.as_ptr() as *mut c_void,
-                fragment.len() as i64,
+                write_bytes.as_ptr() as *mut c_void,
+                write_bytes.len() as i64,
             );
         }
     }
@@ -1640,6 +1893,8 @@ fn write_svs(
     output_path: &str,
     pb: Option<&ProgressBar>,
     verbose: bool,
+    quality: u8,
+    icc_bake: bool,
 ) {
     // Determine SVS compression code and photometric from the full-res level.
     // For JPEG2000 source use Aperio proprietary codes; for JPEG use standard 7.
@@ -1663,6 +1918,18 @@ fn write_svs(
         };
         vlog(pb, &msg);
     }
+    let icc_transform: Option<Arc<IccTransform>> = if icc_bake {
+        icc_profile.as_deref().and_then(build_icc_transform)
+    } else {
+        None
+    };
+    if icc_bake && verbose {
+        vlog(pb, if icc_transform.is_some() {
+            "  [icc  ] baking → sRGB"
+        } else {
+            "  [icc  ] bake skipped (no profile or build failed)"
+        });
+    }
     let ts_uid = dcm0.meta().transfer_syntax();
     let is_jp2 = is_jpeg2000(&map_transfer_syntax_to_compression(ts_uid));
     // Read raw PhotometricInterpretation to distinguish YBR_ICT/YBR_RCT from RGB.
@@ -1670,6 +1937,7 @@ fn write_svs(
         .ok()
         .and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
         .unwrap_or_default();
+    let jp2k_has_ict_rct = matches!(photometric_interp.as_str(), "YBR_ICT" | "YBR_RCT");
     let (svs_compression, photometric) = match (is_jp2, photometric_interp.as_str()) {
         (true,  "YBR_ICT") | (true, "YBR_RCT")
                               => (COMPRESSION_APERIO_JP2_YCBCR, PHOTOMETRIC_YCBCR as u32),
@@ -1740,10 +2008,15 @@ fn write_svs(
             base_res_x, base_res_y,
             0,  // SubFileType: full image
             Some(&image_desc_c),
+            icc_transform.as_deref(),
+            quality,
+            jp2k_has_ict_rct,
         );
-        if let Some(ref icc) = icc_profile {
-            TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                icc.len() as u32, icc.as_ptr() as *const c_void);
+        if !icc_bake {
+            if let Some(ref icc) = icc_profile {
+                TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                    icc.len() as u32, icc.as_ptr() as *const c_void);
+            }
         }
         TIFFWriteDirectory(tiff);
         if let Some(p) = pb { p.inc(base.n_frames.unwrap_or(0) as u64); }
@@ -1771,10 +2044,9 @@ fn write_svs(
                 continue;
             }
 
-            // For JPEG passthrough, libtiff checks that the JPEG SOF header dimensions match the TIFF tile declaration.
-            // If tiles are not multiples of 16, this mismatch causes an error, so we skip these levels.
             let (lvl_tile_w, lvl_tile_h) = level.tile_size.unwrap();
-            if svs_compression == 7 && !is_jpeg_tile_aligned(lvl_tile_w, lvl_tile_h) {
+            // For JPEG passthrough without baking, libtiff rejects non-16-aligned tiles.
+            if !icc_bake && svs_compression == 7 && !is_jpeg_tile_aligned(lvl_tile_w, lvl_tile_h) {
                 if verbose {
                     vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
                         _i + 1, level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
@@ -1785,8 +2057,9 @@ fn write_svs(
             let ds = base_cols / level.px_columns.unwrap_or(1) as f64;
             let lv_mpp = base_mpp_x * ds;
             if verbose {
-                vlog(pb, format!("  [pass ] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                    _i + 1,
+                let tag = if icc_bake { "bake " } else { "pass " };
+                vlog(pb, format!("  [{}] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                    tag, _i + 1,
                     level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
                     lv_mpp, lvl_tile_w, lvl_tile_h,
                     level.n_frames.unwrap_or(0)));
@@ -1797,6 +2070,9 @@ fn write_svs(
                 base_res_x / ds, base_res_y / ds,
                 FILETYPE_REDUCEDIMAGE,
                 None,
+                icc_transform.as_deref(),
+                quality,
+                jp2k_has_ict_rct,
             );
             TIFFWriteDirectory(tiff);
             if let Some(p) = pb { p.inc(level.n_frames.unwrap_or(0) as u64); }
@@ -1847,6 +2123,7 @@ fn write_resampled_tiff(
     pb: Option<&ProgressBar>,
     verbose: bool,
     half: bool,
+    icc_bake: bool,
 ) {
 
     // ── Group DICOM files by resolution level ─────────────────────────────
@@ -1915,8 +2192,9 @@ fn write_resampled_tiff(
         let (chosen_tw, chosen_th) = chosen_meta.tile_size.unwrap_or((chosen_w, chosen_h));
 
         // Passthrough if the closest group's MPP is within 10 % of target.
+        // ICC baking requires pixel decoding, so passthrough is always disabled when baking.
         let diff = (chosen_mpp_x - target_lv_mpp_x).abs() / target_lv_mpp_x;
-        let mut passthrough = diff < 0.1;
+        let mut passthrough = diff < 0.1 && !icc_bake;
 
         if passthrough {
             let compr = tiff_compression_tag(&chosen_meta.transfer_syntax_uid);
@@ -2025,6 +2303,18 @@ fn write_resampled_tiff(
             None      => "  [icc  ] not found".to_string(),
         };
         vlog(pb, &msg);
+    }
+    let icc_transform: Option<Arc<IccTransform>> = if icc_bake {
+        icc_profile.as_deref().and_then(build_icc_transform)
+    } else {
+        None
+    };
+    if icc_bake && verbose {
+        vlog(pb, if icc_transform.is_some() {
+            "  [icc  ] baking → sRGB"
+        } else {
+            "  [icc  ] bake skipped (no profile or build failed)"
+        });
     }
 
     // The jp2k crate (OpenJPEG) does NOT automatically reverse the JPEG 2000
@@ -2179,6 +2469,7 @@ fn write_resampled_tiff(
             color_space,
             n_reduce,
             half,
+            icc_transform:    icc_transform.clone(),
         });
         let (raw_tx, raw_rx) = mpsc::sync_channel::<LibRawChunk>(2);
         let (enc_tx, enc_rx) = mpsc::sync_channel::<LibEncChunk>(2);
@@ -2293,9 +2584,11 @@ fn write_resampled_tiff(
                     if let Some(ref desc) = image_desc_c {
                         TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
                     }
-                    if let Some(ref icc) = icc_profile {
-                        TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                            icc.len() as u32, icc.as_ptr() as *const c_void);
+                    if !icc_bake {
+                        if let Some(ref icc) = icc_profile {
+                            TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                                icc.len() as u32, icc.as_ptr() as *const c_void);
+                        }
                     }
                 }
                 drop(first_dcm);
@@ -2360,9 +2653,11 @@ fn write_resampled_tiff(
                     if let Some(ref desc) = image_desc_c {
                         TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
                     }
-                    if let Some(ref icc) = icc_profile {
-                        TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                            icc.len() as u32, icc.as_ptr() as *const c_void);
+                    if !icc_bake {
+                        if let Some(ref icc) = icc_profile {
+                            TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                                icc.len() as u32, icc.as_ptr() as *const c_void);
+                        }
                     }
                 }
 
@@ -2448,7 +2743,8 @@ fn convert_one_series(
     // When the source is JP2K and a level close to the target exists, passthrough the
     // matching level and all coarser levels as SVS without any decode or re-encode.
     // OpenSlide recognises JP2K tiles in SVS but not in plain TIFF/OME-TIFF.
-    let jp2k_svs_skip: Option<usize> = effective_mpp.and_then(|target| {
+    // ICC baking requires pixel decoding, so jp2k_svs_skip is disabled when baking.
+    let jp2k_svs_skip: Option<usize> = if args.icc_bake { None } else { effective_mpp.and_then(|target| {
         if !is_jpeg2000(&comp) { return None; }
         // Count levels finer than target (smaller mpp = higher resolution).
         let skip = slide_levels_owned.iter()
@@ -2460,7 +2756,7 @@ fn convert_one_series(
             .map(|mpp| (mpp - target).abs() / target < 0.1)
             .unwrap_or(false);
         if skip > 0 && has_match { Some(skip) } else { None }
-    });
+    }) };
 
     // Resolve the stem used for the output filename.
     let file_stem: String = if args.use_parent_name {
@@ -2529,6 +2825,8 @@ fn convert_one_series(
             &tmp_path,
             Some(&pb),
             args.verbose,
+            args.quality,
+            args.icc_bake,
         );
     } else if let Some(target_mpp) = effective_mpp {
         write_resampled_tiff(
@@ -2538,6 +2836,7 @@ fn convert_one_series(
             Some(&pb),
             args.verbose,
             args.half,
+            args.icc_bake,
         );
     } else if args.legacy {
         if is_jpeg2000(&comp) {
@@ -2549,6 +2848,8 @@ fn convert_one_series(
                 &tmp_path,
                 Some(&pb),
                 args.verbose,
+                args.quality,
+                args.icc_bake,
             );
         } else {
             write_flat_multipage_tiff(
@@ -2556,6 +2857,8 @@ fn convert_one_series(
                 &tmp_path,
                 Some(&pb),
                 args.verbose,
+                args.quality,
+                args.icc_bake,
             );
         }
     } else {
@@ -2567,6 +2870,8 @@ fn convert_one_series(
             &tmp_path,
             Some(&pb),
             args.verbose,
+            args.quality,
+            args.icc_bake,
         );
     }
 
@@ -2718,10 +3023,10 @@ pub fn run(args: Args) {
 
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            if args_ref.mpp.is_some() || args_ref.half {
-                // Resampling: CPU-bound (decode + resize + encode).
+            if args_ref.mpp.is_some() || args_ref.half || args_ref.icc_bake {
+                // Resampling / ICC-bake: CPU-bound (decode + transform + encode).
                 // Process one WSI at a time so all n_jobs threads concentrate on
-                // tile-level parallelism inside write_resampled_tiff.
+                // tile-level parallelism inside write_resampled_tiff / write_*.
                 convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
             } else if n_concurrent <= 1 {
                 // n_concurrent == 1: run inline on the main thread.

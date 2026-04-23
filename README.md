@@ -1,4 +1,4 @@
-# wsi-tools
+# SlideLeaner: The high-speed WSI optimizer for sustainable pathology.
 
 A fast command-line toolkit for Whole Slide Image (WSI) processing.
 
@@ -11,10 +11,11 @@ A fast command-line toolkit for Whole Slide Image (WSI) processing.
 
 - Rust toolchain (edition 2024)
 - [libtiff](http://www.libtiff.org/)
+- [Little CMS 2](https://www.littlecms.com/) (required for `--icc-bake`)
 
-**macOS:** `brew install libtiff`  
-**Debian/Ubuntu:** `sudo apt install libtiff-dev`  
-**Fedora/RHEL:** `sudo dnf install libtiff-devel`
+**macOS:** `brew install libtiff little-cms2`  
+**Debian/Ubuntu:** `sudo apt install libtiff-dev liblcms2-dev`  
+**Fedora/RHEL:** `sudo dnf install libtiff-devel lcms2-devel`
 
 ## Building
 
@@ -33,13 +34,14 @@ Converts Whole Slide Image DICOM sets into pyramidal TIFF files.
 ### Modes
 
 - **Passthrough** (default): compressed pixel data is written directly without decoding, preserving original quality and maximising speed.
-- **Downsampling** (`--mpp`): tiles are decoded, resized to a target resolution, and re-encoded as JPEG.
+- **Downsampling** (`--mpp` / `--half`): tiles are decoded, resized to a target resolution, and re-encoded as JPEG.
+- **ICC bake** (`--icc-bake`): tiles are decoded, the embedded ICC color profile is applied to convert pixels to sRGB, and the tiles are re-encoded as JPEG. The ICC profile tag is omitted from the output, so any viewer displays correct colors without needing ICC support. Useful when the source has a large per-WSI ICC profile (e.g. Hamamatsu: ~13 MB) that causes storage bloat or viewer failures. Not that this feature is experimental and not optimised for performance.
 
 ### Output formats
 
 By default the output is OME-TIFF. Pass `--legacy` to select a format based on the DICOM transfer syntax:
 
-| DICOM compression | Default | `--legacy` | `--mpp` |
+| DICOM compression | Default | `--legacy` | `--mpp` / `--icc-bake` |
 |---|---|---|---|
 | JPEG | OME-TIFF | BigTIFF | OME-TIFF (or BigTIFF with `--legacy`) |
 | JPEG 2000 | OME-TIFF | Aperio SVS | OME-TIFF (or BigTIFF with `--legacy`) |
@@ -54,9 +56,10 @@ dcm2tiff <input_dir> <output_dir> [OPTIONS]
 |---|---|---|
 | `--mpp <N>` | Downsample to this resolution (µm/pixel) | off (passthrough) |
 | `--half` | Halve width and height (fastest downsampling; mutually exclusive with `--mpp`) | off |
+| `--icc-bake` | Apply embedded ICC profile to pixel data and write sRGB output without an ICC tag | off |
 | `--legacy` | Write BigTIFF or SVS instead of OME-TIFF | off |
 | `-j` / `--jobs <N>` | Number of parallel threads | all CPUs |
-| `--quality <N>` | JPEG quality for downsampling (1–100) | 87 |
+| `--quality <N>` | JPEG quality for re-encoding (1–100); used with `--mpp`, `--half`, or `--icc-bake` | 87 |
 | `--filter <NAME>` | Downsampling filter: `nearest`, `triangle`, `catmullrom`, `lanczos3` | `nearest` |
 | `--use-parent-name` | Name output files after parent directory instead of Series Instance UID | off |
 | `-v` / `--verbose` | Print input/output paths and scan summary | off |
@@ -81,6 +84,12 @@ dcm2tiff <input_dir> <output_dir> [OPTIONS]
 
 # Halve width and height (fastest for JPEG sources: DCT-domain 1/2 decode + no resize)
 ./target/release/dcm2tiff /data/dicoms /data/output --half
+
+# Bake ICC profile into pixels and write sRGB JPEG output without ICC tag
+./target/release/dcm2tiff /data/dicoms /data/output --icc-bake
+
+# ICC bake combined with downsampling to 0.5 µm/px
+./target/release/dcm2tiff /data/dicoms /data/output --icc-bake --mpp 0.5
 ```
 
 ### Parallelism
@@ -89,6 +98,7 @@ dcm2tiff <input_dir> <output_dir> [OPTIONS]
 |---|---|
 | Passthrough | Number of series processed concurrently (use `-j 1` on HDD) |
 | `--mpp` / `--half` (downsampling) | Tile-level parallelism within one series (all CPUs is fine) |
+| `--icc-bake` | Tile-level parallelism within one series (series are processed sequentially, same as downsampling) |
 
 ---
 
@@ -158,6 +168,9 @@ If the requested `--mpp` is finer than the source base resolution, the tool fall
 | `dicom-pixeldata` | Decoding pixel data |
 | `image` | Resize and JPEG encoding |
 | `fast_image_resize` | Fast tile-level resize |
+| `turbojpeg` | Fast JPEG decode/encode for ICC-baked tiles |
+| `jpeg2k` | JPEG 2000 decode |
+| `lcms2` | ICC color profile transforms (`--icc-bake`) |
 | `indicatif` | Progress bars |
 | `rayon` | Parallelism |
 | `walkdir` | Recursive directory traversal |
