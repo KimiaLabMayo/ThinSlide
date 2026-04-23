@@ -6,6 +6,7 @@
 #[allow(non_camel_case_types)]
 #[allow(non_snake_case)]
 pub mod bindings;
+mod tiffds;
 use bindings::{
     TIFF, TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteDirectory, TIFFClose,
     TIFFTAG_SUBFILETYPE, TIFFTAG_IMAGEWIDTH, TIFFTAG_IMAGELENGTH, TIFFTAG_TILEWIDTH,
@@ -2922,23 +2923,33 @@ pub fn run(args: Args) {
 
     let mut dir_map: std::collections::HashMap<std::path::PathBuf, Vec<String>> =
         std::collections::HashMap::new();
+    let mut tiff_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut last_dir_count  = 0usize;
     let mut total_file_count = 0usize;
     for entry in WalkDir::new(&args.input_dir).into_iter().filter_map(|e| e.ok()) {
-        if entry.file_type().is_file()
-            && entry.path().extension().map_or(false, |e| e == "dcm")
-        {
-            let parent = entry.path().parent()
-                .unwrap_or(Path::new(".")).to_path_buf();
-            dir_map.entry(parent).or_default()
-                .push(entry.path().to_string_lossy().into_owned());
-            total_file_count += 1;
-            let n_dirs = dir_map.len();
-            if n_dirs != last_dir_count {
-                scan_pb.set_message(format!("{} files in {} dirs found",
-                    total_file_count, n_dirs));
-                last_dir_count = n_dirs;
+        if !entry.file_type().is_file() { continue; }
+        let ext = entry.path().extension()
+            .and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+        match ext.as_str() {
+            "dcm" => {
+                let parent = entry.path().parent()
+                    .unwrap_or(Path::new(".")).to_path_buf();
+                dir_map.entry(parent).or_default()
+                    .push(entry.path().to_string_lossy().into_owned());
+                total_file_count += 1;
+                let n_dirs = dir_map.len();
+                if n_dirs != last_dir_count {
+                    scan_pb.set_message(format!("{} DCM in {} dirs, {} TIFF/SVS",
+                        total_file_count, n_dirs, tiff_paths.len()));
+                    last_dir_count = n_dirs;
+                }
             }
+            "tiff" | "svs" => {
+                tiff_paths.push(entry.path().to_owned());
+                scan_pb.set_message(format!("{} DCM in {} dirs, {} TIFF/SVS",
+                    total_file_count, dir_map.len(), tiff_paths.len()));
+            }
+            _ => {}
         }
     }
     scan_pb.finish_and_clear();
@@ -2954,8 +2965,10 @@ pub fn run(args: Args) {
     let total_files = total_file_count as u64;
 
     if args.verbose {
-        eprintln!("Found {} DICOM files in {} directories",
-            total_files, dir_groups.len());
+        eprintln!("Found {} DICOM files in {} directories", total_files, dir_groups.len());
+        if !tiff_paths.is_empty() {
+            eprintln!("Found {} TIFF/SVS files", tiff_paths.len());
+        }
     }
 
     // ── Phase 2+3: metadata extraction pipelined with conversion ─────────────
@@ -3071,5 +3084,16 @@ pub fn run(args: Args) {
     if skipped > 0 {
         println!("  {} of {} series skipped (output already exists).",
             skipped, total_processed);
+    }
+
+    // Process TIFF/SVS files (requires --mpp or --half)
+    if !tiff_paths.is_empty() {
+        if args.mpp.is_some() || args.half {
+            tiff_paths.sort();
+            tiffds::process_files(&tiff_paths, &args, &mp);
+        } else {
+            eprintln!("  {} TIFF/SVS file(s) found; specify --mpp or --half to process them.",
+                tiff_paths.len());
+        }
     }
 }

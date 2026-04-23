@@ -2,10 +2,23 @@
 
 A fast command-line toolkit for Whole Slide Image (WSI) processing.
 
-| Command | Input | Output |
-|---|---|---|
-| `dcm2tiff` | DICOM WSI (directory) | Pyramidal TIFF / OME-TIFF / SVS |
-| `tiffds` | TIFF / SVS (directory) | Downsampled pyramidal OME-TIFF / TIFF |
+## Features
+
+- **Zero-Decode Transcoding**: Repacks DICOM to TIFF by mapping binary bitstreams directly into containers. No re-encoding, zero quality loss, and near-instantaneous execution.
+
+- **High-Speed Parallel Architecture**: Leverages multi-core processing and concurrent I/O pipelines (read/transform/write) to eliminate processing bottlenecks.
+
+- **Interoperability by Default**: Outputs OME-TIFF to ensure seamless integration with the global bio-imaging ecosystem (Legacy TIFF mode available via --legacy).
+
+- **Smart Downsampling**: Optimized tile-based resampling and stitching for arbitrary MPP or high-speed 1/2 downsizing without memory bloat.
+
+- **Color Accuracy (--icc-bake)**: (Experimental) Bakes ICC profiles directly into RGB pixel data for consistent visualization across non-ICC aware analysis tools.
+
+- **Compact Storage**: Optimizes file size using JPEG tables within TIFF, ensuring high-fidelity data remains manageable and sustainable.
+
+- **Research-Ready**: Consolidates fragmented DICOM file sets into a single, high-performance file, streamlining data management and transfer for downstream projects.
+
+`slean` scans an input directory for DICOM WSI files (`.dcm`) and pyramidal TIFF/SVS files (`.tiff`, `.svs`) and converts or downsamples them into pyramidal TIFF files.
 
 ## Requirements
 
@@ -23,122 +36,93 @@ A fast command-line toolkit for Whole Slide Image (WSI) processing.
 cargo build --release
 ```
 
-Binaries are placed at `target/release/dcm2tiff` and `target/release/tiffds`.
+Binary is placed at `target/release/slean`.
 
 ---
 
-## dcm2tiff
+## Usage
 
-Converts Whole Slide Image DICOM sets into pyramidal TIFF files.
+```
+slean <input_dir> <output_dir> [OPTIONS]
+```
+
+`slean` processes all supported files under `input_dir` in one pass:
+
+| Source file type | Condition | Output |
+|---|---|---|
+| DICOM (`.dcm`) | always | OME-TIFF (or BigTIFF/SVS with `--legacy`) |
+| TIFF / SVS | `--mpp` or `--half` required | OME-TIFF (or BigTIFF with `--legacy`) |
 
 ### Modes
 
-- **Passthrough** (default): compressed pixel data is written directly without decoding, preserving original quality and maximising speed.
-- **Downsampling** (`--mpp` / `--half`): tiles are decoded, resized to a target resolution, and re-encoded as JPEG.
-- **ICC bake** (`--icc-bake`): tiles are decoded, the embedded ICC color profile is applied to convert pixels to sRGB, and the tiles are re-encoded as JPEG. The ICC profile tag is omitted from the output, so any viewer displays correct colors without needing ICC support. Useful when the source has a large per-WSI ICC profile (e.g. Hamamatsu: ~13 MB) that causes storage bloat or viewer failures. Not that this feature is experimental and not optimised for performance.
+- **Passthrough** (DICOM, default): compressed pixel data is written directly without decoding, preserving original quality and maximising speed.
+- **Downsampling** (`--mpp` / `--half`): tiles are decoded, resized to a target resolution, and re-encoded as JPEG. Applies to both DICOM and TIFF/SVS sources.
+- **ICC bake** (`--icc-bake`, DICOM only): tiles are decoded, the embedded ICC color profile is applied to convert pixels to sRGB, and the tiles are re-encoded as JPEG. The ICC profile tag is omitted from the output, so any viewer displays correct colors without needing ICC support. Useful when the source has a large per-WSI ICC profile (e.g. Hamamatsu: ~13 MB) that causes storage bloat or viewer failures. Note that this feature is experimental and not optimised for performance.
 
 ### Output formats
 
-By default the output is OME-TIFF. Pass `--legacy` to select a format based on the DICOM transfer syntax:
+By default the output is OME-TIFF. Pass `--legacy` to select a format based on the source:
 
-| DICOM compression | Default | `--legacy` | `--mpp` / `--icc-bake` |
+| Source compression | Default | `--legacy` | `--mpp` / `--icc-bake` |
 |---|---|---|---|
-| JPEG | OME-TIFF | BigTIFF | OME-TIFF (or BigTIFF with `--legacy`) |
-| JPEG 2000 | OME-TIFF | Aperio SVS | OME-TIFF (or BigTIFF with `--legacy`) |
+| DICOM JPEG | OME-TIFF | BigTIFF | OME-TIFF (or BigTIFF with `--legacy`) |
+| DICOM JPEG 2000 | OME-TIFF | Aperio SVS | OME-TIFF (or BigTIFF with `--legacy`) |
+| TIFF/SVS (any) | — | — | OME-TIFF (or BigTIFF with `--legacy`) |
 
-### Usage
-
-```
-dcm2tiff <input_dir> <output_dir> [OPTIONS]
-```
+### Options
 
 | Option | Description | Default |
 |---|---|---|
-| `--mpp <N>` | Downsample to this resolution (µm/pixel) | off (passthrough) |
+| `--mpp <N>` | Downsample to this resolution (µm/pixel) | off (passthrough for DICOM) |
 | `--half` | Halve width and height (fastest downsampling; mutually exclusive with `--mpp`) | off |
-| `--icc-bake` | Apply embedded ICC profile to pixel data and write sRGB output without an ICC tag | off |
+| `--icc-bake` | Apply embedded ICC profile to pixel data and write sRGB output without an ICC tag (DICOM only) | off |
 | `--legacy` | Write BigTIFF or SVS instead of OME-TIFF | off |
 | `-j` / `--jobs <N>` | Number of parallel threads | all CPUs |
 | `--quality <N>` | JPEG quality for re-encoding (1–100); used with `--mpp`, `--half`, or `--icc-bake` | 87 |
 | `--filter <NAME>` | Downsampling filter: `nearest`, `triangle`, `catmullrom`, `lanczos3` | `nearest` |
-| `--use-parent-name` | Name output files after parent directory instead of Series Instance UID | off |
+| `--use-parent-name` | Name DICOM output files after parent directory instead of Series Instance UID | off |
 | `-v` / `--verbose` | Print input/output paths and scan summary | off |
 
 ### Examples
 
 ```sh
-# Passthrough — OME-TIFF, all CPUs
-./target/release/dcm2tiff /data/dicoms /data/output
+# DICOM passthrough — OME-TIFF, all CPUs
+./target/release/slean /data/dicoms /data/output
 
-# Passthrough — SVS / BigTIFF (format chosen by DICOM compression type)
-./target/release/dcm2tiff /data/dicoms /data/output --legacy
+# DICOM passthrough — SVS / BigTIFF (format chosen by DICOM compression type)
+./target/release/slean /data/dicoms /data/output --legacy
 
-# Downsample to 0.5 µm/px
-./target/release/dcm2tiff /data/dicoms /data/output --mpp 0.5
+# Downsample DICOM and TIFF/SVS to 0.5 µm/px
+./target/release/slean /data/slides /data/output --mpp 0.5
 
 # Downsample to 1.0 µm/px, Lanczos3 filter, quality 90, 4 threads
-./target/release/dcm2tiff /data/dicoms /data/output --mpp 1.0 --filter lanczos3 --quality 90 -j 4
-
-# On HDD: process one series at a time to avoid seek contention
-./target/release/dcm2tiff /data/dicoms /data/output -j 1
+./target/release/slean /data/slides /data/output --mpp 1.0 --filter lanczos3 --quality 90 -j 4
 
 # Halve width and height (fastest for JPEG sources: DCT-domain 1/2 decode + no resize)
-./target/release/dcm2tiff /data/dicoms /data/output --half
+./target/release/slean /data/slides /data/output --half
 
-# Bake ICC profile into pixels and write sRGB JPEG output without ICC tag
-./target/release/dcm2tiff /data/dicoms /data/output --icc-bake
+# Bake ICC profile into pixels and write sRGB JPEG output without ICC tag (DICOM only)
+./target/release/slean /data/dicoms /data/output --icc-bake
 
 # ICC bake combined with downsampling to 0.5 µm/px
-./target/release/dcm2tiff /data/dicoms /data/output --icc-bake --mpp 0.5
+./target/release/slean /data/dicoms /data/output --icc-bake --mpp 0.5
+
+# Mixed directory: DICOM passthrough + TIFF/SVS downsampled to 2.0 µm/px
+./target/release/slean /data/mixed /data/output --mpp 2.0
+
+# On HDD: process DICOM one series at a time to avoid seek contention
+./target/release/slean /data/dicoms /data/output -j 1
 ```
 
 ### Parallelism
 
 | Mode | `-j N` controls |
 |---|---|
-| Passthrough | Number of series processed concurrently (use `-j 1` on HDD) |
-| `--mpp` / `--half` (downsampling) | Tile-level parallelism within one series (all CPUs is fine) |
+| DICOM passthrough | Number of series processed concurrently (use `-j 1` on HDD) |
+| `--mpp` / `--half` (downsampling) | Tile-level parallelism within one series/file (all CPUs is fine) |
 | `--icc-bake` | Tile-level parallelism within one series (series are processed sequentially, same as downsampling) |
 
----
-
-## tiffds
-
-Downsamples existing TIFF / SVS files to a target resolution. Reads every `.tiff` / `.svs` file under the input directory and writes a pyramidal OME-TIFF (default) or BigTIFF (`--legacy`).
-
-Either `--mpp` or `--half` is required.
-
-### Usage
-
-```
-tiffds <input_dir> <output_dir> (--mpp <N> | --half) [OPTIONS]
-```
-
-| Option | Description | Default |
-|---|---|---|
-| `--mpp <N>` | Target resolution (µm/pixel); required unless `--half` | — |
-| `--half` | Halve width and height (fastest downsampling; mutually exclusive with `--mpp`) | off |
-| `--legacy` | Write flat pyramidal BigTIFF instead of OME-TIFF | off |
-| `-j` / `--jobs <N>` | Number of parallel threads | all CPUs |
-| `--quality <N>` | JPEG quality (1–100) | 87 |
-| `--filter <NAME>` | Downsampling filter: `nearest`, `triangle`, `catmullrom`, `lanczos3` | `nearest` |
-| `-v` / `--verbose` | Print input/output paths | off |
-
-### Examples
-
-```sh
-# Downsample all TIFFs/SVS files to 2.0 µm/px
-./target/release/tiffds /data/slides /data/output --mpp 2.0
-
-# High-quality downsampling to 1.0 µm/px
-./target/release/tiffds /data/slides /data/output --mpp 1.0 --filter lanczos3 --quality 90
-
-# Write flat BigTIFF instead of OME-TIFF
-./target/release/tiffds /data/slides /data/output --mpp 2.0 --legacy
-
-# Halve width and height (fastest for JPEG sources)
-./target/release/tiffds /data/slides /data/output --half
-```
+TIFF/SVS files are always processed one file at a time (tile-level parallelism within each file).
 
 ---
 

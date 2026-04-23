@@ -1,16 +1,12 @@
 [package]
-name = "wsi-tools"
+name = "slide-leaner"
 version = "0.1.0"
 edition = "2024"
 links = "tiff"
 
 [[bin]]
-name = "dcm2tiff"
-path = "src/bin/dcm2tiff.rs"
-
-[[bin]]
-name = "tiffds"
-path = "src/bin/tiffds.rs"
+name = "slean"
+path = "src/bin/slean.rs"
 
 [build-dependencies]
 pkg-config = "0.3"

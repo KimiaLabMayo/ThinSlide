@@ -1,4 +1,4 @@
-use wsi_tools::{Args, run};
+use slide_leaner::{Args, run};
 
 fn main() {
     let start_time = std::time::Instant::now();
