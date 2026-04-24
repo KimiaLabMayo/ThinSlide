@@ -106,6 +106,7 @@ struct EncodeParams {
     n_reduce:          u32,
     half:              bool,
     jpeg_tables:       Option<Arc<Vec<u8>>>,
+    icc_transform:     Option<Arc<crate::IccTransform>>,
 }
 
 fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u32, Vec<u8>)> {
@@ -233,6 +234,14 @@ fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u3
             let copy_len  = *pw as usize * ch;
             canvas[dst_start..dst_start + copy_len]
                 .copy_from_slice(&pixels[src_start..src_start + copy_len]);
+        }
+    }
+
+    if let Some(ref xform) = p.icc_transform {
+        if ch == 3 {
+            let mut dst = vec![0u8; canvas.len()];
+            crate::apply_icc(xform, &canvas, &mut dst);
+            canvas = dst;
         }
     }
 
@@ -368,6 +377,347 @@ pub(crate) fn process_files(
     }
 }
 
+// ─── ICC bake: single tile decode → transform → encode ───────────────────────
+
+fn bake_single_tile(
+    data:              &[u8],
+    is_raw_jpeg:       bool,
+    is_jp2k_tile:      bool,
+    src_jp2k_is_ycbcr: bool,
+    spp:               u32,
+    src_tile_w:        u32,
+    src_tile_h:        u32,
+    quality:           u8,
+    xform:             &crate::IccTransform,
+    jpeg_tables:       Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    let ch = spp as usize;
+    const APP14_ADOBE_RGB: [u8; 16] = [
+        0xFF, 0xEE, 0x00, 0x0E,
+        b'A', b'd', b'o', b'b', b'e',
+        0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    let (pixels, w, h) = if is_raw_jpeg {
+        let fmt = if spp == 1 { turbojpeg::PixelFormat::GRAY } else { turbojpeg::PixelFormat::RGB };
+        let combined: Vec<u8> = if let Some(tables) = jpeg_tables {
+            let inject_app14 = spp == 3;
+            let app14_len = if inject_app14 { APP14_ADOBE_RGB.len() } else { 0 };
+            let mut v = Vec::with_capacity(2 + app14_len + (tables.len() - 4) + (data.len() - 2));
+            v.extend_from_slice(&tables[0..2]);
+            if inject_app14 { v.extend_from_slice(&APP14_ADOBE_RGB); }
+            v.extend_from_slice(&tables[2..tables.len()-2]);
+            v.extend_from_slice(&data[2..]);
+            v
+        } else {
+            data.to_vec()
+        };
+        let dec = turbojpeg::decompress(&combined, fmt).ok()?;
+        let (w, h) = (dec.width as u32, dec.height as u32);
+        let pitch = w as usize * ch;
+        let pix = if dec.pitch == pitch {
+            dec.pixels
+        } else {
+            (0..h as usize).flat_map(|r| {
+                dec.pixels[r*dec.pitch..r*dec.pitch+pitch].iter().copied()
+            }).collect()
+        };
+        (pix, w, h)
+    } else if is_jp2k_tile {
+        let j2k = jpeg2k::Image::from_bytes_with(data, jpeg2k::DecodeParameters::default()).ok()?;
+        let comps = j2k.components();
+        if comps.is_empty() { return None; }
+        let luma_w = comps[0].width() as usize;
+        let luma_h = comps[0].height() as usize;
+        if luma_w == 0 || luma_h == 0 { return None; }
+        let mut pix: Vec<u8> = if spp == 1 || comps.len() < 3 {
+            comps[0].data_u8().collect()
+        } else {
+            let y_u8:  Vec<u8> = comps[0].data_u8().collect();
+            let cb_u8: Vec<u8> = comps[1].data_u8().collect();
+            let cr_u8: Vec<u8> = comps[2].data_u8().collect();
+            let cb_w = comps[1].width() as usize;
+            let cb_h = comps[1].height() as usize;
+            let cr_w = comps[2].width() as usize;
+            let cr_h = comps[2].height() as usize;
+            let mut buf = Vec::with_capacity(luma_w * luma_h * 3);
+            for row in 0..luma_h {
+                for col in 0..luma_w {
+                    let y = y_u8[row*luma_w+col];
+                    let cb_col = (col*cb_w/luma_w).min(cb_w.saturating_sub(1));
+                    let cb_row = (row*cb_h/luma_h).min(cb_h.saturating_sub(1));
+                    let cb = cb_u8[cb_row*cb_w+cb_col];
+                    let cr_col = (col*cr_w/luma_w).min(cr_w.saturating_sub(1));
+                    let cr_row = (row*cr_h/luma_h).min(cr_h.saturating_sub(1));
+                    let cr = cr_u8[cr_row*cr_w+cr_col];
+                    buf.extend_from_slice(&[y, cb, cr]);
+                }
+            }
+            buf
+        };
+        let cs = j2k.color_space();
+        if spp == 3 && (
+            matches!(cs, jpeg2k::ColorSpace::SYCC)
+            || (src_jp2k_is_ycbcr && !matches!(cs, jpeg2k::ColorSpace::SRGB))
+        ) {
+            for c in pix.chunks_mut(3) {
+                let y  = c[0] as f32;
+                let cb = c[1] as f32 - 128.0;
+                let cr = c[2] as f32 - 128.0;
+                c[0] = (y + 1.40200 * cr).clamp(0.0, 255.0) as u8;
+                c[1] = (y - 0.34414*cb - 0.71414*cr).clamp(0.0, 255.0) as u8;
+                c[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
+            }
+        }
+        (pix, luma_w as u32, luma_h as u32)
+    } else {
+        (data.to_vec(), src_tile_w, src_tile_h)
+    };
+
+    let baked = if spp == 3 {
+        let mut dst = vec![0u8; pixels.len()];
+        crate::apply_icc(xform, &pixels, &mut dst);
+        dst
+    } else {
+        pixels
+    };
+
+    if spp == 1 {
+        turbojpeg::compress(
+            turbojpeg::Image::<&[u8]> {
+                pixels: &baked, width: w as usize,
+                pitch: w as usize, height: h as usize,
+                format: turbojpeg::PixelFormat::GRAY,
+            },
+            quality as i32, turbojpeg::Subsamp::Gray,
+        ).ok().map(|b| b.to_vec())
+    } else {
+        turbojpeg::compress(
+            turbojpeg::Image::<&[u8]> {
+                pixels: &baked, width: w as usize,
+                pitch: w as usize * 3, height: h as usize,
+                format: turbojpeg::PixelFormat::RGB,
+            },
+            quality as i32, turbojpeg::Subsamp::Sub2x2,
+        ).ok().map(|b| b.to_vec())
+    }
+}
+
+// ─── ICC bake-only: preserve pyramid structure, apply ICC per tile ────────────
+
+fn process_file_icc_bake_only(
+    src_path:   &str,
+    out_dir:    &str,
+    out_stem:   &str,
+    args:       &crate::Args,
+    icc_xform:  Arc<crate::IccTransform>,
+    src_levels: &[LevelDesc],
+    pb:         &ProgressBar,
+) {
+    let out_path = if args.legacy {
+        format!("{out_dir}/{out_stem}.tiff")
+    } else {
+        format!("{out_dir}/{out_stem}.ome.tiff")
+    };
+    let tmp_path = format!("{out_path}.tmp");
+
+    let total_tiles: u64 = src_levels.iter().map(|lv| lv.n_tiles as u64).sum();
+    pb.set_length(total_tiles);
+
+    let ome   = !args.legacy;
+    let base  = &src_levels[0];
+    let out_spp: u32 = if base.spp >= 3 { 3 } else { 1 };
+    let out_photometric = if out_spp == 1 { PHOTOMETRIC_MINISBLACK } else { PHOTOMETRIC_YCBCR };
+
+    let file_stem = Path::new(src_path).file_stem()
+        .unwrap_or_default().to_string_lossy().to_string();
+    let image_desc_c: Option<CString> = if ome {
+        let xml = generate_ome_xml(
+            &file_stem,
+            base.img_w, base.img_h,
+            base.mpp_x, base.mpp_y,
+            out_spp,
+        );
+        Some(CString::new(xml).unwrap())
+    } else {
+        None
+    };
+
+    let chunk_size = (rayon::current_num_threads() * 4).max(1);
+
+    unsafe {
+        let src_c   = CString::new(src_path).unwrap();
+        let tmp_c   = CString::new(tmp_path.as_str()).unwrap();
+        let r_mode  = CString::new("r").unwrap();
+        let w8_mode = CString::new("w8").unwrap();
+
+        let src_tiff = TIFFOpen(src_c.as_ptr(), r_mode.as_ptr());
+        if src_tiff.is_null() {
+            eprintln!("  [error] Cannot open: {src_path}");
+            return;
+        }
+        let dst_tiff = TIFFOpen(tmp_c.as_ptr(), w8_mode.as_ptr());
+        if dst_tiff.is_null() {
+            eprintln!("  [error] Cannot create: {tmp_path}");
+            TIFFClose(src_tiff);
+            return;
+        }
+
+        let n_subifds = src_levels.len().saturating_sub(1);
+        if ome && n_subifds > 0 {
+            let zeros: Vec<u64> = vec![0u64; n_subifds];
+            TIFFSetField(dst_tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr());
+        }
+
+        for (lv_idx, src_lv) in src_levels.iter().enumerate() {
+            navigate_to_level(src_tiff, &src_lv.nav);
+
+            let is_base  = lv_idx == 0;
+            let subfile  = if is_base { 0u32 } else { FILETYPE_REDUCEDIMAGE };
+            let out_tile_w = tile_align(src_lv.tile_w, 16);
+            let out_tile_h = tile_align(src_lv.tile_h, 16);
+
+            TIFFSetField(dst_tiff, TIFFTAG_SUBFILETYPE,      subfile);
+            TIFFSetField(dst_tiff, TIFFTAG_IMAGEWIDTH,       src_lv.img_w);
+            TIFFSetField(dst_tiff, TIFFTAG_IMAGELENGTH,      src_lv.img_h);
+            TIFFSetField(dst_tiff, TIFFTAG_TILEWIDTH,        out_tile_w);
+            TIFFSetField(dst_tiff, TIFFTAG_TILELENGTH,       out_tile_h);
+            TIFFSetField(dst_tiff, TIFFTAG_COMPRESSION,      COMPRESSION_JPEG);
+            TIFFSetField(dst_tiff, TIFFTAG_PHOTOMETRIC,      out_photometric);
+            if out_photometric == PHOTOMETRIC_YCBCR {
+                TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING, 2u32, 2u32);
+            }
+            TIFFSetField(dst_tiff, TIFFTAG_SAMPLESPERPIXEL,  out_spp);
+            TIFFSetField(dst_tiff, TIFFTAG_BITSPERSAMPLE,    8u32);
+            TIFFSetField(dst_tiff, TIFFTAG_SAMPLEFORMAT,     SAMPLEFORMAT_UINT as u32);
+            TIFFSetField(dst_tiff, TIFFTAG_PLANARCONFIG,     PLANARCONFIG_CONTIG as u32);
+            TIFFSetField(dst_tiff, TIFFTAG_ORIENTATION,      ORIENTATION_TOPLEFT as u32);
+            TIFFSetField(dst_tiff, TIFFTAG_RESOLUTIONUNIT,   RESUNIT_CENTIMETER as u32);
+            if src_lv.mpp_x > 0.0 {
+                TIFFSetField(dst_tiff, TIFFTAG_XRESOLUTION,  1e4 / src_lv.mpp_x);
+                TIFFSetField(dst_tiff, TIFFTAG_YRESOLUTION,  1e4 / src_lv.mpp_y);
+            }
+            if is_base {
+                if let Some(ref desc) = image_desc_c {
+                    TIFFSetField(dst_tiff, TIFFTAG_IMAGEDESCRIPTION, desc.as_ptr());
+                }
+                // ICC is baked in; do not embed the profile in the output
+            }
+
+            let src_is_jp2k   = is_jp2k(src_lv.compression as u32);
+            let src_is_jpeg   = src_lv.compression as u32 == COMPRESSION_JPEG;
+            let src_jp2k_is_ycbcr =
+                src_is_jp2k && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
+
+            let jpeg_tables_arc: Option<Arc<Vec<u8>>> = if src_is_jpeg {
+                let mut tlen: u32 = 0;
+                let mut tptr: *const u8 = std::ptr::null();
+                let ok = TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
+                    &mut tlen as *mut u32, &mut tptr as *mut *const u8);
+                if ok != 0 && !tptr.is_null() && tlen > 2 {
+                    Some(Arc::new(std::slice::from_raw_parts(tptr, tlen as usize).to_vec()))
+                } else { None }
+            } else { None };
+
+            let raw_buf_size = (TIFFTileSize(src_tiff) as usize)
+                .max(src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize)
+                .max(1 << 17);
+            let pix_size = src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize;
+            let tile_ids: Vec<u32> = (0..src_lv.n_tiles).collect();
+
+            type BakeTile = (u32, Option<(Vec<u8>, bool, bool)>);
+
+            let (raw_tx, raw_rx) = mpsc::sync_channel::<Vec<BakeTile>>(2);
+            let (enc_tx, enc_rx) = mpsc::sync_channel::<EncChunk>(2);
+
+            let xform_t       = Arc::clone(&icc_xform);
+            let tables_t      = jpeg_tables_arc.clone();
+            let quality       = args.quality;
+            let spp           = out_spp;
+            let src_tile_w    = src_lv.tile_w;
+            let src_tile_h    = src_lv.tile_h;
+
+            let compute_handle = std::thread::spawn(move || {
+                for raw_chunk in raw_rx {
+                    let mut encoded: EncChunk = raw_chunk.par_iter()
+                        .filter_map(|(id, tile_opt)| {
+                            let (data, is_raw_jpeg, is_jp2k_tile) = tile_opt.as_ref()?;
+                            let jpeg = bake_single_tile(
+                                data, *is_raw_jpeg, *is_jp2k_tile, src_jp2k_is_ycbcr,
+                                spp, src_tile_w, src_tile_h, quality,
+                                &xform_t,
+                                tables_t.as_deref().map(|v| v.as_slice()),
+                            )?;
+                            Some((*id, jpeg))
+                        })
+                        .collect();
+                    encoded.sort_unstable_by_key(|(n, _)| *n);
+                    if enc_tx.send(encoded).is_err() { break; }
+                }
+            });
+
+            let mut jpegtables_registered = false;
+            let mut pending_write: Option<EncChunk> = None;
+
+            for chunk in tile_ids.chunks(chunk_size) {
+                let raw_chunk: Vec<BakeTile> = chunk.iter()
+                    .map(|&tile_num| {
+                        if src_is_jp2k || src_is_jpeg {
+                            let mut buf = vec![0u8; raw_buf_size];
+                            let n = TIFFReadRawTile(src_tiff, tile_num,
+                                buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
+                            if n > 0 {
+                                buf.truncate(n as usize);
+                                (tile_num, Some((buf, src_is_jpeg, src_is_jp2k)))
+                            } else {
+                                (tile_num, None)
+                            }
+                        } else {
+                            let mut buf = vec![0u8; pix_size];
+                            let n = TIFFReadEncodedTile(src_tiff, tile_num,
+                                buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
+                            if n > 0 { (tile_num, Some((buf, false, false))) }
+                            else { (tile_num, None) }
+                        }
+                    })
+                    .collect();
+
+                raw_tx.send(raw_chunk).expect("compute thread dropped");
+
+                if let Some(prev) = pending_write.take() {
+                    let n = prev.len() as u64;
+                    write_enc_chunk(dst_tiff, &prev, &mut jpegtables_registered);
+                    pb.inc(n);
+                }
+                pending_write = enc_rx.recv().ok();
+            }
+
+            drop(raw_tx);
+            if let Some(last) = pending_write.take() {
+                let n = last.len() as u64;
+                write_enc_chunk(dst_tiff, &last, &mut jpegtables_registered);
+                pb.inc(n);
+            }
+            for enc in enc_rx {
+                let n = enc.len() as u64;
+                write_enc_chunk(dst_tiff, &enc, &mut jpegtables_registered);
+                pb.inc(n);
+            }
+            compute_handle.join().expect("compute thread panicked");
+
+            TIFFWriteDirectory(dst_tiff);
+        }
+
+        TIFFClose(dst_tiff);
+        TIFFClose(src_tiff);
+    }
+
+    if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
+        eprintln!("  [error] Failed to rename {tmp_path} → {out_path}: {e}");
+        let _ = std::fs::remove_file(&tmp_path);
+    }
+}
+
 // ─── JP2K SVS passthrough ─────────────────────────────────────────────────────
 
 fn write_jp2k_svs_from_tiff(
@@ -484,6 +834,32 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return;
     }
 
+    // --icc-bake: no ICC profile → copy and return
+    if args.icc_bake && icc_profile.is_none() {
+        let src_name = Path::new(src_path).file_name()
+            .unwrap_or_default().to_string_lossy().to_string();
+        eprintln!("  [warn ] No ICC profile found in {src_name}; copying to output as-is.");
+        let dst = std::path::PathBuf::from(out_dir).join(&src_name);
+        if let Err(e) = std::fs::copy(src_path, &dst) {
+            eprintln!("  [error] Copy failed for {src_name}: {e}");
+        }
+        return;
+    }
+
+    // --icc-bake without --mpp/--half: pure 1:1 ICC bake
+    if args.icc_bake && args.mpp.is_none() && !args.half {
+        let icc = icc_profile.as_deref().unwrap(); // guaranteed Some by check above
+        if let Some(xform) = crate::build_icc_transform(icc) {
+            if args.verbose {
+                vlog(Some(pb), format!("  [icc  ] baking {} bytes → sRGB", icc.len()));
+            }
+            process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, pb);
+        } else {
+            eprintln!("  [error] Invalid ICC profile in {src_path}; skipping.");
+        }
+        return;
+    }
+
     let mpp_unknown = src_levels[0].mpp_x <= 0.0;
     if mpp_unknown && !args.half {
         eprintln!("  [error] Cannot determine resolution for {src_path}: \
@@ -512,7 +888,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     }
 
     let target_mpp = if args.half { base.mpp_x * 2.0 } else { args.mpp.unwrap() };
-    let jp2k_svs_skip: Option<usize> = if is_jp2k(base.compression as u32) {
+    let jp2k_svs_skip: Option<usize> = if !args.icc_bake && is_jp2k(base.compression as u32) {
         let skip = src_levels.iter()
             .take_while(|lv| lv.mpp_x < target_mpp * 0.9)
             .count();
@@ -540,7 +916,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return;
     }
 
-    let mut output_levels = compute_output_levels(&src_levels, target_mpp, args.verbose);
+    let mut output_levels = compute_output_levels(&src_levels, target_mpp, args.verbose, args.icc_bake);
     if mpp_unknown {
         for lv in output_levels.iter_mut() {
             lv.actual_mpp_x = 0.0;
@@ -595,6 +971,20 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     };
     let fir_pixel_type = if out_spp == 1 { fir::PixelType::U8 } else { fir::PixelType::U8x3 };
     let resize_opts = fir::ResizeOptions::new().resize_alg(fir_alg);
+
+    let icc_transform_arc: Option<Arc<crate::IccTransform>> = if args.icc_bake {
+        icc_profile.as_deref().and_then(crate::build_icc_transform)
+    } else {
+        None
+    };
+    if args.icc_bake && args.verbose {
+        let msg = if icc_transform_arc.is_some() {
+            format!("  [icc  ] baking → sRGB (resample+bake mode)")
+        } else {
+            "  [icc  ] transform build failed; skipping ICC bake".to_string()
+        };
+        vlog(Some(pb), &msg);
+    }
 
     let src_c   = CString::new(src_path).unwrap();
     let tmp_c   = CString::new(tmp_path.as_str()).unwrap();
@@ -686,9 +1076,11 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                 if let Some(ref desc) = image_desc_c {
                     TIFFSetField(dst_tiff, TIFFTAG_IMAGEDESCRIPTION, desc.as_ptr());
                 }
-                if let Some(ref icc) = icc_profile {
-                    TIFFSetField(dst_tiff, TIFFTAG_ICCPROFILE,
-                        icc.len() as u32, icc.as_ptr() as *const c_void);
+                if !args.icc_bake {
+                    if let Some(ref icc) = icc_profile {
+                        TIFFSetField(dst_tiff, TIFFTAG_ICCPROFILE,
+                            icc.len() as u32, icc.as_ptr() as *const c_void);
+                    }
                 }
             }
 
@@ -777,6 +1169,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                     n_reduce,
                     half:              args.half,
                     jpeg_tables:       jpeg_tables_arc.clone(),
+                    icc_transform:     icc_transform_arc.clone(),
                 });
 
                 let (raw_tx, raw_rx) = mpsc::sync_channel::<RawChunk>(2);
@@ -1046,6 +1439,7 @@ fn compute_output_levels(
     src_levels: &[LevelDesc],
     target_mpp: f64,
     verbose: bool,
+    icc_bake: bool,
 ) -> Vec<OutputLevel> {
     let base_mpp = src_levels[0].mpp_x;
     let mut out  = Vec::new();
@@ -1065,7 +1459,8 @@ fn compute_output_levels(
         let aligned    = best.tile_w % 16 == 0 && best.tile_h % 16 == 0;
         let passthrough = diff < 0.1
             && best.compression as u32 == COMPRESSION_JPEG
-            && aligned;
+            && aligned
+            && !icc_bake;
 
         let (out_img_w, out_img_h, out_tile_w, out_tile_h, actual_mpp_x, actual_mpp_y) =
             if passthrough {

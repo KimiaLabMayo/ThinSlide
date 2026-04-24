@@ -45,12 +45,12 @@ fn vlog(pb: Option<&ProgressBar>, msg: impl AsRef<str>) {
 
 // ─── ICC color management ─────────────────────────────────────────────────────
 
-struct IccTransform(lcms2::Transform<u8, u8>);
+pub(crate) struct IccTransform(lcms2::Transform<u8, u8>);
 // SAFETY: lcms2 transforms are thread-safe for concurrent cmsDoTransform calls (LCMS2 >= 2.8).
 unsafe impl Send for IccTransform {}
 unsafe impl Sync for IccTransform {}
 
-fn build_icc_transform(icc_data: &[u8]) -> Option<Arc<IccTransform>> {
+pub(crate) fn build_icc_transform(icc_data: &[u8]) -> Option<Arc<IccTransform>> {
     let src = lcms2::Profile::new_icc(icc_data).ok()?;
     let dst = lcms2::Profile::new_srgb();
     let xform = lcms2::Transform::new(
@@ -61,7 +61,7 @@ fn build_icc_transform(icc_data: &[u8]) -> Option<Arc<IccTransform>> {
     Some(Arc::new(IccTransform(xform)))
 }
 
-fn apply_icc(xform: &IccTransform, src: &[u8], dst: &mut [u8]) {
+pub(crate) fn apply_icc(xform: &IccTransform, src: &[u8], dst: &mut [u8]) {
     xform.0.transform_pixels(src, dst);
 }
 
@@ -3086,13 +3086,13 @@ pub fn run(args: Args) {
             skipped, total_processed);
     }
 
-    // Process TIFF/SVS files (requires --mpp or --half)
+    // Process TIFF/SVS files
     if !tiff_paths.is_empty() {
-        if args.mpp.is_some() || args.half {
+        if args.mpp.is_some() || args.half || args.icc_bake {
             tiff_paths.sort();
             tiffds::process_files(&tiff_paths, &args, &mp);
         } else {
-            eprintln!("  {} TIFF/SVS file(s) found; specify --mpp or --half to process them.",
+            eprintln!("  {} TIFF/SVS file(s) found; specify --mpp, --half, or --icc-bake to process them.",
                 tiff_paths.len());
         }
     }
