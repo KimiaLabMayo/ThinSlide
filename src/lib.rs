@@ -2741,11 +2741,11 @@ fn convert_one_series(
             series_idx, series_id, comp, src_mpp, slide_levels_owned.len(), mode);
     }
 
-    // When the source is JP2K and a level close to the target exists, passthrough the
-    // matching level and all coarser levels as SVS without any decode or re-encode.
-    // OpenSlide recognises JP2K tiles in SVS but not in plain TIFF/OME-TIFF.
+    // When --legacy is set, the source is JP2K, and a level close to the target exists,
+    // passthrough the matching level and all coarser levels as SVS without decoding.
+    // Without --legacy the output is always OME-TIFF, so this path is disabled.
     // ICC baking requires pixel decoding, so jp2k_svs_skip is disabled when baking.
-    let jp2k_svs_skip: Option<usize> = if args.icc_bake { None } else { effective_mpp.and_then(|target| {
+    let jp2k_svs_skip: Option<usize> = if !args.legacy || args.icc_bake { None } else { effective_mpp.and_then(|target| {
         if !is_jpeg2000(&comp) { return None; }
         // Count levels finer than target (smaller mpp = higher resolution).
         let skip = slide_levels_owned.iter()
@@ -2772,7 +2772,7 @@ fn convert_one_series(
     };
 
     let output_path = if jp2k_svs_skip.is_some() {
-        // JP2K passthrough: always SVS (OpenSlide requires SVS for JP2K, not plain TIFF).
+        // JP2K passthrough with --legacy: write SVS so OpenSlide can read JP2K tiles.
         format!("{}/{}.svs", args.output_dir, file_stem)
     } else if effective_mpp.is_some() {
         if args.legacy {
