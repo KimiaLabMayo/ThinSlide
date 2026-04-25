@@ -65,19 +65,31 @@ pub(crate) fn apply_icc(xform: &IccTransform, src: &[u8], dst: &mut [u8]) {
     xform.0.transform_pixels(src, dst);
 }
 
-fn bake_jpeg_tile(fragment: &[u8], xform: &IccTransform, quality: u8) -> Option<Vec<u8>> {
+fn bake_jpeg_tile(fragment: &[u8], xform: &IccTransform, quality: u8, out_w: usize, out_h: usize) -> Option<Vec<u8>> {
     let img = turbojpeg::decompress(fragment, turbojpeg::PixelFormat::RGB).ok()?;
     let (w, h) = (img.width, img.height);
-    let pitch = w * 3;
-    let src_pix: Vec<u8> = if img.pitch == pitch {
+    let src_pitch = w * 3;
+    let src_pix: Vec<u8> = if img.pitch == src_pitch {
         img.pixels
     } else {
-        (0..h).flat_map(|r| img.pixels[r*img.pitch..r*img.pitch+pitch].iter().copied()).collect()
+        (0..h).flat_map(|r| img.pixels[r*img.pitch..r*img.pitch+src_pitch].iter().copied()).collect()
     };
     let mut dst_pix = vec![0u8; src_pix.len()];
     apply_icc(xform, &src_pix, &mut dst_pix);
+    // Pad to declared tile dimensions so the JPEG SOF matches the TIFF tile tag.
+    let (enc_pix, enc_pitch) = if out_w > w || out_h > h {
+        let mut padded = vec![0u8; out_w * out_h * 3];
+        for row in 0..h.min(out_h) {
+            let copy_w = w.min(out_w) * 3;
+            padded[row * out_w * 3..row * out_w * 3 + copy_w]
+                .copy_from_slice(&dst_pix[row * src_pitch..row * src_pitch + copy_w]);
+        }
+        (padded, out_w * 3)
+    } else {
+        (dst_pix, src_pitch)
+    };
     let tj = turbojpeg::Image::<&[u8]> {
-        pixels: &dst_pix, width: w, pitch, height: h,
+        pixels: &enc_pix, width: out_w, pitch: enc_pitch, height: out_h,
         format: turbojpeg::PixelFormat::RGB,
     };
     turbojpeg::compress(tj, quality as i32, turbojpeg::Subsamp::Sub2x2)
@@ -1162,7 +1174,7 @@ fn write_flat_multipage_tiff(
                         let tile_num = tile_indices.get(frag_idx).copied()
                             .unwrap_or(frag_idx as u32);
                         let baked: Option<Vec<u8>> = if baking && compression == 7 {
-                            icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality))
+                            icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality, tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize))
                         } else {
                             None
                         };
@@ -1552,7 +1564,7 @@ fn write_ome_tiff(
                         let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
                         let baked: Option<Vec<u8>> = if baking {
                             if compr == 7 {
-                                icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality))
+                                icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality, tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize))
                             } else {
                                 icc_transform.as_deref().and_then(|xf| bake_jp2k_tile(fragment, jp2k_has_ict_rct, xf, quality))
                             }
@@ -1688,7 +1700,7 @@ fn write_ome_tiff(
                         let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
                         let baked: Option<Vec<u8>> = if baking_sub {
                             if compr == 7 {
-                                sub_icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality))
+                                sub_icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality, tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize))
                             } else {
                                 sub_icc_transform.as_deref().and_then(|xf| bake_jp2k_tile(fragment, jp2k_has_ict_rct_sub, xf, quality))
                             }
@@ -1829,7 +1841,7 @@ unsafe fn write_svs_tiled_level(
             let tile_num = tile_indices.get(i).copied().unwrap_or(i as u32);
             let baked: Option<Vec<u8>> = icc_transform.and_then(|xf| {
                 if svs_compression == 7 {
-                    bake_jpeg_tile(fragment, xf, quality)
+                    bake_jpeg_tile(fragment, xf, quality, tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize)
                 } else {
                     bake_jp2k_tile(fragment, jp2k_has_ict_rct, xf, quality)
                 }
