@@ -1031,6 +1031,7 @@ fn write_flat_multipage_tiff(
             CString::new(output_path).unwrap().as_ptr(),
             CString::new("w8").unwrap().as_ptr(),
         );
+        assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
 
         let mut icc_written = false;
         for (group_idx, group) in groups.iter().enumerate() {
@@ -1430,6 +1431,7 @@ fn write_ome_tiff(
             CString::new(output_path).unwrap().as_ptr(),
             CString::new("w8").unwrap().as_ptr(), // BigTIFF
         );
+        assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
 
         // ── IFD 0: Full resolution (main chain) ───────────────────────────
         {
@@ -1989,6 +1991,7 @@ fn write_svs(
             CString::new(output_path).unwrap().as_ptr(),
             CString::new("w8").unwrap().as_ptr(),
         );
+        assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
 
         // ── IFD 0: Full resolution ────────────────────────────────────────
         if verbose {
@@ -2524,6 +2527,7 @@ fn write_resampled_tiff(
             CString::new(output_path).unwrap().as_ptr(),
             CString::new("w8").unwrap().as_ptr(), // BigTIFF
         );
+        assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
 
         // For OME-TIFF: register the SubIFD chain on IFD 0 before writing anything.
         if ome && n_subifds > 0 {
