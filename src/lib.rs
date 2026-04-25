@@ -1216,17 +1216,17 @@ fn write_flat_multipage_tiff(
 
 /// Generate a deterministic UUID (version 4 format) from a DICOM UID string.
 fn uid_to_uuid(uid: &str) -> String {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
+    // FNV-1a 64-bit — stable across Rust versions and platforms
+    const OFFSET: u64 = 14695981039346656037;
+    const PRIME: u64  = 1099511628211;
 
-    let mut h = DefaultHasher::new();
-    uid.hash(&mut h);
-    let a = h.finish();
+    let bytes = uid.as_bytes();
+    let mut a = OFFSET;
+    for &b in bytes { a ^= b as u64; a = a.wrapping_mul(PRIME); }
 
-    let mut h2 = DefaultHasher::new();
-    a.hash(&mut h2);
-    uid.len().hash(&mut h2);
-    let b = h2.finish();
+    // Second word: different starting seed to get independent 64-bit half
+    let mut b = OFFSET ^ 0xdeadbeef_cafebabe_u64;
+    for &byte in bytes { b ^= byte as u64; b = b.wrapping_mul(PRIME); }
 
     format!(
         "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
