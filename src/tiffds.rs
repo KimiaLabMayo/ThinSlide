@@ -887,6 +887,28 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         vlog(Some(pb), &icc_msg);
     }
 
+    if !args.half {
+        if let Some(t) = args.mpp {
+            if t <= base.mpp_x {
+                eprintln!(
+                    "  [warn ] requested MPP {:.4} µm/px ≤ source {:.4} µm/px (upscaling not supported); {}",
+                    t, base.mpp_x,
+                    if args.icc_bake { "applying ICC bake at 1:1" } else { "skipping" }
+                );
+                if args.icc_bake {
+                    // icc_profile is guaranteed Some here: None case returned early at line 838
+                    let icc = icc_profile.as_deref().unwrap();
+                    if let Some(xform) = crate::build_icc_transform(icc) {
+                        process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, pb);
+                    } else {
+                        eprintln!("  [error] Invalid ICC profile in {src_path}; skipping.");
+                    }
+                }
+                return;
+            }
+        }
+    }
+
     let target_mpp = if args.half { base.mpp_x * 2.0 } else { args.mpp.unwrap() };
     let jp2k_svs_skip: Option<usize> = if !args.icc_bake && is_jp2k(base.compression as u32) {
         let skip = src_levels.iter()

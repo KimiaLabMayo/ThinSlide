@@ -2738,7 +2738,19 @@ fn convert_one_series(
             }
             None
         } else {
-            let mut em = args.mpp.filter(|&t| t > src_mpp);
+            let mut em = if let Some(t) = args.mpp {
+                if t <= src_mpp {
+                    eprintln!(
+                        "  [warn ] requested MPP {:.4} µm/px ≤ source {:.4} µm/px (upscaling not supported); skipping",
+                        t, src_mpp
+                    );
+                    None
+                } else {
+                    Some(t)
+                }
+            } else {
+                None
+            };
             if let Some(val) = em {
                 if (val - src_mpp).abs() / src_mpp < 0.1 {
                     if args.verbose {
