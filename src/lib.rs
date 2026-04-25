@@ -634,8 +634,8 @@ impl std::fmt::Display for DcmMetadata {
     }
 }
 
-fn extract_metadata(dcm_path: &str) -> DcmMetadata {
-    let dcm = dicom::object::open_file(dcm_path).unwrap();
+fn extract_metadata(dcm_path: &str) -> Result<DcmMetadata, dicom_object::ReadError> {
+    let dcm = dicom::object::open_file(dcm_path)?;
 
     let get_str = |name: &str| -> String {
         dcm.element_by_name(name)
@@ -702,7 +702,7 @@ fn extract_metadata(dcm_path: &str) -> DcmMetadata {
 
     let objective_power = get_f64("ObjectiveLensPower");
 
-    DcmMetadata {
+    Ok(DcmMetadata {
         sop_class_uid,
         series_instance_uid,
         modality,
@@ -716,7 +716,7 @@ fn extract_metadata(dcm_path: &str) -> DcmMetadata {
         mpp_x,
         mpp_y,
         objective_power,
-    }
+    })
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -2791,6 +2791,8 @@ fn convert_one_series(
     // passthrough the matching level and all coarser levels as SVS without decoding.
     // Without --legacy the output is always OME-TIFF, so this path is disabled.
     // ICC baking requires pixel decoding, so jp2k_svs_skip is disabled when baking.
+    // --half sets effective_mpp = src_mpp * 2, so this path intentionally fires when a
+    // 2x level exists in the source — lossless passthrough is preferable to resampling.
     let jp2k_svs_skip: Option<usize> = if !args.legacy || args.icc_bake { None } else { effective_mpp.and_then(|target| {
         if !is_jpeg2000(&comp) { return None; }
         // Count levels finer than target (smaller mpp = higher resolution).
@@ -3051,7 +3053,10 @@ pub fn run(args: Args) {
         for files in dir_groups {
             let n = files.len() as u64;
             let metas: Vec<DcmMetadata> = files.iter()
-                .map(|p| extract_metadata(p))
+                .filter_map(|p| match extract_metadata(p) {
+                    Ok(m) => Some(m),
+                    Err(e) => { eprintln!("  [skip] {}: {}", p, e); None }
+                })
                 .collect();
             meta_pb_clone.inc(n);
 
