@@ -1162,7 +1162,7 @@ fn write_flat_multipage_tiff(
             // Write tiles from every DICOM file in this resolution group.
             // When baking: decode JPEG → apply ICC transform → re-encode JPEG.
             // Otherwise: passthrough raw bytes with JPEGTABLES optimisation.
-            let mut jpegtables_registered = false;
+            let mut registered_tables: Option<Vec<u8>> = None;
             for dcm_meta in group.iter() {
                 let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                 let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
@@ -1182,16 +1182,21 @@ fn write_flat_multipage_tiff(
                         let split = (compression == 7)
                             .then(|| split_jpeg_to_tables_and_tile(src_bytes))
                             .flatten();
-                        if !jpegtables_registered {
-                            if let Some((ref tables, _)) = split {
-                                TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                    tables.len() as u32, tables.as_ptr());
-                                jpegtables_registered = true;
+                        let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                            match registered_tables {
+                                None => {
+                                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                        tables.len() as u32, tables.as_ptr());
+                                    registered_tables = Some(tables.clone());
+                                    tile_data.as_slice()
+                                }
+                                Some(ref rt) if rt == tables => tile_data.as_slice(),
+                                // Different DQT/DHT tables — write self-contained JPEG
+                                _ => src_bytes,
                             }
-                        }
-                        let write_bytes = split.as_ref()
-                            .map(|(_, t)| t.as_slice())
-                            .unwrap_or(src_bytes);
+                        } else {
+                            src_bytes
+                        };
                         TIFFWriteRawTile(
                             tiff, tile_num,
                             write_bytes.as_ptr() as *mut c_void,
@@ -1553,7 +1558,7 @@ fn write_ome_tiff(
 
             drop(first_dcm);
 
-            let mut jpegtables_registered_lv0 = false;
+            let mut registered_tables_lv0: Option<Vec<u8>> = None;
             for dcm_meta in group.iter() {
                 let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                 let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
@@ -1573,15 +1578,21 @@ fn write_ome_tiff(
                         let split = (if baking { true } else { compr == 7 })
                             .then(|| split_jpeg_to_tables_and_tile(src_bytes))
                             .flatten();
-                        if !jpegtables_registered_lv0 {
-                            if let Some((ref tables, _)) = split {
-                                TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                    tables.len() as u32, tables.as_ptr());
-                                jpegtables_registered_lv0 = true;
+                        let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                            match registered_tables_lv0 {
+                                None => {
+                                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                        tables.len() as u32, tables.as_ptr());
+                                    registered_tables_lv0 = Some(tables.clone());
+                                    tile_data.as_slice()
+                                }
+                                Some(ref rt) if rt == tables => tile_data.as_slice(),
+                                // Different DQT/DHT tables — write self-contained JPEG
+                                _ => src_bytes,
                             }
-                        }
-                        let write_bytes = split.as_ref()
-                            .map(|(_, t)| t.as_slice()).unwrap_or(src_bytes);
+                        } else {
+                            src_bytes
+                        };
                         TIFFWriteRawTile(tiff, tile_num,
                             write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
                     }
@@ -1689,7 +1700,7 @@ fn write_ome_tiff(
             }
             drop(first_dcm);
 
-            let mut jpegtables_reg_sub = false;
+            let mut registered_tables_sub: Option<Vec<u8>> = None;
             for dcm_meta in group.iter() {
                 let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                 let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
@@ -1709,15 +1720,21 @@ fn write_ome_tiff(
                         let split = (if baking_sub { true } else { compr == 7 })
                             .then(|| split_jpeg_to_tables_and_tile(src_bytes))
                             .flatten();
-                        if !jpegtables_reg_sub {
-                            if let Some((ref tables, _)) = split {
-                                TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                    tables.len() as u32, tables.as_ptr());
-                                jpegtables_reg_sub = true;
+                        let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                            match registered_tables_sub {
+                                None => {
+                                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                        tables.len() as u32, tables.as_ptr());
+                                    registered_tables_sub = Some(tables.clone());
+                                    tile_data.as_slice()
+                                }
+                                Some(ref rt) if rt == tables => tile_data.as_slice(),
+                                // Different DQT/DHT tables — write self-contained JPEG
+                                _ => src_bytes,
                             }
-                        }
-                        let write_bytes = split.as_ref()
-                            .map(|(_, t)| t.as_slice()).unwrap_or(src_bytes);
+                        } else {
+                            src_bytes
+                        };
                         TIFFWriteRawTile(tiff, tile_num,
                             write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
                     }
@@ -1835,7 +1852,7 @@ unsafe fn write_svs_tiled_level(
     }
 
     let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-    let mut jpegtables_registered = false;
+    let mut registered_tables: Option<Vec<u8>> = None;
     for (i, fragment) in fragments.iter().enumerate() {
         if !fragment.is_empty() {
             let tile_num = tile_indices.get(i).copied().unwrap_or(i as u32);
@@ -1847,19 +1864,24 @@ unsafe fn write_svs_tiled_level(
                 }
             });
             let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
-            // For baked (or already-JPEG passthrough) tiles, use JPEGTABLES optimization.
             let split = (out_compression == 7)
                 .then(|| split_jpeg_to_tables_and_tile(src_bytes))
                 .flatten();
-            if !jpegtables_registered {
-                if let Some((ref tables, _)) = split {
-                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                        tables.len() as u32, tables.as_ptr());
-                    jpegtables_registered = true;
+            let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                match registered_tables {
+                    None => {
+                        TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                            tables.len() as u32, tables.as_ptr());
+                        registered_tables = Some(tables.clone());
+                        tile_data.as_slice()
+                    }
+                    Some(ref rt) if rt == tables => tile_data.as_slice(),
+                    // Different DQT/DHT tables — write self-contained JPEG
+                    _ => src_bytes,
                 }
-            }
-            let write_bytes = split.as_ref()
-                .map(|(_, t)| t.as_slice()).unwrap_or(src_bytes);
+            } else {
+                src_bytes
+            };
             TIFFWriteRawTile(
                 tiff, tile_num,
                 write_bytes.as_ptr() as *mut c_void,
