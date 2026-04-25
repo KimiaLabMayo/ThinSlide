@@ -2672,6 +2672,30 @@ fn write_resampled_tiff(
 
 // ─── Main entry point ─────────────────────────────────────────────────────────
 
+// Strips directory components and rejects characters unsafe in filenames so
+// that DICOM metadata values (SeriesInstanceUID, directory names) cannot cause
+// writes outside the intended output directory.
+fn sanitize_file_stem(stem: &str) -> String {
+    // file_name() discards every component before the last separator, removing
+    // any "../" traversal sequences embedded in the value.
+    let base = Path::new(stem)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("");
+    // Keep only characters that are safe on all major filesystems.
+    let sanitized: String = base
+        .chars()
+        .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        .collect();
+    // Trim leading dots to avoid hidden files and the "." / ".." names.
+    let sanitized = sanitized.trim_start_matches('.').to_string();
+    if sanitized.is_empty() {
+        "unnamed".to_string()
+    } else {
+        sanitized
+    }
+}
+
 // ─── Per-series conversion ────────────────────────────────────────────────────
 //
 // Converts one WSI series (all resolution levels) to the appropriate output
@@ -2758,15 +2782,17 @@ fn convert_one_series(
     }) };
 
     // Resolve the stem used for the output filename.
+    // Both branches are passed through sanitize_file_stem to prevent path
+    // traversal when DICOM metadata contains sequences like "../../etc/passwd".
     let file_stem: String = if args.use_parent_name {
-        Path::new(&slide_levels_owned[0].file_path)
+        let raw = Path::new(&slide_levels_owned[0].file_path)
             .parent()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .unwrap_or(series_id.as_str())
-            .to_string()
+            .unwrap_or(series_id.as_str());
+        sanitize_file_stem(raw)
     } else {
-        series_id.clone()
+        sanitize_file_stem(series_id.as_str())
     };
 
     let output_path = if jp2k_svs_skip.is_some() {
