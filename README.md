@@ -75,7 +75,7 @@ By default the output is OME-TIFF. Pass `--legacy` to select a format based on t
 |---|---|---|
 | `--mpp <N>` | Downsample to this resolution (µm/pixel) | off (passthrough for DICOM) |
 | `--half` | Halve width and height (fastest downsampling; mutually exclusive with `--mpp`) | off |
-| `--icc-bake` | Apply embedded ICC profile to pixel data and write sRGB output without an ICC tag (DICOM only) | off |
+| `--icc-bake` | Apply embedded ICC profile to pixel data and write sRGB output without an ICC profile | off |
 | `--legacy` | Write BigTIFF or SVS instead of OME-TIFF | off |
 | `-j` / `--jobs <N>` | Number of parallel threads | all CPUs |
 | `--quality <N>` | JPEG quality for re-encoding (1–100); used with `--mpp`, `--half`, or `--icc-bake` | 87 |

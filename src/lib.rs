@@ -1606,7 +1606,12 @@ fn write_ome_tiff(
                 .ok().and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
                 .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT"))
                 .unwrap_or(false);
-            let baking_sub = icc_bake && !matches!(color_space, ColorSpace::Grayscale);
+            let sub_icc_transform: Option<Arc<IccTransform>> = if icc_bake {
+                extract_icc_profile(&first_dcm).and_then(|icc| build_icc_transform(&icc))
+            } else {
+                None
+            };
+            let baking_sub = sub_icc_transform.is_some() && !matches!(color_space, ColorSpace::Grayscale);
             let photometric = if baking_sub {
                 PHOTOMETRIC_YCBCR
             } else {
@@ -1669,17 +1674,6 @@ fn write_ome_tiff(
                 }
             }
             drop(first_dcm);
-
-            // Build sub-level ICC transform on demand (reuse icc_profile from IFD 0 scope is not in scope here;
-            // re-extract from the first file in this group for the baking path).
-            let sub_icc_transform: Option<Arc<IccTransform>> = if baking_sub {
-                let dcm_tmp = dicom::object::open_file(&metadata.file_path).ok();
-                dcm_tmp.as_ref()
-                    .and_then(|d| extract_icc_profile(d))
-                    .and_then(|icc| build_icc_transform(&icc))
-            } else {
-                None
-            };
 
             let mut jpegtables_reg_sub = false;
             for dcm_meta in group.iter() {
