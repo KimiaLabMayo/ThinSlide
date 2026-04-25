@@ -2175,8 +2175,8 @@ fn write_resampled_tiff(
     let base_w    = base.px_columns.unwrap_or(0);
     let base_h    = base.px_rows.unwrap_or(0);
     let (_in_tile_w, _in_tile_h) = base.tile_size.unwrap_or((base_w, base_h));
-    let src_mpp_x = base.mpp_x.unwrap_or(0.25);
-    let src_mpp_y = base.mpp_y.unwrap_or(src_mpp_x);
+    let src_mpp_x = base.mpp_x.filter(|&v| v > 0.0).unwrap_or(0.0);
+    let src_mpp_y = base.mpp_y.filter(|&v| v > 0.0).unwrap_or(src_mpp_x);
 
     // ── Determine which groups produce an active pyramid level ─────────────
     // One output level is generated per DICOM resolution group.  The target
@@ -2199,26 +2199,36 @@ fn write_resampled_tiff(
     }
 
     let active_levels: Vec<LevelInfo> = groups.iter().enumerate().filter_map(|(i, _)| {
+        // When half=true and MPP is unknown (target_mpp == 0.0), fall back to
+        // a normalized 1:2 ratio so scale math produces 0.5× without dividing by zero.
+        let half_unknown = half && target_mpp <= 0.0;
+
         // Target MPP for this output level: scale target_mpp by the ratio of
         // this group's MPP to the base level's MPP.
-        let group_mpp_x     = groups[i][0].mpp_x.unwrap_or(src_mpp_x);
-        let group_mpp_y     = groups[i][0].mpp_y.unwrap_or(src_mpp_y);
-        let target_lv_mpp_x = target_mpp * (group_mpp_x / src_mpp_x);
-        let target_lv_mpp_y = target_mpp * (group_mpp_y / src_mpp_y);
+        let group_mpp_x = groups[i][0].mpp_x.filter(|&v| v > 0.0).unwrap_or(src_mpp_x);
+        let group_mpp_y = groups[i][0].mpp_y.filter(|&v| v > 0.0).unwrap_or(src_mpp_y);
+        let target_lv_mpp_x = if half_unknown { 2.0 } else { target_mpp * (group_mpp_x / src_mpp_x) };
+        let target_lv_mpp_y = if half_unknown { 2.0 } else { target_mpp * (group_mpp_y / src_mpp_y) };
 
-        // Find the input group whose MPP is closest to target_lv_mpp_x.
-        let chosen = groups.iter()
-            .min_by(|a, b| {
-                let ma = a[0].mpp_x.unwrap_or(src_mpp_x);
-                let mb = b[0].mpp_x.unwrap_or(src_mpp_x);
-                (ma - target_lv_mpp_x).abs()
-                    .partial_cmp(&(mb - target_lv_mpp_x).abs()).unwrap()
-            })
-            .unwrap();
+        // When MPP is unknown, pick source group by index (no MPP to compare).
+        // Otherwise find the input group whose MPP is closest to target_lv_mpp_x.
+        let chosen = if half_unknown {
+            &groups[i]
+        } else {
+            groups.iter()
+                .min_by(|a, b| {
+                    let ma = a[0].mpp_x.unwrap_or(src_mpp_x);
+                    let mb = b[0].mpp_x.unwrap_or(src_mpp_x);
+                    (ma - target_lv_mpp_x).abs()
+                        .partial_cmp(&(mb - target_lv_mpp_x).abs()).unwrap()
+                })
+                .unwrap()
+        };
 
         let chosen_meta  = chosen[0];
-        let chosen_mpp_x = chosen_meta.mpp_x.unwrap_or(src_mpp_x);
-        let chosen_mpp_y = chosen_meta.mpp_y.unwrap_or(src_mpp_y);
+        // Use 1.0 as normalized dummy for scale math when MPP is unknown.
+        let chosen_mpp_x = if half_unknown { 1.0 } else { chosen_meta.mpp_x.unwrap_or(src_mpp_x) };
+        let chosen_mpp_y = if half_unknown { 1.0 } else { chosen_meta.mpp_y.unwrap_or(src_mpp_y) };
         let chosen_w     = chosen_meta.px_columns.unwrap_or(0);
         let chosen_h     = chosen_meta.px_rows.unwrap_or(0);
         let (chosen_tw, chosen_th) = chosen_meta.tile_size.unwrap_or((chosen_w, chosen_h));
@@ -2264,8 +2274,13 @@ fn write_resampled_tiff(
                 let scale_y = if chosen_th > 0 { nat_oth as f64 / chosen_th as f64 } else { 1.0 };
                 let oiw = (chosen_w as f64 * scale_x).round() as u32;
                 let oih = (chosen_h as f64 * scale_y).round() as u32;
-                let amx = if nat_otw > 0 { chosen_mpp_x * chosen_tw as f64 / nat_otw as f64 } else { chosen_mpp_x };
-                let amy = if nat_oth > 0 { chosen_mpp_y * chosen_th as f64 / nat_oth as f64 } else { chosen_mpp_y };
+                // When MPP is unknown, leave actual_mpp as 0.0 (written as no resolution tag).
+                let amx = if half_unknown { 0.0 }
+                          else if nat_otw > 0 { chosen_mpp_x * chosen_tw as f64 / nat_otw as f64 }
+                          else { chosen_mpp_x };
+                let amy = if half_unknown { 0.0 }
+                          else if nat_oth > 0 { chosen_mpp_y * chosen_th as f64 / nat_oth as f64 }
+                          else { chosen_mpp_y };
                 (oiw, oih, otw, oth, amx, amy)
             };
 
@@ -2377,8 +2392,8 @@ fn write_resampled_tiff(
         let mut resampled_meta = base.clone();
         resampled_meta.px_columns = Some(base_lv.out_img_w);
         resampled_meta.px_rows    = Some(base_lv.out_img_h);
-        resampled_meta.mpp_x      = Some(base_lv.actual_mpp_x);
-        resampled_meta.mpp_y      = Some(base_lv.actual_mpp_y);
+        resampled_meta.mpp_x      = if base_lv.actual_mpp_x > 0.0 { Some(base_lv.actual_mpp_x) } else { None };
+        resampled_meta.mpp_y      = if base_lv.actual_mpp_y > 0.0 { Some(base_lv.actual_mpp_y) } else { None };
         resampled_meta.tile_size  = Some((base_lv.out_tile_w, base_lv.out_tile_h));
         Some(CString::new(generate_OME_XML(&[resampled_meta])).unwrap())
     } else {
@@ -2601,9 +2616,11 @@ fn write_resampled_tiff(
                 TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
                 TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
                 TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
-                TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
-                TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv.actual_mpp_x);
-                TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv.actual_mpp_y);
+                if lv.actual_mpp_x > 0.0 {
+                    TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
+                    TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv.actual_mpp_x);
+                    TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv.actual_mpp_y);
+                }
                 if matches!(cs_lv, ColorSpace::YCbCr) {
                     let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
                     let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
@@ -2676,9 +2693,11 @@ fn write_resampled_tiff(
                 TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
                 TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
                 TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
-                TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
-                TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv.actual_mpp_x);
-                TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv.actual_mpp_y);
+                if lv.actual_mpp_x > 0.0 {
+                    TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
+                    TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     1e4 / lv.actual_mpp_x);
+                    TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     1e4 / lv.actual_mpp_y);
+                }
                 if photometric == PHOTOMETRIC_YCBCR as u32 {
                     TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
                 }
@@ -2757,8 +2776,8 @@ fn convert_one_series(
     let series_id     = &slide_levels_owned[0].series_instance_uid;
     let ts_uid        = &slide_levels_owned[0].transfer_syntax_uid;
     let comp          = map_transfer_syntax_to_compression(ts_uid);
-    let src_mpp_opt   = slide_levels_owned[0].mpp_x;
-    let src_mpp       = src_mpp_opt.unwrap_or(0.25);
+    let src_mpp_opt   = slide_levels_owned[0].mpp_x.filter(|&v| v > 0.0);
+    let src_mpp       = src_mpp_opt.unwrap_or(0.0);
 
     // --half: always downsample to exactly 2× the source MPP (no 10% tolerance check).
     //         Proceeds even when source MPP is unknown (dimension halving still works).
