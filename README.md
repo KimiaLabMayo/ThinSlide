@@ -1,24 +1,22 @@
-# SlideLeaner: The high-speed WSI optimizer for sustainable pathology.
+# SlideLeaner (slean)
+**A high-speed WSI optimizer for DICOM/TIFF/SVS.**
 
-A fast command-line toolkit for Whole Slide Image (WSI) processing.
+## Key Use Cases: Why use SlideLeaner?
 
-## Features
+### 1. Consolidate & Manage (DICOM → TIFF)
+* **Problem**: Fragmented DICOM files are difficult to manage, move, or preview.
+* **Solution**: Repacks fragments into a single, high-performance tiff/OME-TIFF.
+* **Performance**: **Zero-decode transcoding** — works at near-copy speeds with zero quality loss.
 
-- **Zero-Decode Transcoding**: Repacks DICOM to TIFF by mapping binary bitstreams directly into containers. No re-encoding, zero quality loss, and near-instantaneous execution.
+### 2. Optimize & Share (Smart Downsampling)
+* **Problem**: Massive WSI files (1GB+) hinder network transfer and inflate storage costs.
+* **Solution**: Downsample to a target resolution using `--mpp` or `--half`.
+* **Benefit**: Reduces file size by **75–85%** while maintaining diagnostic fidelity, making data sharing seamless.
 
-- **High-Speed Parallel Architecture**: Leverages multi-core processing and concurrent I/O pipelines (read/transform/write) to eliminate processing bottlenecks.
-
-- **Interoperability by Default**: Outputs OME-TIFF to ensure seamless integration with the global bio-imaging ecosystem (Legacy TIFF mode available via --legacy).
-
-- **Smart Downsampling**: Optimized tile-based resampling and stitching for arbitrary MPP or high-speed 1/2 downsizing without memory bloat.
-
-- **Color Accuracy (--icc-bake)**: (Experimental) Bakes ICC profiles directly into RGB pixel data for consistent visualization across non-ICC aware analysis tools.
-
-- **Compact Storage**: Optimizes file size using JPEG tables within TIFF, ensuring high-fidelity data remains manageable and sustainable.
-
-- **Research-Ready**: Consolidates fragmented DICOM file sets into a single, high-performance file, streamlining data management and transfer for downstream projects.
-
-`slean` scans an input directory for DICOM WSI files (`.dcm`) and pyramidal TIFF/SVS files (`.tiff`, `.svs`) and converts or downsamples them into pyramidal TIFF files.
+### 3. Standardize Color Across Platforms (`--icc-bake`)
+* **Problem**: WSI colors look inconsistent or "washed out" in AI scripts, web browsers, or non-specialized viewers.
+* **Solution**: Bakes ICC profiles directly into pixel data (supports DICOM, TIFF, and SVS).
+* **Benefit**: Guarantees **consistent, accurate color** in any environment, including QuPath, Python (OpenSlide/Standard libraries), and browsers.
 
 ## Requirements
 
