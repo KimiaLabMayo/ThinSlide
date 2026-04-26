@@ -96,6 +96,17 @@ fn bake_jpeg_tile(fragment: &[u8], xform: &IccTransform, quality: u8, out_w: usi
         .map(|b| b.to_vec()).ok()
 }
 
+pub(crate) fn ycbcr_to_rgb(pixels: &mut [u8]) {
+    for c in pixels.chunks_mut(3) {
+        let y  = c[0] as f32;
+        let cb = c[1] as f32 - 128.0;
+        let cr = c[2] as f32 - 128.0;
+        c[0] = (y + 1.40200 * cr).clamp(0.0, 255.0) as u8;
+        c[1] = (y - 0.34414 * cb - 0.71414 * cr).clamp(0.0, 255.0) as u8;
+        c[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
+    }
+}
+
 fn decode_jp2k_to_rgb(fragment: &[u8], has_ict_rct: bool) -> Option<(Vec<u8>, u32, u32)> {
     let j2k = jpeg2k::Image::from_bytes_with(fragment, jpeg2k::DecodeParameters::default()).ok()?;
     let comps = j2k.components();
@@ -121,12 +132,7 @@ fn decode_jp2k_to_rgb(fragment: &[u8], has_ict_rct: bool) -> Option<(Vec<u8>, u3
         buf
     };
     if has_ict_rct && comps.len() >= 3 {
-        for c in pixels.chunks_mut(3) {
-            let y = c[0] as f32; let cb = c[1] as f32 - 128.0; let cr = c[2] as f32 - 128.0;
-            c[0] = (y + 1.40200 * cr).clamp(0.0, 255.0) as u8;
-            c[1] = (y - 0.34414*cb - 0.71414*cr).clamp(0.0, 255.0) as u8;
-            c[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
-        }
+        ycbcr_to_rgb(&mut pixels);
     }
     Some((pixels, w as u32, h as u32))
 }
@@ -330,14 +336,7 @@ fn encode_one_tile_lib(
                 buf
             };
             if (p.jp2k_has_ict_rct || p.color_space == ColorSpace::YCbCr) && p.spp == 3 {
-                for c in pixels.chunks_mut(3) {
-                    let y  = c[0] as f32;
-                    let cb = c[1] as f32 - 128.0;
-                    let cr = c[2] as f32 - 128.0;
-                    c[0] = (y + 1.40200 * cr).clamp(0.0, 255.0) as u8;
-                    c[1] = (y - 0.34414*cb - 0.71414*cr).clamp(0.0, 255.0) as u8;
-                    c[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
-                }
+                ycbcr_to_rgb(&mut pixels);
             }
             Some((pixels, luma_w as u32, luma_h as u32))
         } else {

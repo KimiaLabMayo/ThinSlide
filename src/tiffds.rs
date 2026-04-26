@@ -194,14 +194,7 @@ fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u3
                 || (p.src_jp2k_is_ycbcr && !matches!(color_space, jpeg2k::ColorSpace::SRGB))
             );
             if needs_ycbcr_cvt {
-                for c in pix.chunks_mut(3) {
-                    let y  = c[0] as f32;
-                    let cb = c[1] as f32 - 128.0;
-                    let cr = c[2] as f32 - 128.0;
-                    c[0] = (y + 1.40200 * cr).clamp(0.0, 255.0) as u8;
-                    c[1] = (y - 0.34414*cb - 0.71414*cr).clamp(0.0, 255.0) as u8;
-                    c[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
-                }
+                super::ycbcr_to_rgb(&mut pix);
             }
             Some((pix, luma_w as u32, luma_h as u32))
         } else {
@@ -416,14 +409,7 @@ fn bake_single_tile(
             matches!(cs, jpeg2k::ColorSpace::SYCC)
             || (src_jp2k_is_ycbcr && !matches!(cs, jpeg2k::ColorSpace::SRGB))
         ) {
-            for c in pix.chunks_mut(3) {
-                let y  = c[0] as f32;
-                let cb = c[1] as f32 - 128.0;
-                let cr = c[2] as f32 - 128.0;
-                c[0] = (y + 1.40200 * cr).clamp(0.0, 255.0) as u8;
-                c[1] = (y - 0.34414*cb - 0.71414*cr).clamp(0.0, 255.0) as u8;
-                c[2] = (y + 1.77200 * cb).clamp(0.0, 255.0) as u8;
-            }
+            super::ycbcr_to_rgb(&mut pix);
         }
         (pix, luma_w as u32, luma_h as u32)
     } else {
