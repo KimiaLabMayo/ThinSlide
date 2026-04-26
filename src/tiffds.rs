@@ -243,6 +243,7 @@ fn bake_single_tile(
     quality:           u8,
     xform:             &crate::IccTransform,
     jpeg_tables:       Option<&[u8]>,
+    src_photometric:   u32,
 ) -> Option<Vec<u8>> {
     let ch = spp as usize;
     const APP14_ADOBE_RGB: [u8; 16] = [
@@ -254,7 +255,7 @@ fn bake_single_tile(
     let (pixels, w, h) = if is_raw_jpeg {
         let fmt = if spp == 1 { turbojpeg::PixelFormat::GRAY } else { turbojpeg::PixelFormat::RGB };
         let combined: Vec<u8> = if let Some(tables) = jpeg_tables {
-            let inject_app14 = spp == 3;
+            let inject_app14 = spp == 3 && src_photometric == PHOTOMETRIC_RGB;
             let app14_len = if inject_app14 { APP14_ADOBE_RGB.len() } else { 0 };
             let mut v = Vec::with_capacity(2 + app14_len + (tables.len() - 4) + (data.len() - 2));
             v.extend_from_slice(&tables[0..2]);
@@ -463,12 +464,13 @@ fn process_file_icc_bake_only(
             let (raw_tx, raw_rx) = mpsc::sync_channel::<Vec<BakeTile>>(2);
             let (enc_tx, enc_rx) = mpsc::sync_channel::<EncChunk>(2);
 
-            let xform_t       = Arc::clone(&icc_xform);
-            let tables_t      = jpeg_tables_arc.clone();
-            let quality       = args.quality;
-            let spp           = out_spp;
-            let src_tile_w    = src_lv.tile_w;
-            let src_tile_h    = src_lv.tile_h;
+            let xform_t        = Arc::clone(&icc_xform);
+            let tables_t       = jpeg_tables_arc.clone();
+            let quality        = args.quality;
+            let spp            = out_spp;
+            let src_tile_w     = src_lv.tile_w;
+            let src_tile_h     = src_lv.tile_h;
+            let src_photometric = src_lv.photometric as u32;
 
             let compute_handle = std::thread::spawn(move || {
                 for raw_chunk in raw_rx {
@@ -480,6 +482,7 @@ fn process_file_icc_bake_only(
                                 spp, src_tile_w, src_tile_h, quality,
                                 &xform_t,
                                 tables_t.as_deref().map(|v| v.as_slice()),
+                                src_photometric,
                             )?;
                             Some((*id, jpeg))
                         })

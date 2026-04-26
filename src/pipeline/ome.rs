@@ -112,7 +112,7 @@ pub(crate) fn generate_tiff_ome_xml(
 ) -> String {
     let safe_name = xml_escape(name);
     let type_str  = "uint8";
-    let size_c    = if spp == 1 { 1 } else { spp };
+    let size_c    = 1u32;
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
