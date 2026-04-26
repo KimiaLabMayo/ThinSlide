@@ -131,7 +131,11 @@ fn decode_jp2k_to_rgb(fragment: &[u8], has_ict_rct: bool) -> Option<(Vec<u8>, u3
         }
         buf
     };
-    if has_ict_rct && comps.len() >= 3 {
+    let cs = j2k.color_space();
+    if comps.len() >= 3
+        && !matches!(cs, jpeg2k::ColorSpace::SRGB)
+        && (has_ict_rct || matches!(cs, jpeg2k::ColorSpace::SYCC))
+    {
         ycbcr_to_rgb(&mut pixels);
     }
     Some((pixels, w as u32, h as u32))
@@ -335,7 +339,11 @@ fn encode_one_tile_lib(
                 }
                 buf
             };
-            if (p.jp2k_has_ict_rct || p.color_space == ColorSpace::YCbCr) && p.spp == 3 {
+            let cs = j2k_img.color_space();
+            if p.spp == 3
+                && !matches!(cs, jpeg2k::ColorSpace::SRGB)
+                && (p.jp2k_has_ict_rct || p.color_space == ColorSpace::YCbCr || matches!(cs, jpeg2k::ColorSpace::SYCC))
+            {
                 ycbcr_to_rgb(&mut pixels);
             }
             Some((pixels, luma_w as u32, luma_h as u32))
@@ -1486,7 +1494,7 @@ fn write_ome_tiff(
             }
             let jp2k_has_ict_rct = first_dcm.element_by_name("PhotometricInterpretation")
                 .ok().and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
-                .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT"))
+                .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT" | "YBR_FULL" | "YBR_FULL_422"))
                 .unwrap_or(false);
             let baking = icc_transform.is_some() && !matches!(color_space, ColorSpace::Grayscale);
             let photometric = if baking {
@@ -1632,7 +1640,7 @@ fn write_ome_tiff(
             let color_space = infer_color_space(&first_dcm);
             let jp2k_has_ict_rct_sub = first_dcm.element_by_name("PhotometricInterpretation")
                 .ok().and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
-                .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT"))
+                .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT" | "YBR_FULL" | "YBR_FULL_422"))
                 .unwrap_or(false);
             let sub_icc_transform: Option<Arc<IccTransform>> = if icc_bake {
                 extract_icc_profile(&first_dcm).and_then(|icc| build_icc_transform(&icc))
@@ -1971,7 +1979,7 @@ fn write_svs(
         .ok()
         .and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
         .unwrap_or_default();
-    let jp2k_has_ict_rct = matches!(photometric_interp.as_str(), "YBR_ICT" | "YBR_RCT");
+    let jp2k_has_ict_rct = matches!(photometric_interp.as_str(), "YBR_ICT" | "YBR_RCT" | "YBR_FULL" | "YBR_FULL_422");
     let (svs_compression, photometric) = match (is_jp2, photometric_interp.as_str()) {
         (true,  "YBR_ICT") | (true, "YBR_RCT")
                               => (COMPRESSION_APERIO_JP2_YCBCR, PHOTOMETRIC_YCBCR as u32),
@@ -2377,7 +2385,7 @@ fn write_resampled_tiff(
         .and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
         .unwrap_or_default();
 
-    let jp2k_has_ict_rct = matches!(src_photometric_interp.as_str(), "YBR_ICT" | "YBR_RCT");
+    let jp2k_has_ict_rct = matches!(src_photometric_interp.as_str(), "YBR_ICT" | "YBR_RCT" | "YBR_FULL" | "YBR_FULL_422");
 
     // turbojpeg always produces JFIF JPEG (YCbCr encoded internally), regardless
     // of the source color space.  PHOTOMETRIC_YCBCR is the standard convention
