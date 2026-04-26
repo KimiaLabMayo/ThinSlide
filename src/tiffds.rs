@@ -13,60 +13,26 @@ use fast_image_resize as fir;
 use jpeg2k;
 
 use crate::bindings::{
-    TIFF,
     TIFFOpen, TIFFClose,
     TIFFGetField,
     TIFFSetField,
-    TIFFSetDirectory, TIFFSetSubDirectory,
-    TIFFNumberOfDirectories,
-    TIFFNumberOfTiles,
     TIFFReadRawTile, TIFFReadEncodedTile,
     TIFFWriteRawTile, TIFFWriteDirectory,
     TIFFTileSize,
-    TIFFTAG_IMAGEWIDTH, TIFFTAG_IMAGELENGTH,
-    TIFFTAG_TILEWIDTH, TIFFTAG_TILELENGTH,
-    TIFFTAG_COMPRESSION,
-    TIFFTAG_PHOTOMETRIC,
-    TIFFTAG_SAMPLESPERPIXEL,
     TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_ICCPROFILE,
     TIFFTAG_JPEGTABLES, TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_SUBIFD,
-    TIFFTAG_XRESOLUTION, TIFFTAG_YRESOLUTION, TIFFTAG_RESOLUTIONUNIT,
     COMPRESSION_JPEG,
     PHOTOMETRIC_RGB, PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK,
-    RESUNIT_CENTIMETER, RESUNIT_INCH,
     FILETYPE_REDUCEDIMAGE,
 };
 use crate::{tile_align, nearest_16, MIN_PYRAMID_SIDE, xml_escape,
             vlog, write_enc_chunk, compute_thread, set_tiff_ifd_tags};
+use crate::source::tiff::{
+    TiffSource, TiffLevel, navigate,
+    is_jp2k, COMPRESSION_APERIO_JP2_YCBCR,
+};
 
-const COMPRESSION_APERIO_JP2_YCBCR: u32 = 33003;
-const COMPRESSION_APERIO_JP2_RGB: u32   = 33005;
-const COMPRESSION_JP2000: u32           = 34712;
-
-fn is_jp2k(c: u32) -> bool {
-    matches!(c, COMPRESSION_APERIO_JP2_YCBCR | COMPRESSION_APERIO_JP2_RGB | COMPRESSION_JP2000)
-}
-
-// ─── Source pyramid description ───────────────────────────────────────────────
-
-struct LevelDesc {
-    img_w:       u32,
-    img_h:       u32,
-    tile_w:      u32,
-    tile_h:      u32,
-    mpp_x:       f64,
-    mpp_y:       f64,
-    compression: u16,
-    photometric: u16,
-    spp:         u16,
-    n_tiles:     u32,
-    nav:         LevelNav,
-}
-
-enum LevelNav {
-    Dir(u32),
-    SubDir(u64),
-}
+// ─── Output pyramid description ───────────────────────────────────────────────
 
 struct OutputLevel {
     out_img_w:    u32,
@@ -391,7 +357,7 @@ fn process_file_icc_bake_only(
     out_stem:   &str,
     args:       &crate::Args,
     icc_xform:  Arc<crate::IccTransform>,
-    src_levels: &[LevelDesc],
+    src_levels: &[TiffLevel],
     pb:         &ProgressBar,
 ) {
     let out_path = if args.legacy {
@@ -450,7 +416,7 @@ fn process_file_icc_bake_only(
         }
 
         for (lv_idx, src_lv) in src_levels.iter().enumerate() {
-            navigate_to_level(src_tiff, &src_lv.nav);
+            navigate(src_tiff, lv_idx, src_levels);
 
             let is_base  = lv_idx == 0;
             let subfile  = if is_base { 0u32 } else { FILETYPE_REDUCEDIMAGE };
@@ -589,7 +555,7 @@ fn process_file_icc_bake_only(
 
 fn write_jp2k_svs_from_tiff(
     src_path: &str,
-    levels: &[LevelDesc],
+    levels: &[TiffLevel],
     dst_path: &str,
     verbose: bool,
     pb: &ProgressBar,
@@ -624,11 +590,11 @@ fn write_jp2k_svs_from_tiff(
         }
 
         for (idx, lv) in levels.iter().enumerate() {
-            navigate_to_level(src_tiff, &lv.nav);
+            navigate(src_tiff, idx, levels);
 
             let aperio_compr: u32 =
                 if lv.photometric as u32 == PHOTOMETRIC_YCBCR { COMPRESSION_APERIO_JP2_YCBCR }
-                else { COMPRESSION_APERIO_JP2_RGB };
+                else { crate::source::tiff::COMPRESSION_APERIO_JP2_RGB };
 
             let subfile: u32 = if idx == 0 { 0 } else { FILETYPE_REDUCEDIMAGE };
             set_tiff_ifd_tags(dst_tiff, subfile,
@@ -672,18 +638,11 @@ fn write_jp2k_svs_from_tiff(
 // ─── Per-file processing ──────────────────────────────────────────────────────
 
 fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Args, pb: &ProgressBar) {
-    let (mut src_levels, icc_profile) = {
-        let src_c = CString::new(src_path).unwrap();
-        let tiff = unsafe { TIFFOpen(src_c.as_ptr(), CString::new("r").unwrap().as_ptr()) };
-        if tiff.is_null() {
-            eprintln!("  [error] Cannot open: {src_path}");
-            return;
-        }
-        let levels = collect_pyramid_levels(tiff);
-        let icc    = read_icc_profile(tiff, &levels);
-        unsafe { TIFFClose(tiff); }
-        (levels, icc)
+    let Some(src) = TiffSource::open(src_path) else {
+        eprintln!("  [error] Cannot open: {src_path}");
+        return;
     };
+    let (mut src_levels, icc_profile, _meta) = src.into_parts();
 
     if src_levels.is_empty() {
         eprintln!("  [warn] No tiled pyramid found in: {src_path}");
@@ -704,7 +663,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
 
     // --icc-bake without --mpp/--half: pure 1:1 ICC bake
     if args.icc_bake && args.mpp.is_none() && !args.half {
-        let icc = icc_profile.as_deref().unwrap(); // guaranteed Some by check above
+        let icc = icc_profile.as_deref().unwrap();
         if let Some(xform) = crate::build_icc_transform(icc) {
             if args.verbose {
                 vlog(Some(pb), format!("  [icc  ] baking {} bytes → sRGB", icc.len()));
@@ -752,7 +711,6 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                     if args.icc_bake { "applying ICC bake at 1:1" } else { "skipping" }
                 );
                 if args.icc_bake {
-                    // icc_profile is guaranteed Some here: None case returned early at line 838
                     let icc = icc_profile.as_deref().unwrap();
                     if let Some(xform) = crate::build_icc_transform(icc) {
                         process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, pb);
@@ -857,7 +815,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     };
     if args.icc_bake && args.verbose {
         let msg = if icc_transform_arc.is_some() {
-            format!("  [icc  ] baking → sRGB (resample+bake mode)")
+            "  [icc  ] baking → sRGB (resample+bake mode)".to_string()
         } else {
             "  [icc  ] transform build failed; skipping ICC bake".to_string()
         };
@@ -895,7 +853,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             let is_base = lv_idx == 0;
             let subfile = if is_base { 0u32 } else { FILETYPE_REDUCEDIMAGE };
 
-            navigate_to_level(src_tiff, &src_lv.nav);
+            navigate(src_tiff, lv_out.src_idx, &src_levels);
 
             let (src_subsamp_h, src_subsamp_v) = if src_lv.compression as u32 == COMPRESSION_JPEG
                 && src_lv.photometric as u32 == PHOTOMETRIC_YCBCR
@@ -1134,173 +1092,10 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     }
 }
 
-// ─── Source TIFF navigation ───────────────────────────────────────────────────
-
-fn navigate_to_level(tiff: *mut TIFF, nav: &LevelNav) {
-    unsafe {
-        match nav {
-            LevelNav::Dir(d)    => { TIFFSetDirectory(tiff, *d); }
-            LevelNav::SubDir(o) => { TIFFSetSubDirectory(tiff, *o); }
-        }
-    }
-}
-
-fn collect_pyramid_levels(tiff: *mut TIFF) -> Vec<LevelDesc> {
-    let mut levels = Vec::new();
-
-    unsafe { TIFFSetDirectory(tiff, 0); }
-    let Some(mut lv0) = read_level_meta(tiff) else { return levels; };
-
-    let mut n_sub: u16 = 0;
-    let mut sub_ptr: *const u64 = std::ptr::null();
-    let has_subifds = unsafe {
-        TIFFGetField(tiff, TIFFTAG_SUBIFD,
-            &mut n_sub as *mut u16,
-            &mut sub_ptr as *mut *const u64) != 0
-    } && n_sub > 0 && !sub_ptr.is_null();
-
-    if lv0.mpp_x <= 0.0 {
-        if let Some(mpp) = parse_mpp_from_image_description(tiff) {
-            lv0.mpp_x = mpp;
-            lv0.mpp_y = mpp;
-        }
-    }
-
-    lv0.nav = LevelNav::Dir(0);
-    levels.push(lv0);
-
-    if has_subifds {
-        let offsets = unsafe { std::slice::from_raw_parts(sub_ptr, n_sub as usize) };
-        for &off in offsets {
-            if off == 0 { continue; }
-            if unsafe { TIFFSetSubDirectory(tiff, off) } != 0 {
-                if let Some(mut lv) = read_level_meta(tiff) {
-                    lv.nav = LevelNav::SubDir(off);
-                    levels.push(lv);
-                }
-                unsafe { TIFFSetDirectory(tiff, 0); }
-            }
-        }
-    } else {
-        let n_dirs = unsafe { TIFFNumberOfDirectories(tiff) };
-        for dir_idx in 1..n_dirs {
-            unsafe { TIFFSetDirectory(tiff, dir_idx); }
-            if let Some(mut lv) = read_level_meta(tiff) {
-                lv.nav = LevelNav::Dir(dir_idx);
-                levels.push(lv);
-            }
-        }
-        unsafe { TIFFSetDirectory(tiff, 0); }
-    }
-
-    levels.sort_by(|a, b| b.img_w.cmp(&a.img_w));
-
-    if levels.len() > 1 && levels[0].img_w > 0 {
-        let bw  = levels[0].img_w as f64;
-        let bh  = levels[0].img_h as f64;
-        let bmx = levels[0].mpp_x;
-        let bmy = levels[0].mpp_y;
-        for lv in levels.iter_mut().skip(1) {
-            if lv.img_w > 0 { lv.mpp_x = bmx * bw / lv.img_w as f64; }
-            if lv.img_h > 0 { lv.mpp_y = bmy * bh / lv.img_h as f64; }
-        }
-    }
-
-    levels.sort_by(|a, b| a.mpp_x.partial_cmp(&b.mpp_x).unwrap());
-    levels
-}
-
-fn read_level_meta(tiff: *mut TIFF) -> Option<LevelDesc> {
-    let mut width: u32 = 0;
-    let mut height: u32 = 0;
-    let mut tile_w: u32 = 0;
-    let mut tile_h: u32 = 0;
-    let mut compression: u16 = 1;
-    let mut photometric: u16 = 2;
-    let mut spp: u16 = 3;
-    let mut xres: f32 = 0.0;
-    let mut yres: f32 = 0.0;
-    let mut resunit: u16 = RESUNIT_CENTIMETER as u16;
-
-    unsafe {
-        if TIFFGetField(tiff, TIFFTAG_IMAGEWIDTH,  &mut width  as *mut u32) == 0 { return None; }
-        if TIFFGetField(tiff, TIFFTAG_IMAGELENGTH, &mut height as *mut u32) == 0 { return None; }
-        if TIFFGetField(tiff, TIFFTAG_TILEWIDTH,   &mut tile_w as *mut u32) == 0 { return None; }
-        if TIFFGetField(tiff, TIFFTAG_TILELENGTH,  &mut tile_h as *mut u32) == 0 { return None; }
-        if tile_w == 0 || tile_h == 0 { return None; }
-
-        TIFFGetField(tiff, TIFFTAG_COMPRESSION,     &mut compression as *mut u16);
-        TIFFGetField(tiff, TIFFTAG_PHOTOMETRIC,     &mut photometric as *mut u16);
-        TIFFGetField(tiff, TIFFTAG_SAMPLESPERPIXEL, &mut spp        as *mut u16);
-        TIFFGetField(tiff, TIFFTAG_XRESOLUTION,     &mut xres       as *mut f32);
-        TIFFGetField(tiff, TIFFTAG_YRESOLUTION,     &mut yres       as *mut f32);
-        TIFFGetField(tiff, TIFFTAG_RESOLUTIONUNIT,  &mut resunit    as *mut u16);
-    }
-
-    let (mpp_x, mpp_y) = mpp_from_resolution(xres as f64, yres as f64, resunit as u32);
-    let n_tiles = unsafe { TIFFNumberOfTiles(tiff) };
-
-    Some(LevelDesc {
-        img_w: width, img_h: height,
-        tile_w, tile_h,
-        mpp_x, mpp_y,
-        compression, photometric, spp,
-        n_tiles,
-        nav: LevelNav::Dir(0),
-    })
-}
-
-fn mpp_from_resolution(xres: f64, yres: f64, resunit: u32) -> (f64, f64) {
-    if xres <= 0.0 || yres <= 0.0 { return (0.0, 0.0); }
-    if resunit == RESUNIT_CENTIMETER {
-        (10000.0 / xres, 10000.0 / yres)
-    } else if resunit == RESUNIT_INCH {
-        (25400.0 / xres, 25400.0 / yres)
-    } else {
-        (0.0, 0.0)
-    }
-}
-
-fn parse_mpp_from_image_description(tiff: *mut TIFF) -> Option<f64> {
-    let mut desc_ptr: *const std::os::raw::c_char = std::ptr::null();
-    let ok = unsafe {
-        TIFFGetField(tiff, TIFFTAG_IMAGEDESCRIPTION,
-            &mut desc_ptr as *mut *const std::os::raw::c_char)
-    };
-    if ok == 0 || desc_ptr.is_null() { return None; }
-    let desc = unsafe { std::ffi::CStr::from_ptr(desc_ptr) }.to_string_lossy();
-    for part in desc.split('|') {
-        let part = part.trim();
-        if let Some(val_str) = part.strip_prefix("MPP = ") {
-            if let Ok(mpp) = val_str.trim().parse::<f64>() {
-                if mpp > 0.0 { return Some(mpp); }
-            }
-        }
-    }
-    None
-}
-
-fn read_icc_profile(tiff: *mut TIFF, levels: &[LevelDesc]) -> Option<Vec<u8>> {
-    if levels.is_empty() { return None; }
-    navigate_to_level(tiff, &levels[0].nav);
-    let mut icc_len: u32 = 0;
-    let mut icc_ptr: *const u8 = std::ptr::null();
-    let ok = unsafe {
-        TIFFGetField(tiff, TIFFTAG_ICCPROFILE,
-            &mut icc_len as *mut u32,
-            &mut icc_ptr as *mut *const u8) != 0
-    };
-    if ok && icc_len > 0 && !icc_ptr.is_null() {
-        Some(unsafe { std::slice::from_raw_parts(icc_ptr, icc_len as usize) }.to_vec())
-    } else {
-        None
-    }
-}
-
 // ─── Output pyramid computation ───────────────────────────────────────────────
 
 fn compute_output_levels(
-    src_levels: &[LevelDesc],
+    src_levels: &[TiffLevel],
     target_mpp: f64,
     verbose: bool,
     icc_bake: bool,

@@ -8,10 +8,12 @@
 pub mod bindings;
 pub mod args;
 pub mod pipeline;
+pub mod source;
 pub use args::Args;
 pub(crate) use pipeline::icc::{IccTransform, build_icc_transform, apply_icc};
 pub(crate) use pipeline::encode::{ycbcr_to_rgb, compose_and_encode, compute_thread, write_enc_chunk};
 pub use pipeline::encode::split_jpeg_to_tables_and_tile;
+pub(crate) use source::tiff::{COMPRESSION_APERIO_JP2_YCBCR, COMPRESSION_APERIO_JP2_RGB};
 mod tiffds;
 use bindings::{
     TIFF, TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteDirectory, TIFFClose,
@@ -127,9 +129,6 @@ fn bake_jp2k_tile(fragment: &[u8], has_ict_rct: bool, xform: &IccTransform, qual
 
 const PWSI_CLASS_UID: &str = "1.2.840.10008.5.1.4.1.1.77.1.6";
 
-// SVS (Aperio) JPEG 2000 proprietary compression codes recognized by OpenSlide
-const COMPRESSION_APERIO_JP2_YCBCR: u32 = 33003;
-const COMPRESSION_APERIO_JP2_RGB: u32 = 33005;
 
 /// Minimum length of the longer image side (pixels) required to include a
 /// pyramid level in the resampled output.  Levels below this threshold are
