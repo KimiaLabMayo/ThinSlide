@@ -13,26 +13,26 @@ pub use args::Args;
 pub(crate) use pipeline::icc::{IccTransform, build_icc_transform, apply_icc};
 pub(crate) use pipeline::encode::{ycbcr_to_rgb, compose_and_encode, compute_thread, write_enc_chunk};
 pub use pipeline::encode::split_jpeg_to_tables_and_tile;
+pub(crate) use pipeline::writer::set_tiff_ifd_tags;
+pub(crate) use pipeline::ome::generate_dicom_ome_xml;
+pub use pipeline::ome::xml_escape;
+pub use pipeline::run;
 pub(crate) use source::tiff::{COMPRESSION_APERIO_JP2_YCBCR, COMPRESSION_APERIO_JP2_RGB};
 pub(crate) use source::dicom::{
-    DicomSource, DcmMetadata, CompressionType, ColorSpace,
+    DcmMetadata, CompressionType, ColorSpace,
     is_jpeg2000, map_transfer_syntax_to_compression, tiff_compression_tag,
-    infer_color_space, extract_icc_profile, extract_metadata,
-    is_wsi_dicom, frame_to_tile_indices, group_by_resolution,
+    infer_color_space, extract_icc_profile,
+    frame_to_tile_indices, group_by_resolution,
 };
-use source::SlideSource;
 mod tiffds;
 use bindings::{
     TIFF, TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteDirectory, TIFFClose,
-    TIFFTAG_SUBFILETYPE, TIFFTAG_IMAGEWIDTH, TIFFTAG_IMAGELENGTH, TIFFTAG_TILEWIDTH,
-    TIFFTAG_TILELENGTH, TIFFTAG_COMPRESSION, TIFFTAG_PHOTOMETRIC, TIFFTAG_SAMPLESPERPIXEL,
-    TIFFTAG_BITSPERSAMPLE, TIFFTAG_SAMPLEFORMAT, TIFFTAG_PLANARCONFIG, TIFFTAG_ORIENTATION,
-    TIFFTAG_RESOLUTIONUNIT, TIFFTAG_XRESOLUTION, TIFFTAG_YRESOLUTION,
+    TIFFTAG_SUBFILETYPE, TIFFTAG_IMAGEWIDTH, TIFFTAG_IMAGELENGTH,
+    TIFFTAG_COMPRESSION, TIFFTAG_PHOTOMETRIC, TIFFTAG_SAMPLESPERPIXEL,
+    TIFFTAG_BITSPERSAMPLE, TIFFTAG_PLANARCONFIG,
     PHOTOMETRIC_RGB, PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK,
-    SAMPLEFORMAT_UINT, TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_YCBCRSUBSAMPLING,
+    TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_YCBCRSUBSAMPLING,
     PLANARCONFIG_CONTIG, TIFFTAG_SUBIFD, TIFFWriteRawStrip,
-    ORIENTATION_TOPLEFT,
-    RESUNIT_CENTIMETER,
     FILETYPE_REDUCEDIMAGE,
     TIFFTAG_ROWSPERSTRIP,
     TIFFTAG_ICCPROFILE,
@@ -41,16 +41,12 @@ use bindings::{
 
 use std::ffi::CString;
 use std::os::raw::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, Condvar};
+use std::sync::Arc;
 use std::sync::mpsc;
-use std::time::Duration;
-use walkdir::WalkDir;
 use dicom_pixeldata::PixelDecoder;
 use image::imageops::FilterType;
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use fast_image_resize as fir;
-use std::path::Path;
 
 pub(crate) fn vlog(pb: Option<&ProgressBar>, msg: impl AsRef<str>) {
     if let Some(p) = pb { p.println(msg.as_ref()); }
@@ -348,40 +344,9 @@ fn log_icc_and_build_transform(
     xf
 }
 
-/// Set the standard image/tile/compression/resolution TIFF tags common to every IFD.
-/// Pass mpp_x == 0.0 to skip resolution tags (unknown physical size).
-pub(crate) unsafe fn set_tiff_ifd_tags(
-    tiff: *mut TIFF,
-    subfile_type: u32,
-    width: u32, height: u32,
-    tile_w: u32, tile_h: u32,
-    compression: u32,
-    photometric: u32,
-    spp: u32,
-    mpp_x: f64, mpp_y: f64,
-) { unsafe {
-    TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
-    TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      width);
-    TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     height);
-    TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_align(tile_w, 16));
-    TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_align(tile_h, 16));
-    TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     compression);
-    TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     photometric);
-    TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, spp);
-    TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
-    TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
-    TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
-    TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
-    if mpp_x > 0.0 {
-        TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32, RESUNIT_CENTIMETER as u32);
-        TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,   1e4 / mpp_x);
-        TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,   1e4 / mpp_y);
-    }
-}}
-
 // ─── Generic pyramidal TIFF writer (JPEG-compressed DICOM) ───────────────────
 
-fn write_flat_multipage_tiff(
+pub(crate) fn write_flat_multipage_tiff(
     slide_level_metadata_list: &[DcmMetadata],
     output_path: &str,
     pb: Option<&ProgressBar>,
@@ -568,159 +533,19 @@ fn write_flat_multipage_tiff(
     }
 }
 
-/// Generate a deterministic UUID (version 4 format) from a DICOM UID string.
-fn uid_to_uuid(uid: &str) -> String {
-    // FNV-1a 64-bit — stable across Rust versions and platforms
-    const OFFSET: u64 = 14695981039346656037;
-    const PRIME: u64  = 1099511628211;
-
-    let bytes = uid.as_bytes();
-    let mut a = OFFSET;
-    for &b in bytes { a ^= b as u64; a = a.wrapping_mul(PRIME); }
-
-    // Second word: different starting seed to get independent 64-bit half
-    let mut b = OFFSET ^ 0xdeadbeef_cafebabe_u64;
-    for &byte in bytes { b ^= byte as u64; b = b.wrapping_mul(PRIME); }
-
-    format!(
-        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        (a >> 32) as u32,
-        (a >> 16) as u16,
-        a as u16 & 0x0FFF,
-        ((b >> 48) as u16 & 0x3FFF) | 0x8000,
-        b & 0x0000_FFFF_FFFF_FFFF_u64,
-    )
-}
-
-/// Build a conforming OME-XML string (schema 2016-06) for the full-resolution image.
-///
-/// The returned XML is placed in the ImageDescription tag of IFD 0.  BioFormats
-/// identifies a file as OME-TIFF by the presence of this block and uses it to
-/// determine pixel dimensions, physical pixel size, and channel layout.
-///
-/// Structure decisions
-/// -------------------
-/// * A single `<Image>` / `<Pixels>` block describes the full-resolution plane
-///   (IFD 0, `TiffData IFD="0"`).
-/// * Reduced-resolution pyramid IFDs carry `SUBFILETYPE=REDUCEDIMAGE`; BioFormats
-///   detects those automatically without additional `<Image>` entries.
-/// * For RGB/YCbCr images one `<Channel SamplesPerPixel="3">` is emitted with
-///   `Interleaved="true"`, matching the JPEG interleaved storage layout.
-/// * Physical pixel size is expressed in µm (OME default unit).
 /// Round `v` up to the nearest multiple of `align`.
 /// libtiff requires JPEG tile dimensions to be multiples of 16 (YCbCr MCU boundary).
-/// Applying this universally is safe: for other compressions it has no side-effects.
 pub fn tile_align(v: u32, align: u32) -> u32 {
     (v + align - 1) / align * align
 }
 
-/// Check if the JPEG tile dimensions are multiples of 16, as required by libtiff for pass-through tiles.
-/// When using `TIFFWriteRawTile` for pass-through, libtiff checks that the JPEG SOF header dimensions match 
-/// the TIFF tile declaration (after tile_align). If the JPEG dimensions are not multiples of 16, this mismatch 
-/// causes a "Bad value N for tileWidth/tileLength tag" error.
-/// 
 fn is_jpeg_tile_aligned(tile_w: u32, tile_h: u32) -> bool {
     tile_w % 16 == 0 && tile_h % 16 == 0
 }
 
 /// Round `v` to the nearest multiple of 16, with a minimum of 16.
-/// Used to compute the output tile size for resampled TIFF writing so that
-/// JPEG tiles always satisfy libtiff's MCU-boundary requirement.
 pub fn nearest_16(v: f64) -> u32 {
     ((v / 16.0).round() as u32).max(1) * 16
-}
-
-/// Escape special XML characters in an attribute value.
-pub fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-     .replace('<', "&lt;")
-     .replace('>', "&gt;")
-     .replace('"', "&quot;")
-}
-
-#[allow(non_snake_case)]
-fn generate_OME_XML(metadata_list: &[DcmMetadata]) -> String {
-    let base   = &metadata_list[0];
-    let width  = base.px_columns.unwrap_or(0);
-    let height = base.px_rows.unwrap_or(0);
-    let mpp_x  = base.mpp_x.unwrap_or(0.25);
-    let mpp_y  = base.mpp_y.unwrap_or(mpp_x);
-    let uuid   = uid_to_uuid(&base.series_instance_uid);
-    let name   = &base.series_instance_uid;
-
-    // SamplesPerPixel is cached in DcmMetadata; open file only for BitsAllocated and Manufacturer.
-    let spp: u32 = base.spp as u32;
-    let dcm = dicom::object::open_file(&base.file_path).ok();
-    let bps: u32 = dcm.as_ref()
-        .and_then(|d| d.element_by_name("BitsAllocated").ok())
-        .and_then(|e| e.to_str().ok().and_then(|s| s.trim().parse().ok()))
-        .unwrap_or(8);
-
-    // DICOM Tag (0008,0070): scanner vendor name.
-    let manufacturer: Option<String> = dcm.as_ref()
-        .and_then(|d| d.element_by_name("Manufacturer").ok())
-        .and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
-        .filter(|s| !s.is_empty());
-
-    // OME pixel type string
-    let pixel_type = match (bps, spp) {
-        (8,  _) => "uint8",
-        (16, _) => "uint16",
-        (32, _) => "uint32",
-        _       => "uint8",
-    };
-
-    // For interleaved colour (RGB / YCbCr) the OME convention used by BioFormats
-    // is: SizeC = SamplesPerPixel, one <Channel> element with SamplesPerPixel,
-    // Interleaved="true".  For grayscale: SizeC=1, SamplesPerPixel=1, no interleave.
-    let (_size_c, channel_spp, interleaved) = if spp >= 3 {
-        (spp, spp, "true")
-    } else {
-        (1u32, 1u32, "false")
-    };
-
-    // Optional <Instrument> block and back-reference from <Image>.
-    // Per OME 2016-06 schema: <Instrument> must precede <Image> in the root;
-    // <InstrumentRef> must precede <Pixels> inside <Image>.
-    let (instrument_block, instrument_ref) = match manufacturer {
-        Some(ref mfr) => (
-            format!(
-                "  <Instrument ID=\"Instrument:0\">\n    <Microscope Manufacturer=\"{}\"/>\n  </Instrument>\n",
-                xml_escape(mfr)
-            ),
-            "    <InstrumentRef ID=\"Instrument:0\"/>\n".to_string(),
-        ),
-        None => (String::new(), String::new()),
-    };
-
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"
-     xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-     xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd"
-     UUID="urn:uuid:{uuid}">
-{instrument_block}  <Image ID="Image:0" Name="{name}">
-{instrument_ref}    <Pixels ID="Pixels:0"
-            DimensionOrder="XYZCT"
-            Type="{pixel_type}"
-            SizeX="{width}"
-            SizeY="{height}"
-            SizeZ="1"
-            SizeC="1"
-            SizeT="1"
-            PhysicalSizeX="{mpp_x:.6}"
-            PhysicalSizeXUnit="µm"
-            PhysicalSizeY="{mpp_y:.6}"
-            PhysicalSizeYUnit="µm"
-            Interleaved="{interleaved}">
-      <Channel ID="Channel:0:0" SamplesPerPixel="{channel_spp}">
-        <LightPath/>
-      </Channel>
-      <TiffData FirstC="0" FirstT="0" FirstZ="0" IFD="0" PlaneCount="1"/>
-    </Pixels>
-  </Image>
-</OME>"#
-    )
 }
 
 
@@ -740,7 +565,7 @@ fn generate_OME_XML(metadata_list: &[DcmMetadata]) -> String {
 //
 // Pixel data is copied verbatim from DICOM fragments — no re-encoding.
 // The OME-XML conforms to the OME 2016-06 schema and is parsed by BioFormats.
-fn write_ome_tiff(
+pub(crate) fn write_ome_tiff(
     slide_level_metadata_list: &[DcmMetadata],
     _thumbnail_meta: Option<&DcmMetadata>,
     _overview_meta: Option<&DcmMetadata>,
@@ -758,7 +583,7 @@ fn write_ome_tiff(
         .sum();
     if let Some(p) = pb { p.set_length(total_tiles); }
 
-    let ome_xml      = generate_OME_XML(slide_level_metadata_list);
+    let ome_xml      = generate_dicom_ome_xml(slide_level_metadata_list);
     let image_desc_c = CString::new(ome_xml).unwrap();
 
     // Number of sub-resolution levels that will be stored as SubIFDs.
@@ -1155,8 +980,8 @@ unsafe fn write_svs_stripped_jpeg(
     );
 }}
 
-fn write_svs(
-    slide_levels: &[DcmMetadata],      // sorted largest-first (VOLUME)
+pub(crate) fn write_svs(
+    slide_levels: &[DcmMetadata],
     thumbnail_meta: Option<&DcmMetadata>,
     label_meta: Option<&DcmMetadata>,
     overview_meta: Option<&DcmMetadata>,
@@ -1364,7 +1189,7 @@ fn write_svs(
 // level and rounded to the nearest multiple of 16 for JPEG MCU compliance).
 // Pyramid levels whose longer side falls below MIN_PYRAMID_SIDE are skipped.
 // If the source has only one DICOM level the output is a single-IFD TIFF.
-fn write_resampled_tiff(
+pub(crate) fn write_resampled_tiff(
     slide_level_metadata_list: &[DcmMetadata],
     output_path: &str,
     target_mpp: f64,
@@ -1589,7 +1414,7 @@ fn write_resampled_tiff(
         resampled_meta.mpp_x      = if base_lv.actual_mpp_x > 0.0 { Some(base_lv.actual_mpp_x) } else { None };
         resampled_meta.mpp_y      = if base_lv.actual_mpp_y > 0.0 { Some(base_lv.actual_mpp_y) } else { None };
         resampled_meta.tile_size  = Some((base_lv.out_tile_w, base_lv.out_tile_h));
-        Some(CString::new(generate_OME_XML(&[resampled_meta])).unwrap())
+        Some(CString::new(generate_dicom_ome_xml(&[resampled_meta])).unwrap())
     } else {
         None
     };
@@ -1890,467 +1715,3 @@ fn write_resampled_tiff(
     }
 }
 
-// ─── Main entry point ─────────────────────────────────────────────────────────
-
-// Strips directory components and rejects characters unsafe in filenames so
-// that DICOM metadata values (SeriesInstanceUID, directory names) cannot cause
-// writes outside the intended output directory.
-fn sanitize_file_stem(stem: &str) -> String {
-    // file_name() discards every component before the last separator, removing
-    // any "../" traversal sequences embedded in the value.
-    let base = Path::new(stem)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("");
-    // Keep only characters that are safe on all major filesystems.
-    let sanitized: String = base
-        .chars()
-        .filter(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.'))
-        .collect();
-    // Trim leading dots to avoid hidden files and the "." / ".." names.
-    let sanitized = sanitized.trim_start_matches('.').to_string();
-    if sanitized.is_empty() {
-        "unnamed".to_string()
-    } else {
-        sanitized
-    }
-}
-
-// ─── Per-series conversion ────────────────────────────────────────────────────
-//
-// Converts one WSI series (all resolution levels) to the appropriate output
-// format and writes the result atomically via a .tmp file.
-// Called either inline (resampling mode, serial) or from a rayon::scope task
-// (passthrough mode, parallel).
-fn convert_one_series(
-    series_meta: Vec<DcmMetadata>,
-    series_idx: usize,
-    args: &Args,
-    mp: &MultiProgress,
-    skipped: &AtomicUsize,
-) {
-    let convert_start = std::time::Instant::now();
-
-    let src = match DicomSource::from_series(series_meta) {
-        Some(s) => s,
-        None    => return,
-    };
-
-    let series_id   = src.metadata().name.clone();
-    let ts_uid      = src.slide_levels[0].transfer_syntax_uid.clone();
-    let comp        = map_transfer_syntax_to_compression(&ts_uid);
-    let src_mpp_opt = src.slide_levels[0].mpp_x.filter(|&v| v > 0.0);
-    let src_mpp     = src_mpp_opt.unwrap_or(0.0);
-
-    // --half: always downsample to exactly 2× the source MPP (no 10% tolerance check).
-    //         Proceeds even when source MPP is unknown (dimension halving still works).
-    // --mpp:  skip resampling when source MPP is unknown or within 10% of the source.
-    let effective_mpp: Option<f64> = if args.half {
-        Some(src_mpp * 2.0)
-    } else {
-        if src_mpp_opt.is_none() {
-            if args.verbose {
-                eprintln!("  [warn ] source MPP unknown; skipping (--mpp requires known source MPP)");
-            }
-            None
-        } else {
-            let mut em = if let Some(t) = args.mpp {
-                if t <= src_mpp {
-                    eprintln!(
-                        "  [warn ] requested MPP {:.4} µm/px ≤ source {:.4} µm/px (upscaling not supported); skipping",
-                        t, src_mpp
-                    );
-                    None
-                } else {
-                    Some(t)
-                }
-            } else {
-                None
-            };
-            if let Some(val) = em {
-                if (val - src_mpp).abs() / src_mpp < 0.1 {
-                    if args.verbose {
-                        eprintln!(
-                            "  [warn ] requested MPP {:.4} µm/px within 10% of source {:.4} µm/px; skipping",
-                            val, src_mpp
-                        );
-                    }
-                    em = None;
-                }
-            }
-            em
-        }
-    };
-
-    if args.verbose {
-        let mode = match effective_mpp {
-            Some(m) => format!("→ {:.4} µm/px", m),
-            None    => "passthrough".to_string(),
-        };
-        eprintln!("({}) {}  {}  {:.4} µm/px  {} levels  {}",
-            series_idx, series_id, comp, src_mpp, src.slide_levels.len(), mode);
-    }
-
-    // When --legacy is set, the source is JP2K, and a level close to the target exists,
-    // passthrough the matching level and all coarser levels as SVS without decoding.
-    // Without --legacy the output is always OME-TIFF, so this path is disabled.
-    // ICC baking requires pixel decoding, so jp2k_svs_skip is disabled when baking.
-    // --half sets effective_mpp = src_mpp * 2, so this path intentionally fires when a
-    // 2x level exists in the source — lossless passthrough is preferable to resampling.
-    let jp2k_svs_skip: Option<usize> = if !args.legacy || args.icc_bake { None } else { effective_mpp.and_then(|target| {
-        if !is_jpeg2000(&comp) { return None; }
-        // Count levels finer than target (smaller mpp = higher resolution).
-        let skip = src.slide_levels.iter()
-            .take_while(|m| m.mpp_x.unwrap_or(f64::MAX) < target * 0.9)
-            .count();
-        // The first kept level must be within 10% of the target MPP.
-        let has_match = src.slide_levels.get(skip)
-            .and_then(|m| m.mpp_x)
-            .map(|mpp| (mpp - target).abs() / target < 0.1)
-            .unwrap_or(false);
-        if skip > 0 && has_match { Some(skip) } else { None }
-    }) };
-
-    // Resolve the stem used for the output filename.
-    // Both branches are passed through sanitize_file_stem to prevent path
-    // traversal when DICOM metadata contains sequences like "../../etc/passwd".
-    let file_stem: String = if args.use_parent_name {
-        let raw = Path::new(&src.slide_levels[0].file_path)
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or(series_id.as_str());
-        sanitize_file_stem(raw)
-    } else {
-        sanitize_file_stem(series_id.as_str())
-    };
-
-    let output_path = if jp2k_svs_skip.is_some() {
-        // JP2K passthrough with --legacy: write SVS so OpenSlide can read JP2K tiles.
-        format!("{}/{}.svs", args.output_dir, file_stem)
-    } else if effective_mpp.is_some() {
-        if args.legacy {
-            format!("{}/{}.tiff", args.output_dir, file_stem)
-        } else {
-            format!("{}/{}.ome.tiff", args.output_dir, file_stem)
-        }
-    } else if args.legacy && is_jpeg2000(&comp) {
-        format!("{}/{}.svs", args.output_dir, file_stem)
-    } else if args.legacy {
-        format!("{}/{}.tiff", args.output_dir, file_stem)
-    } else {
-        format!("{}/{}.ome.tiff", args.output_dir, file_stem)
-    };
-
-    // Build progress bar message: "(idx) filename", truncated to fit.
-    let fname    = Path::new(&output_path)
-        .file_name().and_then(|n| n.to_str()).unwrap_or(series_id.as_str());
-    let prefix   = format!("({})", series_idx);
-    let max_name = 52usize.saturating_sub(prefix.len() + 1);
-    let name_str = if fname.len() > max_name {
-        format!("…{}", &fname[fname.len() - max_name.saturating_sub(1)..])
-    } else {
-        fname.to_string()
-    };
-    let pb_msg = format!("{} {}", prefix, name_str);
-
-    let pb = mp.add(ProgressBar::new(0));
-    pb.set_style(
-        ProgressStyle::with_template(
-            "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
-        ).unwrap().progress_chars("=>-"),
-    );
-    pb.set_message(pb_msg.clone());
-
-    // Skip if the final output already exists (guaranteed complete via tmp rename).
-    if Path::new(&output_path).exists() {
-        skipped.fetch_add(1, Ordering::Relaxed);
-        pb.finish_and_clear();
-        return;
-    }
-
-    let tmp_path = format!("{}.tmp", output_path);
-
-    if let Some(skip) = jp2k_svs_skip {
-        write_svs(
-            &src.slide_levels[skip..],
-            src.thumbnail.as_ref(),
-            src.label.as_ref(),
-            src.overview.as_ref(),
-            &tmp_path,
-            Some(&pb),
-            args.verbose,
-            args.quality,
-            args.icc_bake,
-        );
-    } else if let Some(target_mpp) = effective_mpp {
-        write_resampled_tiff(
-            &src.slide_levels, &tmp_path,
-            target_mpp, args.quality, args.filter,
-            !args.legacy,
-            Some(&pb),
-            args.verbose,
-            args.half,
-            args.icc_bake,
-        );
-    } else if args.legacy {
-        if is_jpeg2000(&comp) {
-            write_svs(
-                &src.slide_levels,
-                src.thumbnail.as_ref(),
-                src.label.as_ref(),
-                src.overview.as_ref(),
-                &tmp_path,
-                Some(&pb),
-                args.verbose,
-                args.quality,
-                args.icc_bake,
-            );
-        } else {
-            write_flat_multipage_tiff(
-                &src.slide_levels,
-                &tmp_path,
-                Some(&pb),
-                args.verbose,
-                args.quality,
-                args.icc_bake,
-            );
-        }
-    } else {
-        write_ome_tiff(
-            &src.slide_levels,
-            src.thumbnail.as_ref(),
-            src.overview.as_ref(),
-            src.label.as_ref(),
-            &tmp_path,
-            Some(&pb),
-            args.verbose,
-            args.quality,
-            args.icc_bake,
-        );
-    }
-
-    std::fs::rename(&tmp_path, &output_path)
-        .expect("Failed to rename tmp file to output");
-
-    let elapsed = convert_start.elapsed();
-    mp.println(format!("  {} {:.2}s", pb_msg, elapsed.as_millis() as f64 / 1000.0)).ok();
-    pb.finish_and_clear();
-}
-
-pub fn run(args: Args) {
-    if let Some(n) = args.jobs {
-        // Ignore AlreadyBuilt errors: a dependency may have initialised the
-        // global pool already.  In that case we accept whatever thread count
-        // rayon chose and proceed.
-        let _ = rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global();
-    }
-
-    if args.verbose {
-        eprintln!("[src] {}", args.input_dir);
-        eprintln!("[out] {}", args.output_dir);
-    }
-
-    // if output directory doesn't exist, create it
-    if !Path::new(&args.output_dir).exists() {
-        std::fs::create_dir_all(&args.output_dir).expect("Failed to create output directory");
-    }
-
-    // Remove any stale .tmp files left by a previously interrupted run.
-    for entry in std::fs::read_dir(&args.output_dir).into_iter().flatten().flatten() {
-        let p = entry.path();
-        if p.extension().map_or(false, |e| e == "tmp") {
-            let _ = std::fs::remove_file(&p);
-        }
-    }
-
-    let mp = MultiProgress::new();
-
-    // ── Phase 1: discover .dcm paths grouped by directory (fast, no I/O) ─────
-    let scan_pb = mp.add(ProgressBar::new_spinner());
-    scan_pb.set_style(
-        ProgressStyle::with_template("  Scanning...  {msg}").unwrap()
-    );
-    scan_pb.enable_steady_tick(Duration::from_millis(100));
-
-    let mut dir_map: std::collections::HashMap<std::path::PathBuf, Vec<String>> =
-        std::collections::HashMap::new();
-    let mut tiff_paths: Vec<std::path::PathBuf> = Vec::new();
-    let mut last_dir_count  = 0usize;
-    let mut total_file_count = 0usize;
-    for entry in WalkDir::new(&args.input_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() { continue; }
-        let ext = entry.path().extension()
-            .and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-        match ext.as_str() {
-            "dcm" => {
-                let parent = entry.path().parent()
-                    .unwrap_or(Path::new(".")).to_path_buf();
-                dir_map.entry(parent).or_default()
-                    .push(entry.path().to_string_lossy().into_owned());
-                total_file_count += 1;
-                let n_dirs = dir_map.len();
-                if n_dirs != last_dir_count {
-                    scan_pb.set_message(format!("{} DCM in {} dirs, {} TIFF/SVS",
-                        total_file_count, n_dirs, tiff_paths.len()));
-                    last_dir_count = n_dirs;
-                }
-            }
-            "tiff" | "svs" => {
-                tiff_paths.push(entry.path().to_owned());
-                scan_pb.set_message(format!("{} DCM in {} dirs, {} TIFF/SVS",
-                    total_file_count, dir_map.len(), tiff_paths.len()));
-            }
-            _ => {}
-        }
-    }
-    scan_pb.finish_and_clear();
-
-    // Sort files within each directory group by path, then sort groups by their
-    // directory path.  Sequential order matches typical filesystem layout and
-    // minimises head-seek on HDD while still benefiting SSD prefetch.
-    let mut dir_groups: Vec<Vec<String>> = dir_map
-        .into_iter()
-        .map(|(_, mut files)| { files.sort(); files })
-        .collect();
-    dir_groups.sort_by(|a, b| a[0].cmp(&b[0]));
-    let total_files = total_file_count as u64;
-
-    if args.verbose {
-        eprintln!("Found {} DICOM files in {} directories", total_files, dir_groups.len());
-        if !tiff_paths.is_empty() {
-            eprintln!("Found {} TIFF/SVS files", tiff_paths.len());
-        }
-    }
-
-    // ── Phase 2+3: metadata extraction pipelined with conversion ─────────────
-    //
-    // Scanner thread: iterates over directory groups in parallel, extracts
-    // metadata, groups by series_instance_uid, and sends each WSI series
-    // through a channel.
-    //
-    // Main thread: receives complete series via the channel and immediately
-    // spawns conversion tasks into a rayon::scope, so scanning and conversion
-    // overlap in time.
-    let meta_pb = mp.add(ProgressBar::new(total_files));
-    meta_pb.set_style(
-        ProgressStyle::with_template(
-            "  Extracting metadata [{bar:35.cyan/white}] {pos}/{len} ({elapsed})"
-        ).unwrap().progress_chars("=>-"),
-    );
-
-    let series_counter = AtomicUsize::new(0);
-    let skipped_count  = AtomicUsize::new(0);
-
-    let (tx, rx) = mpsc::channel::<Vec<DcmMetadata>>();
-
-    // Scanner thread: process directory groups one at a time in sorted order.
-    // Serial group processing keeps disk access sequential (avoids inter-directory
-    // seeks); files within each group are still read in parallel because they
-    // reside in the same directory and are nearby on disk.
-    // Each completed series is sent immediately so conversion can begin before
-    // all metadata has been extracted.
-    let meta_pb_clone = meta_pb.clone();
-    let scanner = std::thread::spawn(move || {
-        for files in dir_groups {
-            let n = files.len() as u64;
-            let metas: Vec<DcmMetadata> = files.iter()
-                .filter_map(|p| match extract_metadata(p) {
-                    Ok(m) => Some(m),
-                    Err(e) => { eprintln!("  [skip] {}: {}", p, e); None }
-                })
-                .collect();
-            meta_pb_clone.inc(n);
-
-            let mut by_series: std::collections::HashMap<String, Vec<DcmMetadata>> =
-                std::collections::HashMap::new();
-            for m in metas {
-                if is_wsi_dicom(&m) {
-                    by_series.entry(m.series_instance_uid.clone())
-                        .or_default().push(m);
-                }
-            }
-            for (_, series_metas) in by_series {
-                tx.send(series_metas).ok();
-            }
-        }
-        // tx drops here, closing the channel.
-    });
-
-    // References shared across all rayon::scope tasks (safe: scope outlives them).
-    let mp_ref      = &mp;
-    let args_ref    = &args;
-    let skipped_ref = &skipped_count;
-
-    rayon::scope(|s| {
-        // Semaphore: limit concurrent passthrough WSIs to the thread-pool size
-        // so the process does not open more files or hold more memory than
-        // the number of worker threads.
-        let n_concurrent = rayon::current_num_threads();
-        let sem: Arc<(Mutex<usize>, Condvar)> = Arc::new((Mutex::new(0), Condvar::new()));
-
-        for series_meta in rx {
-            let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            if args_ref.mpp.is_some() || args_ref.half || args_ref.icc_bake {
-                // Resampling / ICC-bake: CPU-bound (decode + transform + encode).
-                // Process one WSI at a time so all n_jobs threads concentrate on
-                // tile-level parallelism inside write_resampled_tiff / write_*.
-                convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
-            } else if n_concurrent <= 1 {
-                // n_concurrent == 1: run inline on the main thread.
-                // Spawning via s.spawn() and then blocking the calling thread on
-                // cvar.wait() inside rayon::scope can deadlock because the OS-level
-                // block prevents rayon's work-stealing from making progress.
-                // Inline execution is identical in behaviour to resampling mode
-                // (one WSI at a time, sequential) which is what -j 1 implies.
-                convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
-            } else {
-                if args.verbose {
-                    println!("Passthrough mode");
-                }
-                // Passthrough: I/O-bound (raw fragment copy).
-                // Acquire a slot before spawning; release it when the task finishes.
-                // This keeps concurrent WSI count equal to the thread-pool size.
-                {
-                    let (lock, cvar) = &*sem;
-                    let mut active = lock.lock().unwrap();
-                    while *active >= n_concurrent {
-                        active = cvar.wait(active).unwrap();
-                    }
-                    *active += 1;
-                }
-                let sem_clone = Arc::clone(&sem);
-                s.spawn(move |_| {
-                    convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
-                    let (lock, cvar) = &*sem_clone;
-                    let mut active = lock.lock().unwrap();
-                    *active -= 1;
-                    cvar.notify_one();
-                });
-            }
-        }
-    });
-
-    scanner.join().unwrap();
-    meta_pb.finish_and_clear();
-
-    let total_processed = series_counter.load(Ordering::Relaxed);
-    let skipped = skipped_count.load(Ordering::Relaxed);
-    if skipped > 0 {
-        println!("  {} of {} series skipped (output already exists).",
-            skipped, total_processed);
-    }
-
-    // Process TIFF/SVS files
-    if !tiff_paths.is_empty() {
-        if args.mpp.is_some() || args.half || args.icc_bake {
-            tiff_paths.sort();
-            tiffds::process_files(&tiff_paths, &args, &mp);
-        } else {
-            eprintln!("  {} TIFF/SVS file(s) found; specify --mpp, --half, or --icc-bake to process them.",
-                tiff_paths.len());
-        }
-    }
-}

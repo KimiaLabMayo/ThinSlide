@@ -25,7 +25,7 @@ use crate::bindings::{
     PHOTOMETRIC_RGB, PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK,
     FILETYPE_REDUCEDIMAGE,
 };
-use crate::{tile_align, nearest_16, MIN_PYRAMID_SIDE, xml_escape,
+use crate::{tile_align, nearest_16, MIN_PYRAMID_SIDE,
             vlog, write_enc_chunk, compute_thread, set_tiff_ifd_tags};
 use crate::source::tiff::{
     TiffSource, TiffLevel, navigate,
@@ -378,7 +378,7 @@ fn process_file_icc_bake_only(
     let file_stem = Path::new(src_path).file_stem()
         .unwrap_or_default().to_string_lossy().to_string();
     let image_desc_c: Option<CString> = if ome {
-        let xml = generate_ome_xml(
+        let xml = crate::pipeline::ome::generate_tiff_ome_xml(
             &file_stem,
             base.img_w, base.img_h,
             base.mpp_x, base.mpp_y,
@@ -783,7 +783,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
 
     let base_lv = &output_levels[0];
     let image_desc_c: Option<CString> = if ome {
-        let xml = generate_ome_xml(
+        let xml = crate::pipeline::ome::generate_tiff_ome_xml(
             &file_stem,
             base_lv.out_img_w, base_lv.out_img_h,
             base_lv.actual_mpp_x, base_lv.actual_mpp_y,
@@ -1170,22 +1170,3 @@ fn compute_output_levels(
     out
 }
 
-// ─── OME-XML generation ────────────────────────────────────────────────────────
-
-fn generate_ome_xml(name: &str, width: u32, height: u32, mpp_x: f64, mpp_y: f64, spp: u32) -> String {
-    let safe_name = xml_escape(name);
-    let type_str  = "uint8";
-    let size_c    = if spp == 1 { 1 } else { spp };
-
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">
-  <Image ID="Image:0" Name="{safe_name}">
-    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="{type_str}" SizeX="{width}" SizeY="{height}" SizeZ="1" SizeC="{size_c}" SizeT="1" PhysicalSizeX="{mpp_x:.6}" PhysicalSizeXUnit="µm" PhysicalSizeY="{mpp_y:.6}" PhysicalSizeYUnit="µm">
-      <Channel ID="Channel:0:0" SamplesPerPixel="{spp}"/>
-      <TiffData/>
-    </Pixels>
-  </Image>
-</OME>"#
-    )
-}

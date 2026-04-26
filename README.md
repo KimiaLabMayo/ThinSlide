@@ -3,20 +3,20 @@
 
 ## Key Use Cases: Why use SlideLeaner?
 
-### 1. Consolidate & Manage (DICOM → TIFF)
-* **Problem**: Fragmented DICOM files are difficult to manage, move, or preview.
-* **Solution**: Repacks fragments into a single, high-performance tiff/OME-TIFF.
+### 1. DICOM → TIFF conversion
+* **Problem**: Fragmented DICOM files are difficult to manage, move, or preview. Redundant JPEG tables and ICC profiles.
+* **Solution**: Repacks fragments into a single tiff/OME-TIFF with no redundant data.
 * **Performance**: **Zero-decode transcoding** — works at near-copy speeds with zero quality loss.
 
-### 2. Optimize & Share (Smart Downsampling)
+### 2. Downsampling
 * **Problem**: Massive WSI files (1GB+) hinder network transfer and inflate storage costs.
-* **Solution**: Downsample to a target resolution using `--mpp` or `--half`.
+* **Solution**: Downsample to a target resolution using `--mpp` or `--half`. (e.g. 40× → 20×)
 * **Benefit**: Reduces file size by **75–85%** while maintaining diagnostic fidelity, making data sharing seamless.
 
-### 3. Standardize Color Across Platforms (`--icc-bake`)
-* **Problem**: WSI colors look inconsistent or "washed out" in AI scripts, web browsers, or non-specialized viewers.
+### 3. Color correction with ICC profiles (`--icc-bake`)
+* **Problem**: WSI colors look inconsistent in AI scripts, web browsers, or non-specialized viewers.
 * **Solution**: Bakes ICC profiles directly into pixel data (supports DICOM, TIFF, and SVS).
-* **Benefit**: Guarantees **consistent, accurate color** in any environment, including QuPath, Python (OpenSlide/Standard libraries), and browsers.
+* **Benefit**: Guarantees **consistent, accurate color** in any environment.
 
 ## Requirements
 
@@ -51,11 +51,6 @@ slean <input_dir> <output_dir> [OPTIONS]
 | DICOM (`.dcm`) | always | OME-TIFF (or BigTIFF/SVS with `--legacy`) |
 | TIFF / SVS | `--mpp` or `--half` required | OME-TIFF (or BigTIFF with `--legacy`) |
 
-### Modes
-
-- **Passthrough** (DICOM, default): compressed pixel data is written directly without decoding, preserving original quality and maximising speed.
-- **Downsampling** (`--mpp` / `--half`): tiles are decoded, resized to a target resolution, and re-encoded as JPEG. Applies to both DICOM and TIFF/SVS sources.
-- **ICC bake** (`--icc-bake`, DICOM only): tiles are decoded, the embedded ICC color profile is applied to convert pixels to sRGB, and the tiles are re-encoded as JPEG. The ICC profile tag is omitted from the output, so any viewer displays correct colors without needing ICC support. Useful when the source has a large per-WSI ICC profile (e.g. Hamamatsu: ~13 MB) that causes storage bloat or viewer failures. Note that this feature is experimental and not optimised for performance.
 
 ### Output formats
 
@@ -107,9 +102,6 @@ By default the output is OME-TIFF. Pass `--legacy` to select a format based on t
 
 # Mixed directory: DICOM passthrough + TIFF/SVS downsampled to 2.0 µm/px
 ./target/release/slean /data/mixed /data/output --mpp 2.0
-
-# On HDD: process DICOM one series at a time to avoid seek contention
-./target/release/slean /data/dicoms /data/output -j 1
 ```
 
 ### Parallelism
@@ -122,16 +114,6 @@ By default the output is OME-TIFF. Pass `--legacy` to select a format based on t
 
 TIFF/SVS files are always processed one file at a time (tile-level parallelism within each file).
 
----
-
-## Downsampling details
-
-When `--mpp` is specified, each output pyramid level independently selects the closest source level as its source:
-
-- **Within 10 %**: tiles are copied as-is (passthrough).
-- **More than 10 % away**: tiles are decoded, resized, and re-encoded as JPEG.
-
-If the requested `--mpp` is finer than the source base resolution, the tool falls back to passthrough rather than inventing detail.
 
 ### Downsampling filters
 
