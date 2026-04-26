@@ -1,4 +1,5 @@
 pub mod tiff;
+pub mod dicom;
 
 #[derive(Clone)]
 pub struct LevelInfo {
