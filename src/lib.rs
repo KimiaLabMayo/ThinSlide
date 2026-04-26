@@ -352,6 +352,22 @@ fn encode_one_tile_lib(
         }
     });
 
+    compose_and_encode(out_id, decoded, ch, p.out_tile_w, p.out_tile_h,
+        p.icc_transform.as_deref(), p.fir_pixel_type, &p.resize_opts, p.quality, p.spp)
+}
+
+pub(crate) fn compose_and_encode(
+    out_id: u32,
+    decoded: [Option<(Vec<u8>, u32, u32)>; 4],
+    ch: usize,
+    out_tile_w: u32,
+    out_tile_h: u32,
+    icc_transform: Option<&IccTransform>,
+    fir_pixel_type: fir::PixelType,
+    resize_opts: &fir::ResizeOptions,
+    quality: u8,
+    spp: u32,
+) -> Option<(u32, Vec<u8>)> {
     if decoded.iter().all(|d| d.is_none()) { return None; }
 
     let (slot_w, slot_h) = decoded.iter()
@@ -363,10 +379,8 @@ fn encode_one_tile_lib(
 
     for qi in 0..4usize {
         let Some((pixels, pw, ph)) = &decoded[qi] else { continue; };
-        let dc = qi % 2;
-        let dr = qi / 2;
-        let ox = dc * slot_w as usize;
-        let oy = dr * slot_h as usize;
+        let ox = (qi % 2) * slot_w as usize;
+        let oy = (qi / 2) * slot_h as usize;
         for row in 0..(*ph as usize) {
             let src_start = row * *pw as usize * ch;
             let dst_start = (oy + row) * canvas_w as usize * ch + ox * ch;
@@ -375,7 +389,7 @@ fn encode_one_tile_lib(
         }
     }
 
-    if let Some(ref xform) = p.icc_transform {
+    if let Some(xform) = icc_transform {
         if ch == 3 {
             let mut dst = vec![0u8; canvas.len()];
             apply_icc(xform, &canvas, &mut dst);
@@ -383,40 +397,30 @@ fn encode_one_tile_lib(
         }
     }
 
-    let resized_raw: Vec<u8> =
-        if canvas_w == p.out_tile_w && canvas_h == p.out_tile_h {
-            canvas
-        } else {
-            let src_fir = fir::images::Image::from_vec_u8(
-                canvas_w, canvas_h, canvas, p.fir_pixel_type).ok()?;
-            let mut dst_fir = fir::images::Image::new(p.out_tile_w, p.out_tile_h, p.fir_pixel_type);
-            fir::Resizer::new().resize(&src_fir, &mut dst_fir, &p.resize_opts).ok()?;
-            dst_fir.into_vec()
-        };
-
-    let jpeg_bytes = if p.spp == 1 {
-        let tj_img = turbojpeg::Image::<&[u8]> {
-            pixels: &resized_raw,
-            width:  p.out_tile_w as usize,
-            pitch:  p.out_tile_w as usize,
-            height: p.out_tile_h as usize,
-            format: turbojpeg::PixelFormat::GRAY,
-        };
-        turbojpeg::compress(tj_img, p.quality as i32, turbojpeg::Subsamp::Gray)
-            .map(|b| b.to_vec()).ok()?
+    let resized: Vec<u8> = if canvas_w == out_tile_w && canvas_h == out_tile_h {
+        canvas
     } else {
-        let tj_img = turbojpeg::Image::<&[u8]> {
-            pixels: &resized_raw,
-            width:  p.out_tile_w as usize,
-            pitch:  p.out_tile_w as usize * 3,
-            height: p.out_tile_h as usize,
-            format: turbojpeg::PixelFormat::RGB,
-        };
-        turbojpeg::compress(tj_img, p.quality as i32, turbojpeg::Subsamp::Sub2x2)
-            .map(|b| b.to_vec()).ok()?
+        let src_fir = fir::images::Image::from_vec_u8(canvas_w, canvas_h, canvas, fir_pixel_type).ok()?;
+        let mut dst_fir = fir::images::Image::new(out_tile_w, out_tile_h, fir_pixel_type);
+        fir::Resizer::new().resize(&src_fir, &mut dst_fir, resize_opts).ok()?;
+        dst_fir.into_vec()
     };
 
-    Some((out_id, jpeg_bytes))
+    let jpeg = if spp == 1 {
+        turbojpeg::compress(turbojpeg::Image::<&[u8]> {
+            pixels: &resized, width: out_tile_w as usize,
+            pitch: out_tile_w as usize, height: out_tile_h as usize,
+            format: turbojpeg::PixelFormat::GRAY,
+        }, quality as i32, turbojpeg::Subsamp::Gray).ok()?.to_vec()
+    } else {
+        turbojpeg::compress(turbojpeg::Image::<&[u8]> {
+            pixels: &resized, width: out_tile_w as usize,
+            pitch: out_tile_w as usize * 3, height: out_tile_h as usize,
+            format: turbojpeg::PixelFormat::RGB,
+        }, quality as i32, turbojpeg::Subsamp::Sub2x2).ok()?.to_vec()
+    };
+
+    Some((out_id, jpeg))
 }
 
 pub(crate) fn compute_thread<R, F>(
@@ -1726,36 +1730,6 @@ fn write_ome_tiff(
             if let Some(p) = pb { p.inc(subifd_tiles); }
         }
 
-        // ── Optional associated images (main chain, after SubIFD chain) ────
-        // Thumbnail / label / overview are appended to the main IFD sequence.
-        // BioFormats skips these for pixel reading; slide viewers can use them.
-        // if let Some(m) = thumbnail_meta {
-        //     if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
-        //         write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE);
-        //         TIFFWriteDirectory(tiff);
-        //         println!("  [OME-TIFF] Thumbnail: {}x{}", w, h);
-        //     } else {
-        //         println!("  [OME-TIFF] Thumbnail: decode failed, skipped");
-        //     }
-        // }
-        // if let Some(m) = label_meta {
-        //     if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
-        //         write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE);
-        //         TIFFWriteDirectory(tiff);
-        //         println!("  [OME-TIFF] Label: {}x{}", w, h);
-        //     } else {
-        //         println!("  [OME-TIFF] Label: decode failed, skipped");
-        //     }
-        // }
-        // if let Some(m) = overview_meta {
-        //     if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
-        //         write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE);
-        //         TIFFWriteDirectory(tiff);
-        //         println!("  [OME-TIFF] Overview: {}x{}", w, h);
-        //     } else {
-        //         println!("  [OME-TIFF] Overview: decode failed, skipped");
-        //     }
-        // }
 
         TIFFClose(tiff);
     }

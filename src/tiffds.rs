@@ -202,68 +202,8 @@ fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u3
         }
     });
 
-    if decoded.iter().all(|d| d.is_none()) { return None; }
-
-    let (slot_w, slot_h) = decoded.iter()
-        .filter_map(|d| d.as_ref().map(|(_, pw, ph)| (*pw, *ph)))
-        .fold((1u32, 1u32), |(mw, mh), (w, h)| (mw.max(w), mh.max(h)));
-    let canvas_w = slot_w * 2;
-    let canvas_h = slot_h * 2;
-    let mut canvas = vec![0u8; canvas_w as usize * canvas_h as usize * ch];
-
-    for qi in 0..4usize {
-        let Some((pixels, pw, ph)) = &decoded[qi] else { continue; };
-        let dc = qi % 2;
-        let dr = qi / 2;
-        let ox = dc * slot_w as usize;
-        let oy = dr * slot_h as usize;
-        for row in 0..(*ph as usize) {
-            let src_start = row * *pw as usize * ch;
-            let dst_start = (oy + row) * canvas_w as usize * ch + ox * ch;
-            let copy_len  = *pw as usize * ch;
-            canvas[dst_start..dst_start + copy_len]
-                .copy_from_slice(&pixels[src_start..src_start + copy_len]);
-        }
-    }
-
-    if let Some(ref xform) = p.icc_transform {
-        if ch == 3 {
-            let mut dst = vec![0u8; canvas.len()];
-            crate::apply_icc(xform, &canvas, &mut dst);
-            canvas = dst;
-        }
-    }
-
-    let resized: Vec<u8> = if canvas_w == p.out_tile_w && canvas_h == p.out_tile_h {
-        canvas
-    } else {
-        let src_fir = fir::images::Image::from_vec_u8(canvas_w, canvas_h, canvas, p.fpt).ok()?;
-        let mut dst_fir = fir::images::Image::new(p.out_tile_w, p.out_tile_h, p.fpt);
-        fir::Resizer::new().resize(&src_fir, &mut dst_fir, &p.resize_opts).ok()?;
-        dst_fir.into_vec()
-    };
-
-    let jpeg = if p.spp == 1 {
-        turbojpeg::compress(
-            turbojpeg::Image::<&[u8]> {
-                pixels: &resized, width: p.out_tile_w as usize,
-                pitch: p.out_tile_w as usize, height: p.out_tile_h as usize,
-                format: turbojpeg::PixelFormat::GRAY,
-            },
-            p.quality as i32, turbojpeg::Subsamp::Gray,
-        ).ok()?.to_vec()
-    } else {
-        turbojpeg::compress(
-            turbojpeg::Image::<&[u8]> {
-                pixels: &resized, width: p.out_tile_w as usize,
-                pitch: p.out_tile_w as usize * 3, height: p.out_tile_h as usize,
-                format: turbojpeg::PixelFormat::RGB,
-            },
-            p.quality as i32, turbojpeg::Subsamp::Sub2x2,
-        ).ok()?.to_vec()
-    };
-
-    Some((out_id, jpeg))
+    crate::compose_and_encode(out_id, decoded, ch, p.out_tile_w, p.out_tile_h,
+        p.icc_transform.as_deref(), p.fpt, &p.resize_opts, p.quality, p.spp)
 }
 
 // ─── Entry point for unified slean binary ─────────────────────────────────────
