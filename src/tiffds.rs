@@ -27,19 +27,17 @@ use crate::bindings::{
     TIFFTAG_TILEWIDTH, TIFFTAG_TILELENGTH,
     TIFFTAG_COMPRESSION,
     TIFFTAG_PHOTOMETRIC,
-    TIFFTAG_SAMPLESPERPIXEL, TIFFTAG_BITSPERSAMPLE,
-    TIFFTAG_SAMPLEFORMAT, TIFFTAG_PLANARCONFIG, TIFFTAG_ORIENTATION,
-    TIFFTAG_SUBFILETYPE, TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_ICCPROFILE,
+    TIFFTAG_SAMPLESPERPIXEL,
+    TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_ICCPROFILE,
     TIFFTAG_JPEGTABLES, TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_SUBIFD,
     TIFFTAG_XRESOLUTION, TIFFTAG_YRESOLUTION, TIFFTAG_RESOLUTIONUNIT,
     COMPRESSION_JPEG,
     PHOTOMETRIC_RGB, PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK,
     RESUNIT_CENTIMETER, RESUNIT_INCH,
-    SAMPLEFORMAT_UINT, PLANARCONFIG_CONTIG, ORIENTATION_TOPLEFT,
     FILETYPE_REDUCEDIMAGE,
 };
 use crate::{tile_align, nearest_16, MIN_PYRAMID_SIDE, xml_escape,
-            vlog, write_enc_chunk, compute_thread};
+            vlog, write_enc_chunk, compute_thread, set_tiff_ifd_tags};
 
 const COMPRESSION_APERIO_JP2_YCBCR: u32 = 33003;
 const COMPRESSION_APERIO_JP2_RGB: u32   = 33005;
@@ -459,25 +457,12 @@ fn process_file_icc_bake_only(
             let out_tile_w = tile_align(src_lv.tile_w, 16);
             let out_tile_h = tile_align(src_lv.tile_h, 16);
 
-            TIFFSetField(dst_tiff, TIFFTAG_SUBFILETYPE,      subfile);
-            TIFFSetField(dst_tiff, TIFFTAG_IMAGEWIDTH,       src_lv.img_w);
-            TIFFSetField(dst_tiff, TIFFTAG_IMAGELENGTH,      src_lv.img_h);
-            TIFFSetField(dst_tiff, TIFFTAG_TILEWIDTH,        out_tile_w);
-            TIFFSetField(dst_tiff, TIFFTAG_TILELENGTH,       out_tile_h);
-            TIFFSetField(dst_tiff, TIFFTAG_COMPRESSION,      COMPRESSION_JPEG);
-            TIFFSetField(dst_tiff, TIFFTAG_PHOTOMETRIC,      out_photometric);
+            set_tiff_ifd_tags(dst_tiff, subfile,
+                src_lv.img_w, src_lv.img_h, out_tile_w, out_tile_h,
+                COMPRESSION_JPEG as u32, out_photometric as u32, out_spp,
+                src_lv.mpp_x, src_lv.mpp_y);
             if out_photometric == PHOTOMETRIC_YCBCR {
                 TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING, 2u32, 2u32);
-            }
-            TIFFSetField(dst_tiff, TIFFTAG_SAMPLESPERPIXEL,  out_spp);
-            TIFFSetField(dst_tiff, TIFFTAG_BITSPERSAMPLE,    8u32);
-            TIFFSetField(dst_tiff, TIFFTAG_SAMPLEFORMAT,     SAMPLEFORMAT_UINT as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_PLANARCONFIG,     PLANARCONFIG_CONTIG as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_ORIENTATION,      ORIENTATION_TOPLEFT as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_RESOLUTIONUNIT,   RESUNIT_CENTIMETER as u32);
-            if src_lv.mpp_x > 0.0 {
-                TIFFSetField(dst_tiff, TIFFTAG_XRESOLUTION,  1e4 / src_lv.mpp_x);
-                TIFFSetField(dst_tiff, TIFFTAG_YRESOLUTION,  1e4 / src_lv.mpp_y);
             }
             if is_base {
                 if let Some(ref desc) = image_desc_c {
@@ -646,24 +631,13 @@ fn write_jp2k_svs_from_tiff(
                 else { COMPRESSION_APERIO_JP2_RGB };
 
             let subfile: u32 = if idx == 0 { 0 } else { FILETYPE_REDUCEDIMAGE };
-            TIFFSetField(dst_tiff, TIFFTAG_SUBFILETYPE,     subfile);
-            TIFFSetField(dst_tiff, TIFFTAG_IMAGEWIDTH,      lv.img_w);
-            TIFFSetField(dst_tiff, TIFFTAG_IMAGELENGTH,     lv.img_h);
-            TIFFSetField(dst_tiff, TIFFTAG_TILEWIDTH,       lv.tile_w);
-            TIFFSetField(dst_tiff, TIFFTAG_TILELENGTH,      lv.tile_h);
-            TIFFSetField(dst_tiff, TIFFTAG_COMPRESSION,     aperio_compr);
-            TIFFSetField(dst_tiff, TIFFTAG_PHOTOMETRIC,     lv.photometric as u32);
+            set_tiff_ifd_tags(dst_tiff, subfile,
+                lv.img_w, lv.img_h, lv.tile_w, lv.tile_h,
+                aperio_compr, lv.photometric as u32, lv.spp as u32,
+                lv.mpp_x, lv.mpp_y);
             if lv.photometric as u32 == PHOTOMETRIC_YCBCR {
                 TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING, 2u32, 2u32);
             }
-            TIFFSetField(dst_tiff, TIFFTAG_SAMPLESPERPIXEL, lv.spp as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_BITSPERSAMPLE,   8u32);
-            TIFFSetField(dst_tiff, TIFFTAG_SAMPLEFORMAT,    SAMPLEFORMAT_UINT as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_PLANARCONFIG,    PLANARCONFIG_CONTIG as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_ORIENTATION,     ORIENTATION_TOPLEFT as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_RESOLUTIONUNIT,  RESUNIT_CENTIMETER as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_XRESOLUTION,     1e4 / lv.mpp_x);
-            TIFFSetField(dst_tiff, TIFFTAG_YRESOLUTION,     1e4 / lv.mpp_y);
 
             if idx == 0 {
                 let desc_c = CString::new(img_desc.as_str()).unwrap();
@@ -935,25 +909,15 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                 (2u16, 2u16)
             };
 
-            TIFFSetField(dst_tiff, TIFFTAG_SUBFILETYPE,      subfile);
-            TIFFSetField(dst_tiff, TIFFTAG_IMAGEWIDTH,       lv_out.out_img_w);
-            TIFFSetField(dst_tiff, TIFFTAG_IMAGELENGTH,      lv_out.out_img_h);
-            TIFFSetField(dst_tiff, TIFFTAG_TILEWIDTH,        tile_align(lv_out.out_tile_w, 16));
-            TIFFSetField(dst_tiff, TIFFTAG_TILELENGTH,       tile_align(lv_out.out_tile_h, 16));
-            TIFFSetField(dst_tiff, TIFFTAG_SAMPLESPERPIXEL,  out_spp);
-            TIFFSetField(dst_tiff, TIFFTAG_BITSPERSAMPLE,    8u32);
-            TIFFSetField(dst_tiff, TIFFTAG_SAMPLEFORMAT,     SAMPLEFORMAT_UINT as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_PLANARCONFIG,     PLANARCONFIG_CONTIG as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_ORIENTATION,      ORIENTATION_TOPLEFT as u32);
-            TIFFSetField(dst_tiff, TIFFTAG_RESOLUTIONUNIT,   RESUNIT_CENTIMETER as u32);
-            if lv_out.actual_mpp_x > 0.0 {
-                TIFFSetField(dst_tiff, TIFFTAG_XRESOLUTION,  1e4 / lv_out.actual_mpp_x);
-                TIFFSetField(dst_tiff, TIFFTAG_YRESOLUTION,  1e4 / lv_out.actual_mpp_y);
-            }
+            let ifd_compr = if lv_out.passthrough { src_lv.compression as u32 } else { COMPRESSION_JPEG };
+            let ifd_photo = if lv_out.passthrough { src_lv.photometric as u32 } else { out_photometric };
+            set_tiff_ifd_tags(dst_tiff, subfile,
+                lv_out.out_img_w, lv_out.out_img_h,
+                lv_out.out_tile_w, lv_out.out_tile_h,
+                ifd_compr, ifd_photo, out_spp,
+                lv_out.actual_mpp_x, lv_out.actual_mpp_y);
 
             if lv_out.passthrough {
-                TIFFSetField(dst_tiff, TIFFTAG_COMPRESSION,  src_lv.compression as u32);
-                TIFFSetField(dst_tiff, TIFFTAG_PHOTOMETRIC,  src_lv.photometric as u32);
                 if src_lv.photometric as u32 == PHOTOMETRIC_YCBCR {
                     TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING,
                         src_subsamp_h as u32, src_subsamp_v as u32);
@@ -968,12 +932,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                         TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES, tlen, tptr);
                     }
                 }
-            } else {
-                TIFFSetField(dst_tiff, TIFFTAG_COMPRESSION,  COMPRESSION_JPEG);
-                TIFFSetField(dst_tiff, TIFFTAG_PHOTOMETRIC,  out_photometric);
-                if out_photometric == PHOTOMETRIC_YCBCR {
-                    TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING, 2u32, 2u32);
-                }
+            } else if out_photometric == PHOTOMETRIC_YCBCR {
+                TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING, 2u32, 2u32);
             }
 
             if is_base {

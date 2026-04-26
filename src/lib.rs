@@ -1030,8 +1030,8 @@ fn log_icc_and_build_transform(
 }
 
 /// Set the standard image/tile/compression/resolution TIFF tags common to every IFD.
-/// Resolution tags are omitted when mpp_x == 0.0 (unknown).
-unsafe fn set_tiff_ifd_tags(
+/// Pass mpp_x == 0.0 to skip resolution tags (unknown physical size).
+pub(crate) unsafe fn set_tiff_ifd_tags(
     tiff: *mut TIFF,
     subfile_type: u32,
     width: u32, height: u32,
@@ -1772,21 +1772,10 @@ unsafe fn write_svs_tiled_level(
     let out_compression = if baking { 7u32 } else { svs_compression };
     let out_photometric = if baking { PHOTOMETRIC_YCBCR as u32 } else { photometric };
 
-    TIFFSetField(tiff, TIFFTAG_SUBFILETYPE as u32,     subfile_type);
-    TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH as u32,      ifd_width);
-    TIFFSetField(tiff, TIFFTAG_IMAGELENGTH as u32,     ifd_height);
-    TIFFSetField(tiff, TIFFTAG_TILEWIDTH as u32,       tile_align(tile_w, 16));
-    TIFFSetField(tiff, TIFFTAG_TILELENGTH as u32,      tile_align(tile_h, 16));
-    TIFFSetField(tiff, TIFFTAG_COMPRESSION as u32,     out_compression);
-    TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC as u32,     out_photometric);
-    TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL as u32, 3u32);
-    TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE as u32,   8u32);
-    TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT as u32,    SAMPLEFORMAT_UINT as u32);
-    TIFFSetField(tiff, TIFFTAG_PLANARCONFIG as u32,    PLANARCONFIG_CONTIG as u32);
-    TIFFSetField(tiff, TIFFTAG_ORIENTATION as u32,     ORIENTATION_TOPLEFT as u32);
-    TIFFSetField(tiff, TIFFTAG_RESOLUTIONUNIT as u32,  RESUNIT_CENTIMETER as u32);
-    TIFFSetField(tiff, TIFFTAG_XRESOLUTION as u32,     res_x);
-    TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,     res_y);
+    set_tiff_ifd_tags(tiff, subfile_type,
+        ifd_width, ifd_height, tile_w, tile_h,
+        out_compression, out_photometric, 3,
+        1e4 / res_x, 1e4 / res_y);
 
     if let Some(desc) = image_desc {
         TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
