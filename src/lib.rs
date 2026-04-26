@@ -38,7 +38,7 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use fast_image_resize as fir;
 use std::path::Path;
 
-fn vlog(pb: Option<&ProgressBar>, msg: impl AsRef<str>) {
+pub(crate) fn vlog(pb: Option<&ProgressBar>, msg: impl AsRef<str>) {
     if let Some(p) = pb { p.println(msg.as_ref()); }
     else { eprintln!("{}", msg.as_ref()); }
 }
@@ -412,24 +412,28 @@ fn encode_one_tile_lib(
     Some((out_id, jpeg_bytes))
 }
 
-fn compute_thread_lib(
-    raw_rx: std::sync::mpsc::Receiver<LibRawChunk>,
-    enc_tx: std::sync::mpsc::SyncSender<LibEncChunk>,
-    params: std::sync::Arc<LibEncodeParams>,
-) {
+pub(crate) fn compute_thread<R, F>(
+    raw_rx: mpsc::Receiver<Vec<(u32, R)>>,
+    enc_tx: mpsc::SyncSender<Vec<(u32, Vec<u8>)>>,
+    encode: F,
+)
+where
+    R: Send + Sync,
+    F: Fn(u32, &R) -> Option<(u32, Vec<u8>)> + Send + Sync,
+{
     for raw_chunk in raw_rx {
-        let mut encoded: LibEncChunk = raw_chunk
+        let mut encoded: Vec<(u32, Vec<u8>)> = raw_chunk
             .par_iter()
-            .filter_map(|(id, quads)| encode_one_tile_lib(*id, quads, &params))
+            .filter_map(|(id, quad)| encode(*id, quad))
             .collect();
         encoded.sort_unstable_by_key(|(n, _)| *n);
         if enc_tx.send(encoded).is_err() { break; }
     }
 }
 
-unsafe fn write_enc_chunk_lib(
+pub(crate) unsafe fn write_enc_chunk(
     tiff: *mut TIFF,
-    chunk: &LibEncChunk,
+    chunk: &[(u32, Vec<u8>)],
     jpegtables_registered: &mut bool,
 ) {
     for (id, jpeg) in chunk {
@@ -2522,7 +2526,7 @@ fn write_resampled_tiff(
         let (enc_tx, enc_rx) = mpsc::sync_channel::<LibEncChunk>(2);
         let params_t = std::sync::Arc::clone(&enc_params);
         let compute_handle = std::thread::spawn(move || {
-            compute_thread_lib(raw_rx, enc_tx, params_t);
+            compute_thread(raw_rx, enc_tx, |id, quads| encode_one_tile_lib(id, quads, &params_t));
         });
 
         let mut jpegtables_registered = false;
@@ -2551,7 +2555,7 @@ fn write_resampled_tiff(
 
             if let Some(prev) = pending_write.take() {
                 let n = prev.len() as u64;
-                unsafe { write_enc_chunk_lib(tiff, &prev, &mut jpegtables_registered); }
+                unsafe { write_enc_chunk(tiff, &prev, &mut jpegtables_registered); }
                 if let Some(p) = pb { p.inc(n); }
             }
             pending_write = enc_rx.recv().ok();
@@ -2560,12 +2564,12 @@ fn write_resampled_tiff(
 
         if let Some(last) = pending_write.take() {
             let n = last.len() as u64;
-            unsafe { write_enc_chunk_lib(tiff, &last, &mut jpegtables_registered); }
+            unsafe { write_enc_chunk(tiff, &last, &mut jpegtables_registered); }
             if let Some(p) = pb { p.inc(n); }
         }
         for enc in enc_rx {
             let n = enc.len() as u64;
-            unsafe { write_enc_chunk_lib(tiff, &enc, &mut jpegtables_registered); }
+            unsafe { write_enc_chunk(tiff, &enc, &mut jpegtables_registered); }
             if let Some(p) = pb { p.inc(n); }
         }
         compute_handle.join().expect("compute thread panicked");

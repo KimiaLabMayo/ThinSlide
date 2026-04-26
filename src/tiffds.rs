@@ -38,16 +38,12 @@ use crate::bindings::{
     SAMPLEFORMAT_UINT, PLANARCONFIG_CONTIG, ORIENTATION_TOPLEFT,
     FILETYPE_REDUCEDIMAGE,
 };
-use crate::{tile_align, nearest_16, MIN_PYRAMID_SIDE, xml_escape, split_jpeg_to_tables_and_tile};
+use crate::{tile_align, nearest_16, MIN_PYRAMID_SIDE, xml_escape,
+            vlog, write_enc_chunk, compute_thread};
 
 const COMPRESSION_APERIO_JP2_YCBCR: u32 = 33003;
 const COMPRESSION_APERIO_JP2_RGB: u32   = 33005;
 const COMPRESSION_JP2000: u32           = 34712;
-
-fn vlog(pb: Option<&ProgressBar>, msg: impl AsRef<str>) {
-    if let Some(p) = pb { p.println(msg.as_ref()); }
-    else { eprintln!("{}", msg.as_ref()); }
-}
 
 fn is_jp2k(c: u32) -> bool {
     matches!(c, COMPRESSION_APERIO_JP2_YCBCR | COMPRESSION_APERIO_JP2_RGB | COMPRESSION_JP2000)
@@ -275,46 +271,6 @@ fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u3
     };
 
     Some((out_id, jpeg))
-}
-
-fn compute_thread_body(
-    raw_rx: mpsc::Receiver<RawChunk>,
-    enc_tx: mpsc::SyncSender<EncChunk>,
-    params: Arc<EncodeParams>,
-) {
-    for raw_chunk in raw_rx {
-        let mut encoded: EncChunk = raw_chunk
-            .par_iter()
-            .filter_map(|(id, quads)| encode_one_tile(*id, quads, &params))
-            .collect();
-        encoded.sort_unstable_by_key(|(n, _)| *n);
-        if enc_tx.send(encoded).is_err() { break; }
-    }
-}
-
-unsafe fn write_enc_chunk(
-    tiff: *mut TIFF,
-    chunk: &EncChunk,
-    jpegtables_registered: &mut bool,
-) {
-    for (id, jpeg) in chunk {
-        let split = split_jpeg_to_tables_and_tile(jpeg);
-        if !*jpegtables_registered {
-            if let Some((ref tables, _)) = split {
-                unsafe {
-                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES,
-                        tables.len() as u32, tables.as_ptr());
-                }
-                *jpegtables_registered = true;
-            }
-        }
-        let write_bytes = split.as_ref().map(|(_, t)| t.as_slice()).unwrap_or(jpeg.as_slice());
-        unsafe {
-            TIFFWriteRawTile(tiff, *id,
-                write_bytes.as_ptr() as *mut c_void,
-                write_bytes.len() as i64);
-        }
-    }
 }
 
 // ─── Entry point for unified slean binary ─────────────────────────────────────
@@ -1198,7 +1154,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                 let (enc_tx, enc_rx) = mpsc::sync_channel::<EncChunk>(2);
                 let params_t = Arc::clone(&enc_params);
                 let compute_handle = std::thread::spawn(move || {
-                    compute_thread_body(raw_rx, enc_tx, params_t);
+                    compute_thread(raw_rx, enc_tx, |id, quads| encode_one_tile(id, quads, &params_t));
                 });
 
                 let mut jpegtables_registered = false;
