@@ -11,7 +11,7 @@ pub mod pipeline;
 pub mod source;
 pub use args::Args;
 pub(crate) use pipeline::icc::{IccTransform, build_icc_transform, apply_icc};
-pub(crate) use pipeline::encode::{ycbcr_to_rgb, compose_and_encode, compute_thread, write_enc_chunk};
+pub(crate) use pipeline::encode::{ycbcr_to_rgb, jp2k_assemble_pixels, compose_and_encode, compute_thread, write_enc_chunk};
 pub use pipeline::encode::split_jpeg_to_tables_and_tile;
 pub(crate) use pipeline::writer::set_tiff_ifd_tags;
 pub(crate) use pipeline::ome::generate_dicom_ome_xml;
@@ -86,30 +86,10 @@ fn bake_jpeg_tile(fragment: &[u8], xform: &IccTransform, quality: u8, out_w: usi
 
 fn decode_jp2k_to_rgb(fragment: &[u8], has_ict_rct: bool) -> Option<(Vec<u8>, u32, u32)> {
     let j2k = jpeg2k::Image::from_bytes_with(fragment, jpeg2k::DecodeParameters::default()).ok()?;
-    let comps = j2k.components();
-    if comps.is_empty() { return None; }
-    let w = comps[0].width() as usize;
-    let h = comps[0].height() as usize;
-    if w == 0 || h == 0 { return None; }
-    let mut pixels: Vec<u8> = if comps.len() < 3 {
-        comps[0].data().iter().map(|v| (*v).clamp(0, 255) as u8).collect()
-    } else {
-        let yd = comps[0].data();
-        let cbd = comps[1].data(); let cbw = comps[1].width() as usize; let cbh = comps[1].height() as usize;
-        let crd = comps[2].data(); let crw = comps[2].width() as usize; let crh = comps[2].height() as usize;
-        let mut buf = Vec::with_capacity(w * h * 3);
-        for row in 0..h {
-            for col in 0..w {
-                let y  = yd[row*w+col].clamp(0, 255) as u8;
-                let cb = cbd[(row*cbh/h).min(cbh.saturating_sub(1))*cbw + (col*cbw/w).min(cbw.saturating_sub(1))].clamp(0, 255) as u8;
-                let cr = crd[(row*crh/h).min(crh.saturating_sub(1))*crw + (col*crw/w).min(crw.saturating_sub(1))].clamp(0, 255) as u8;
-                buf.extend_from_slice(&[y, cb, cr]);
-            }
-        }
-        buf
-    };
+    let n_comps = j2k.components().len();
+    let (mut pixels, w, h) = jp2k_assemble_pixels(&j2k, 3)?;
     let cs = j2k.color_space();
-    if comps.len() >= 3
+    if n_comps >= 3
         && !matches!(cs, jpeg2k::ColorSpace::SRGB)
         && (has_ict_rct || matches!(cs, jpeg2k::ColorSpace::SYCC))
     {
@@ -197,36 +177,7 @@ fn encode_one_tile_lib(
         } else if p.is_jp2k_src {
             let params = jpeg2k::DecodeParameters::default().reduce(p.n_reduce);
             let j2k_img = jpeg2k::Image::from_bytes_with(data, params).ok()?;
-            let comps = j2k_img.components();
-            if comps.is_empty() { return None; }
-            let luma_w = comps[0].width() as usize;
-            let luma_h = comps[0].height() as usize;
-            if luma_w == 0 || luma_h == 0 { return None; }
-            let mut pixels: Vec<u8> = if p.spp == 1 || comps.len() < 3 {
-                comps[0].data().iter().map(|v| (*v).clamp(0, 255) as u8).collect()
-            } else {
-                let y_data  = comps[0].data();
-                let cb_data = comps[1].data();
-                let cr_data = comps[2].data();
-                let cb_w = comps[1].width() as usize;
-                let cb_h = comps[1].height() as usize;
-                let cr_w = comps[2].width() as usize;
-                let cr_h = comps[2].height() as usize;
-                let mut buf = Vec::with_capacity(luma_w * luma_h * 3);
-                for row in 0..luma_h {
-                    for col in 0..luma_w {
-                        let y = y_data[row*luma_w+col].clamp(0, 255) as u8;
-                        let cb_col = (col*cb_w/luma_w).min(cb_w.saturating_sub(1));
-                        let cb_row = (row*cb_h/luma_h).min(cb_h.saturating_sub(1));
-                        let cb = cb_data[cb_row*cb_w+cb_col].clamp(0, 255) as u8;
-                        let cr_col = (col*cr_w/luma_w).min(cr_w.saturating_sub(1));
-                        let cr_row = (row*cr_h/luma_h).min(cr_h.saturating_sub(1));
-                        let cr = cr_data[cr_row*cr_w+cr_col].clamp(0, 255) as u8;
-                        buf.extend_from_slice(&[y, cb, cr]);
-                    }
-                }
-                buf
-            };
+            let (mut pixels, luma_w, luma_h) = jp2k_assemble_pixels(&j2k_img, p.spp as usize)?;
             let cs = j2k_img.color_space();
             if p.spp == 3
                 && !matches!(cs, jpeg2k::ColorSpace::SRGB)

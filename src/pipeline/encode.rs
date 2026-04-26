@@ -6,6 +6,42 @@ use fast_image_resize as fir;
 use crate::bindings::{TIFF, TIFFSetField, TIFFWriteRawTile, TIFFTAG_JPEGTABLES};
 use super::icc::{IccTransform, apply_icc};
 
+/// Assemble a pixel buffer from decoded JP2K components with nearest-neighbor chroma upsampling.
+/// Returns (pixels, width, height).  Does NOT apply YCbCr→RGB conversion; callers handle that.
+pub(crate) fn jp2k_assemble_pixels(img: &jpeg2k::Image, spp: usize) -> Option<(Vec<u8>, usize, usize)> {
+    let comps = img.components();
+    if comps.is_empty() { return None; }
+    let w = comps[0].width() as usize;
+    let h = comps[0].height() as usize;
+    if w == 0 || h == 0 { return None; }
+    let pixels = if spp == 1 || comps.len() < 3 {
+        comps[0].data_u8().collect()
+    } else {
+        let y_u8:  Vec<u8> = comps[0].data_u8().collect();
+        let cb_u8: Vec<u8> = comps[1].data_u8().collect();
+        let cr_u8: Vec<u8> = comps[2].data_u8().collect();
+        let cb_w = comps[1].width() as usize;
+        let cb_h = comps[1].height() as usize;
+        let cr_w = comps[2].width() as usize;
+        let cr_h = comps[2].height() as usize;
+        let mut buf = Vec::with_capacity(w * h * 3);
+        for row in 0..h {
+            for col in 0..w {
+                let y      = y_u8[row * w + col];
+                let cb_col = (col * cb_w / w).min(cb_w.saturating_sub(1));
+                let cb_row = (row * cb_h / h).min(cb_h.saturating_sub(1));
+                let cb     = cb_u8[cb_row * cb_w + cb_col];
+                let cr_col = (col * cr_w / w).min(cr_w.saturating_sub(1));
+                let cr_row = (row * cr_h / h).min(cr_h.saturating_sub(1));
+                let cr     = cr_u8[cr_row * cr_w + cr_col];
+                buf.extend_from_slice(&[y, cb, cr]);
+            }
+        }
+        buf
+    };
+    Some((pixels, w, h))
+}
+
 pub(crate) fn ycbcr_to_rgb(pixels: &mut [u8]) {
     for c in pixels.chunks_mut(3) {
         let y  = c[0] as f32;

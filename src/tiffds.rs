@@ -122,36 +122,7 @@ fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u3
             // JP2K
             let params = jpeg2k::DecodeParameters::default().reduce(p.n_reduce);
             let img = jpeg2k::Image::from_bytes_with(data, params).ok()?;
-            let comps = img.components();
-            if comps.is_empty() { return None; }
-            let luma_w = comps[0].width() as usize;
-            let luma_h = comps[0].height() as usize;
-            if luma_w == 0 || luma_h == 0 { return None; }
-            let mut pix: Vec<u8> = if p.spp == 1 || comps.len() < 3 {
-                comps[0].data_u8().collect()
-            } else {
-                let y_u8:  Vec<u8> = comps[0].data_u8().collect();
-                let cb_u8: Vec<u8> = comps[1].data_u8().collect();
-                let cr_u8: Vec<u8> = comps[2].data_u8().collect();
-                let cb_w = comps[1].width() as usize;
-                let cb_h = comps[1].height() as usize;
-                let cr_w = comps[2].width() as usize;
-                let cr_h = comps[2].height() as usize;
-                let mut buf = Vec::with_capacity(luma_w * luma_h * 3);
-                for row in 0..luma_h {
-                    for col in 0..luma_w {
-                        let y = y_u8[row*luma_w+col];
-                        let cb_col = (col*cb_w/luma_w).min(cb_w.saturating_sub(1));
-                        let cb_row = (row*cb_h/luma_h).min(cb_h.saturating_sub(1));
-                        let cb = cb_u8[cb_row*cb_w+cb_col];
-                        let cr_col = (col*cr_w/luma_w).min(cr_w.saturating_sub(1));
-                        let cr_row = (row*cr_h/luma_h).min(cr_h.saturating_sub(1));
-                        let cr = cr_u8[cr_row*cr_w+cr_col];
-                        buf.extend_from_slice(&[y, cb, cr]);
-                    }
-                }
-                buf
-            };
+            let (mut pix, luma_w, luma_h) = super::jp2k_assemble_pixels(&img, p.spp as usize)?;
             let color_space = img.color_space();
             let needs_ycbcr_cvt = p.spp == 3 && (
                 matches!(color_space, jpeg2k::ColorSpace::SYCC)
@@ -279,36 +250,7 @@ fn bake_single_tile(
         (pix, w, h)
     } else if is_jp2k_tile {
         let j2k = jpeg2k::Image::from_bytes_with(data, jpeg2k::DecodeParameters::default()).ok()?;
-        let comps = j2k.components();
-        if comps.is_empty() { return None; }
-        let luma_w = comps[0].width() as usize;
-        let luma_h = comps[0].height() as usize;
-        if luma_w == 0 || luma_h == 0 { return None; }
-        let mut pix: Vec<u8> = if spp == 1 || comps.len() < 3 {
-            comps[0].data_u8().collect()
-        } else {
-            let y_u8:  Vec<u8> = comps[0].data_u8().collect();
-            let cb_u8: Vec<u8> = comps[1].data_u8().collect();
-            let cr_u8: Vec<u8> = comps[2].data_u8().collect();
-            let cb_w = comps[1].width() as usize;
-            let cb_h = comps[1].height() as usize;
-            let cr_w = comps[2].width() as usize;
-            let cr_h = comps[2].height() as usize;
-            let mut buf = Vec::with_capacity(luma_w * luma_h * 3);
-            for row in 0..luma_h {
-                for col in 0..luma_w {
-                    let y = y_u8[row*luma_w+col];
-                    let cb_col = (col*cb_w/luma_w).min(cb_w.saturating_sub(1));
-                    let cb_row = (row*cb_h/luma_h).min(cb_h.saturating_sub(1));
-                    let cb = cb_u8[cb_row*cb_w+cb_col];
-                    let cr_col = (col*cr_w/luma_w).min(cr_w.saturating_sub(1));
-                    let cr_row = (row*cr_h/luma_h).min(cr_h.saturating_sub(1));
-                    let cr = cr_u8[cr_row*cr_w+cr_col];
-                    buf.extend_from_slice(&[y, cb, cr]);
-                }
-            }
-            buf
-        };
+        let (mut pix, luma_w, luma_h) = super::jp2k_assemble_pixels(&j2k, spp as usize)?;
         let cs = j2k.color_space();
         if spp == 3 && (
             matches!(cs, jpeg2k::ColorSpace::SYCC)
