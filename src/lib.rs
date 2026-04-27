@@ -1602,7 +1602,10 @@ pub(crate) fn write_resampled_tiff(
                 // Write raw tiles from every DICOM file in the source group.
                 // For JPEG sources, strip redundant DQT/DHT from each tile and store
                 // them once in TIFFTAG_JPEGTABLES (~550 bytes saved per tile).
-                let mut jpegtables_registered = false;
+                // When a tile has different tables from the registered ones (e.g. blank
+                // stub tiles mixed with real tissue tiles), write it as a self-contained
+                // JPEG so the decoder always has the correct tables.
+                let mut registered_tables: Option<Vec<u8>> = None;
                 for dcm_meta in lv.src_group.iter() {
                     let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                     let ifd_w        = dcm_meta.px_columns.unwrap_or(0);
@@ -1617,16 +1620,20 @@ pub(crate) fn write_resampled_tiff(
                             let split = (compr == 7)
                                 .then(|| split_jpeg_to_tables_and_tile(fragment))
                                 .flatten();
-                            if !jpegtables_registered {
-                                if let Some((ref tables, _)) = split {
-                                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                        tables.len() as u32, tables.as_ptr());
-                                    jpegtables_registered = true;
+                            let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                                match registered_tables {
+                                    None => {
+                                        TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                            tables.len() as u32, tables.as_ptr());
+                                        registered_tables = Some(tables.clone());
+                                        tile_data.as_slice()
+                                    }
+                                    Some(ref rt) if rt == tables => tile_data.as_slice(),
+                                    _ => fragment.as_slice(),
                                 }
-                            }
-                            let write_bytes = split.as_ref()
-                                .map(|(_, t)| t.as_slice())
-                                .unwrap_or(fragment.as_slice());
+                            } else {
+                                fragment.as_slice()
+                            };
                             TIFFWriteRawTile(tiff, tile_num,
                                 write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
                         }
