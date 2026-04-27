@@ -367,7 +367,7 @@ pub fn run(args: Args) {
 
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            if args_ref.mpp.is_some() || args_ref.half || args_ref.icc_bake {
+            if args_ref.mpp.is_some() || args_ref.half {
                 convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
             } else if n_concurrent <= 1 {
                 convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);

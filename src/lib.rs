@@ -47,6 +47,7 @@ use dicom_pixeldata::PixelDecoder;
 use image::imageops::FilterType;
 use indicatif::ProgressBar;
 use fast_image_resize as fir;
+use rayon::prelude::*;
 
 pub(crate) fn vlog(pb: Option<&ProgressBar>, msg: impl AsRef<str>) {
     if let Some(p) = pb { p.println(msg.as_ref()); }
@@ -430,7 +431,7 @@ pub(crate) fn write_flat_multipage_tiff(
             drop(first_dcm);
 
             // Write tiles from every DICOM file in this resolution group.
-            // When baking: decode JPEG → apply ICC transform → re-encode JPEG.
+            // When baking: encode tiles in parallel per-file, then write serially.
             // Otherwise: passthrough raw bytes with JPEGTABLES optimisation.
             let mut registered_tables: Option<Vec<u8>> = None;
             for dcm_meta in group.iter() {
@@ -439,18 +440,46 @@ pub(crate) fn write_flat_multipage_tiff(
                 let px_elem      = dicom_obj.element_by_name("PixelData").expect("No PixelData");
                 let fragments    = px_elem.fragments().expect("Not encapsulated pixel data");
 
-                for (frag_idx, fragment) in fragments.iter().enumerate() {
-                    if !fragment.is_empty() {
+                if baking && compression == 7 {
+                    let xf = icc_transform.as_deref().unwrap();
+                    let frags: Vec<(u32, &[u8])> = fragments.iter().enumerate()
+                        .filter(|(_, f)| !f.is_empty())
+                        .map(|(i, f)| (tile_indices.get(i).copied().unwrap_or(i as u32), f.as_slice()))
+                        .collect();
+                    let mut encoded: Vec<(u32, Vec<u8>)> = frags.par_iter()
+                        .filter_map(|(tile_num, frag)| {
+                            let jpeg = bake_jpeg_tile(frag, xf, quality,
+                                tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize)?;
+                            Some((*tile_num, jpeg))
+                        })
+                        .collect();
+                    encoded.sort_unstable_by_key(|(n, _)| *n);
+                    for (tile_num, jpeg) in &encoded {
+                        let split = split_jpeg_to_tables_and_tile(jpeg);
+                        let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                            match registered_tables {
+                                None => {
+                                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                        tables.len() as u32, tables.as_ptr());
+                                    registered_tables = Some(tables.clone());
+                                    tile_data.as_slice()
+                                }
+                                Some(ref rt) if rt == tables => tile_data.as_slice(),
+                                _ => jpeg.as_slice(),
+                            }
+                        } else {
+                            jpeg.as_slice()
+                        };
+                        TIFFWriteRawTile(tiff, *tile_num,
+                            write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
+                    }
+                } else {
+                    for (frag_idx, fragment) in fragments.iter().enumerate() {
+                        if fragment.is_empty() { continue; }
                         let tile_num = tile_indices.get(frag_idx).copied()
                             .unwrap_or(frag_idx as u32);
-                        let baked: Option<Vec<u8>> = if baking && compression == 7 {
-                            icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality, tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize))
-                        } else {
-                            None
-                        };
-                        let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
                         let split = (compression == 7)
-                            .then(|| split_jpeg_to_tables_and_tile(src_bytes))
+                            .then(|| split_jpeg_to_tables_and_tile(fragment))
                             .flatten();
                         let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
                             match registered_tables {
@@ -462,16 +491,13 @@ pub(crate) fn write_flat_multipage_tiff(
                                 }
                                 Some(ref rt) if rt == tables => tile_data.as_slice(),
                                 // Different DQT/DHT tables — write self-contained JPEG
-                                _ => src_bytes,
+                                _ => fragment.as_slice(),
                             }
                         } else {
-                            src_bytes
+                            fragment.as_slice()
                         };
-                        TIFFWriteRawTile(
-                            tiff, tile_num,
-                            write_bytes.as_ptr() as *mut c_void,
-                            write_bytes.len() as i64,
-                        );
+                        TIFFWriteRawTile(tiff, tile_num,
+                            write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
                     }
                 }
             }
@@ -867,20 +893,54 @@ unsafe fn write_svs_tiled_level(
     }
 
     let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-    let mut registered_tables: Option<Vec<u8>> = None;
-    for (i, fragment) in fragments.iter().enumerate() {
-        if !fragment.is_empty() {
-            let tile_num = tile_indices.get(i).copied().unwrap_or(i as u32);
-            let baked: Option<Vec<u8>> = icc_transform.and_then(|xf| {
-                if svs_compression == 7 {
-                    bake_jpeg_tile(fragment, xf, quality, tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize)
+
+    if baking {
+        // Encode all tiles in parallel, then write serially.
+        let xf = icc_transform.unwrap();
+        let frags: Vec<(u32, &[u8])> = fragments.iter().enumerate()
+            .filter(|(_, f)| !f.is_empty())
+            .map(|(i, f)| (tile_indices.get(i).copied().unwrap_or(i as u32), f.as_slice()))
+            .collect();
+        let mut encoded: Vec<(u32, Vec<u8>)> = frags.par_iter()
+            .filter_map(|(tile_num, frag)| {
+                let jpeg = if svs_compression == 7 {
+                    bake_jpeg_tile(frag, xf, quality,
+                        tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize)
                 } else {
-                    bake_jp2k_tile(fragment, jp2k_has_ict_rct, xf, quality)
+                    bake_jp2k_tile(frag, jp2k_has_ict_rct, xf, quality)
+                }?;
+                Some((*tile_num, jpeg))
+            })
+            .collect();
+        encoded.sort_unstable_by_key(|(n, _)| *n);
+        let mut registered_tables: Option<Vec<u8>> = None;
+        for (tile_num, jpeg) in &encoded {
+            let split = split_jpeg_to_tables_and_tile(jpeg);
+            let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                match registered_tables {
+                    None => {
+                        TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                            tables.len() as u32, tables.as_ptr());
+                        registered_tables = Some(tables.clone());
+                        tile_data.as_slice()
+                    }
+                    Some(ref rt) if rt == tables => tile_data.as_slice(),
+                    _ => jpeg.as_slice(),
                 }
-            });
-            let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
+            } else {
+                jpeg.as_slice()
+            };
+            TIFFWriteRawTile(tiff, *tile_num,
+                write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
+        }
+    } else {
+        // Passthrough: no per-tile CPU work, stay sequential.
+        let mut registered_tables: Option<Vec<u8>> = None;
+        for (i, fragment) in fragments.iter().enumerate() {
+            if fragment.is_empty() { continue; }
+            let tile_num = tile_indices.get(i).copied().unwrap_or(i as u32);
             let split = (out_compression == 7)
-                .then(|| split_jpeg_to_tables_and_tile(src_bytes))
+                .then(|| split_jpeg_to_tables_and_tile(fragment))
                 .flatten();
             let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
                 match registered_tables {
@@ -891,17 +951,13 @@ unsafe fn write_svs_tiled_level(
                         tile_data.as_slice()
                     }
                     Some(ref rt) if rt == tables => tile_data.as_slice(),
-                    // Different DQT/DHT tables — write self-contained JPEG
-                    _ => src_bytes,
+                    _ => fragment.as_slice(),
                 }
             } else {
-                src_bytes
+                fragment.as_slice()
             };
-            TIFFWriteRawTile(
-                tiff, tile_num,
-                write_bytes.as_ptr() as *mut c_void,
-                write_bytes.len() as i64,
-            );
+            TIFFWriteRawTile(tiff, tile_num,
+                write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
         }
     }
 }}
