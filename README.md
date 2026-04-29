@@ -30,11 +30,51 @@
 
 ## Building
 
+### CLI only
+
+```sh
+cargo build --release --bin slean
+```
+
+Binary is placed at `target/release/slean`.
+
+### CLI + GUI
+
 ```sh
 cargo build --release
 ```
 
-Binary is placed at `target/release/slean`.
+Both binaries are placed in `target/release/`:
+
+| Binary | Description |
+|---|---|
+| `slean` | CLI tool |
+| `slean-gui` | GUI wrapper (requires `slean` in the same directory) |
+
+> **Note:** `slean-gui` locates `slean` by looking next to its own executable, so always keep both binaries in the same directory.
+
+---
+
+## GUI (`slean-gui`)
+
+`slean-gui` is a minimal desktop interface for pathologists who prefer not to use the terminal.
+It wraps `slean` and exposes the same options via a point-and-click window.
+
+```sh
+./target/release/slean-gui
+```
+
+| Control | Description |
+|---|---|
+| Input / Output | Folder picker buttons |
+| Format | OME-TIFF or Legacy (BigTIFF/SVS) |
+| Downsampling | Passthrough, Half, or custom MPP value |
+| Quality | JPEG quality (1–100); available for Half and MPP modes |
+| ICC bake | Convert to sRGB using the embedded ICC profile |
+| Use parent name | Name output after parent directory instead of Series UID |
+| Jobs | Number of parallel threads (blank = all CPUs) |
+
+Output from the underlying `slean` process is streamed into the log area at the bottom of the window.
 
 ---
 
@@ -139,3 +179,5 @@ TIFF/SVS files are always processed one file at a time (tile-level parallelism w
 | `rayon` | Parallelism |
 | `walkdir` | Recursive directory traversal |
 | libtiff (FFI) | Writing TIFF/SVS files |
+| `eframe` / `egui` | GUI framework (`slean-gui`) |
+| `rfd` | Native folder picker dialog (`slean-gui`) |

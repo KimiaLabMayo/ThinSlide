@@ -8,6 +8,10 @@ links = "tiff"
 name = "slean"
 path = "src/bin/slean.rs"
 
+[[bin]]
+name = "slean-gui"
+path = "src/bin/slean_gui.rs"
+
 [build-dependencies]
 pkg-config = "0.3"
 
@@ -26,3 +30,6 @@ image = "0.25"
 tiff = "0.11.3"
 walkdir = "2.5.0"
 lcms2 = "6.1"
+eframe = "0.29"
+rfd = "0.14"
+portable-pty = "0.8"
