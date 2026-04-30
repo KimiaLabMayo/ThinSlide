@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 
 jobs:
   # ── Linux x86_64 musl static (slean CLI only) ──────────────────────────────
@@ -26,7 +27,7 @@ jobs:
 
       - name: Build zlib (musl static)
         run: |
-          curl -sL https://zlib.net/zlib-1.3.1.tar.gz | tar -xz
+          curl -sL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar -xz
           cd zlib-1.3.1
           CC=musl-gcc ./configure --static --prefix=/usr/local/musl-libs
           make -j$(nproc) && sudo make install
@@ -120,43 +121,6 @@ jobs:
             slean-macos-arm64
             slean-gui-macos-arm64
 
-  # ── macOS x86_64 (slean + slean-gui) ───────────────────────────────────────
-  build-macos-x86_64:
-    name: macOS x86_64
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Homebrew deps + NASM
-        run: brew install libtiff little-cms2 pkg-config nasm
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-          key: macos-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build slean + slean-gui
-        env:
-          PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
-        run: cargo build --release --bin slean --bin slean-gui
-
-      - name: Rename artifacts
-        run: |
-          cp target/release/slean slean-macos-x86_64
-          cp target/release/slean-gui slean-gui-macos-x86_64
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: slean-macos-x86_64
-          path: |
-            slean-macos-x86_64
-            slean-gui-macos-x86_64
-
   # ── Windows x86_64 MSVC (slean + slean-gui) ────────────────────────────────
   build-windows:
     name: Windows x86_64
@@ -224,7 +188,7 @@ jobs:
   # ── Create GitHub Release ───────────────────────────────────────────────────
   release:
     name: Create GitHub Release
-    needs: [build-linux-musl, build-macos-arm64, build-macos-x86_64, build-windows]
+    needs: [build-linux-musl, build-macos-arm64, build-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -240,7 +204,5 @@ jobs:
             slean-linux-x86_64-musl
             slean-macos-arm64
             slean-gui-macos-arm64
-            slean-macos-x86_64
-            slean-gui-macos-x86_64
             slean-windows-x86_64.exe
             slean-gui-windows-x86_64.exe
