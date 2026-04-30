@@ -1485,6 +1485,7 @@ pub type __darwin_uid_t = __uint32_t;
 pub type __darwin_useconds_t = __uint32_t;
 pub type __darwin_uuid_t = [::std::os::raw::c_uchar; 16usize];
 pub type __darwin_uuid_string_t = [::std::os::raw::c_char; 37usize];
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct __darwin_pthread_handler_rec {
@@ -1492,6 +1493,7 @@ pub struct __darwin_pthread_handler_rec {
     pub __arg: *mut ::std::os::raw::c_void,
     pub __next: *mut __darwin_pthread_handler_rec,
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of __darwin_pthread_handler_rec"]
@@ -1505,12 +1507,14 @@ const _: () = {
     ["Offset of field: __darwin_pthread_handler_rec::__next"]
         [::std::mem::offset_of!(__darwin_pthread_handler_rec, __next) - 16usize];
 };
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _opaque_pthread_attr_t {
     pub __sig: ::std::os::raw::c_long,
     pub __opaque: [::std::os::raw::c_char; 56usize],
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _opaque_pthread_attr_t"][::std::mem::size_of::<_opaque_pthread_attr_t>() - 64usize];
@@ -1521,12 +1525,14 @@ const _: () = {
     ["Offset of field: _opaque_pthread_attr_t::__opaque"]
         [::std::mem::offset_of!(_opaque_pthread_attr_t, __opaque) - 8usize];
 };
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _opaque_pthread_cond_t {
     pub __sig: ::std::os::raw::c_long,
     pub __opaque: [::std::os::raw::c_char; 40usize],
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _opaque_pthread_cond_t"][::std::mem::size_of::<_opaque_pthread_cond_t>() - 48usize];
@@ -1537,12 +1543,14 @@ const _: () = {
     ["Offset of field: _opaque_pthread_cond_t::__opaque"]
         [::std::mem::offset_of!(_opaque_pthread_cond_t, __opaque) - 8usize];
 };
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _opaque_pthread_condattr_t {
     pub __sig: ::std::os::raw::c_long,
     pub __opaque: [::std::os::raw::c_char; 8usize],
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _opaque_pthread_condattr_t"]
@@ -1554,12 +1562,14 @@ const _: () = {
     ["Offset of field: _opaque_pthread_condattr_t::__opaque"]
         [::std::mem::offset_of!(_opaque_pthread_condattr_t, __opaque) - 8usize];
 };
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _opaque_pthread_mutex_t {
     pub __sig: ::std::os::raw::c_long,
     pub __opaque: [::std::os::raw::c_char; 56usize],
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _opaque_pthread_mutex_t"][::std::mem::size_of::<_opaque_pthread_mutex_t>() - 64usize];
@@ -1570,12 +1580,14 @@ const _: () = {
     ["Offset of field: _opaque_pthread_mutex_t::__opaque"]
         [::std::mem::offset_of!(_opaque_pthread_mutex_t, __opaque) - 8usize];
 };
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _opaque_pthread_mutexattr_t {
     pub __sig: ::std::os::raw::c_long,
     pub __opaque: [::std::os::raw::c_char; 8usize],
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _opaque_pthread_mutexattr_t"]
@@ -1587,12 +1599,14 @@ const _: () = {
     ["Offset of field: _opaque_pthread_mutexattr_t::__opaque"]
         [::std::mem::offset_of!(_opaque_pthread_mutexattr_t, __opaque) - 8usize];
 };
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _opaque_pthread_once_t {
     pub __sig: ::std::os::raw::c_long,
     pub __opaque: [::std::os::raw::c_char; 8usize],
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _opaque_pthread_once_t"][::std::mem::size_of::<_opaque_pthread_once_t>() - 16usize];
@@ -1603,12 +1617,14 @@ const _: () = {
     ["Offset of field: _opaque_pthread_once_t::__opaque"]
         [::std::mem::offset_of!(_opaque_pthread_once_t, __opaque) - 8usize];
 };
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _opaque_pthread_rwlock_t {
     pub __sig: ::std::os::raw::c_long,
     pub __opaque: [::std::os::raw::c_char; 192usize],
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _opaque_pthread_rwlock_t"]
@@ -1620,12 +1636,14 @@ const _: () = {
     ["Offset of field: _opaque_pthread_rwlock_t::__opaque"]
         [::std::mem::offset_of!(_opaque_pthread_rwlock_t, __opaque) - 8usize];
 };
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _opaque_pthread_rwlockattr_t {
     pub __sig: ::std::os::raw::c_long,
     pub __opaque: [::std::os::raw::c_char; 16usize],
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _opaque_pthread_rwlockattr_t"]
@@ -1637,6 +1655,7 @@ const _: () = {
     ["Offset of field: _opaque_pthread_rwlockattr_t::__opaque"]
         [::std::mem::offset_of!(_opaque_pthread_rwlockattr_t, __opaque) - 8usize];
 };
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct _opaque_pthread_t {
@@ -1644,6 +1663,7 @@ pub struct _opaque_pthread_t {
     pub __cleanup_stack: *mut __darwin_pthread_handler_rec,
     pub __opaque: [::std::os::raw::c_char; 8176usize],
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of _opaque_pthread_t"][::std::mem::size_of::<_opaque_pthread_t>() - 8192usize];
@@ -1655,30 +1675,48 @@ const _: () = {
     ["Offset of field: _opaque_pthread_t::__opaque"]
         [::std::mem::offset_of!(_opaque_pthread_t, __opaque) - 16usize];
 };
+#[cfg(target_os = "macos")]
 pub type __darwin_pthread_attr_t = _opaque_pthread_attr_t;
+#[cfg(target_os = "macos")]
 pub type __darwin_pthread_cond_t = _opaque_pthread_cond_t;
+#[cfg(target_os = "macos")]
 pub type __darwin_pthread_condattr_t = _opaque_pthread_condattr_t;
+#[cfg(target_os = "macos")]
 pub type __darwin_pthread_key_t = ::std::os::raw::c_ulong;
+#[cfg(target_os = "macos")]
 pub type __darwin_pthread_mutex_t = _opaque_pthread_mutex_t;
+#[cfg(target_os = "macos")]
 pub type __darwin_pthread_mutexattr_t = _opaque_pthread_mutexattr_t;
+#[cfg(target_os = "macos")]
 pub type __darwin_pthread_once_t = _opaque_pthread_once_t;
+#[cfg(target_os = "macos")]
 pub type __darwin_pthread_rwlock_t = _opaque_pthread_rwlock_t;
+#[cfg(target_os = "macos")]
 pub type __darwin_pthread_rwlockattr_t = _opaque_pthread_rwlockattr_t;
+#[cfg(target_os = "macos")]
 pub type __darwin_pthread_t = *mut _opaque_pthread_t;
+#[cfg(target_os = "macos")]
 pub type intmax_t = ::std::os::raw::c_long;
+#[cfg(target_os = "macos")]
 pub type uintmax_t = ::std::os::raw::c_ulong;
+#[cfg(target_os = "macos")]
 pub type __darwin_nl_item = ::std::os::raw::c_int;
+#[cfg(target_os = "macos")]
 pub type __darwin_wctrans_t = ::std::os::raw::c_int;
+#[cfg(target_os = "macos")]
 pub type __darwin_wctype_t = __uint32_t;
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     pub fn imaxabs(j: intmax_t) -> intmax_t;
 }
+#[cfg(target_os = "macos")]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct imaxdiv_t {
     pub quot: intmax_t,
     pub rem: intmax_t,
 }
+#[cfg(target_os = "macos")]
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of imaxdiv_t"][::std::mem::size_of::<imaxdiv_t>() - 16usize];
@@ -1686,9 +1724,11 @@ const _: () = {
     ["Offset of field: imaxdiv_t::quot"][::std::mem::offset_of!(imaxdiv_t, quot) - 0usize];
     ["Offset of field: imaxdiv_t::rem"][::std::mem::offset_of!(imaxdiv_t, rem) - 8usize];
 };
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     pub fn imaxdiv(__numer: intmax_t, __denom: intmax_t) -> imaxdiv_t;
 }
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     pub fn strtoimax(
         __nptr: *const ::std::os::raw::c_char,
@@ -1696,6 +1736,7 @@ unsafe extern "C" {
         __base: ::std::os::raw::c_int,
     ) -> intmax_t;
 }
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     pub fn strtoumax(
         __nptr: *const ::std::os::raw::c_char,
@@ -1703,6 +1744,7 @@ unsafe extern "C" {
         __base: ::std::os::raw::c_int,
     ) -> uintmax_t;
 }
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     pub fn wcstoimax(
         __nptr: *const wchar_t,
@@ -1710,6 +1752,7 @@ unsafe extern "C" {
         __base: ::std::os::raw::c_int,
     ) -> intmax_t;
 }
+#[cfg(target_os = "macos")]
 unsafe extern "C" {
     pub fn wcstoumax(
         __nptr: *const wchar_t,
