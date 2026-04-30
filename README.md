@@ -16,7 +16,7 @@
 ### 3. Color correction with ICC profiles (`--icc-bake`)
 * **Problem**: WSI colors look inconsistent in AI scripts, web browsers, or non-specialized viewers.
 * **Solution**: Bakes ICC profiles directly into pixel data (supports DICOM, TIFF, and SVS).
-* **Benefit**: Guarantees **consistent, accurate color** in any environment.
+* **Benefit**: Consistent color in any environment.
 
 ## Requirements
 
@@ -57,7 +57,7 @@ Both binaries are placed in `target/release/`:
 
 ## GUI (`slean-gui`)
 
-`slean-gui` is a minimal desktop interface for pathologists who prefer not to use the terminal.
+`slean-gui` is a minimal desktop interface.
 It wraps `slean` and exposes the same options via a point-and-click window.
 
 ```sh
