@@ -18,63 +18,23 @@
 * **Solution**: Bakes ICC profiles directly into pixel data (supports DICOM, TIFF, and SVS).
 * **Benefit**: Consistent color in any environment.
 
-## Requirements
-
-- Rust toolchain (edition 2024)
-- [libtiff](http://www.libtiff.org/)
-- [Little CMS 2](https://www.littlecms.com/) (required for `--icc-bake`)
-
-**macOS:** `brew install libtiff little-cms2`  
-**Debian/Ubuntu:** `sudo apt install libtiff-dev liblcms2-dev`  
-**Fedora/RHEL:** `sudo dnf install libtiff-devel lcms2-devel`
-
-## Building
-
-### CLI only
-
-```sh
-cargo build --release --bin slean
-```
-
-Binary is placed at `target/release/slean`.
-
-### CLI + GUI
-
-```sh
-cargo build --release
-```
-
-Both binaries are placed in `target/release/`:
-
-| Binary | Description |
-|---|---|
-| `slean` | CLI tool |
-| `slean-gui` | GUI wrapper (requires `slean` in the same directory) |
-
-> **Note:** `slean-gui` locates `slean` by looking next to its own executable, so always keep both binaries in the same directory.
-
 ---
 
-## GUI (`slean-gui`)
+## Installation
 
-`slean-gui` is a minimal desktop interface.
-It wraps `slean` and exposes the same options via a point-and-click window.
+Download the latest pre-built binary from [**Releases**](../../releases/latest). No dependencies required.
 
-```sh
-./target/release/slean-gui
-```
-
-| Control | Description |
+| Platform | Binary |
 |---|---|
-| Input / Output | Folder picker buttons |
-| Format | OME-TIFF or Legacy (BigTIFF/SVS) |
-| Downsampling | Passthrough, Half, or custom MPP value |
-| Quality | JPEG quality (1–100); available for Half and MPP modes |
-| ICC bake | Convert to sRGB using the embedded ICC profile |
-| Use parent name | Name output after parent directory instead of Series UID |
-| Jobs | Number of parallel threads (blank = all CPUs) |
+| Linux x86_64 | `slean-linux-x86_64-musl` |
+| macOS arm64 | `slean-macos-arm64`, `slean-gui-macos-arm64` |
+| macOS x86_64 | `slean-macos-x86_64`, `slean-gui-macos-x86_64` |
+| Windows x86_64 | `slean-windows-x86_64.exe`, `slean-gui-windows-x86_64.exe` |
 
-Output from the underlying `slean` process is streamed into the log area at the bottom of the window.
+**Linux / macOS — make executable after download:**
+```sh
+chmod +x slean-linux-x86_64-musl
+```
 
 ---
 
@@ -120,28 +80,28 @@ By default the output is OME-TIFF. Pass `--legacy` to select a format based on t
 
 ```sh
 # DICOM passthrough — OME-TIFF, all CPUs
-./target/release/slean /data/dicoms /data/output
+slean /data/dicoms /data/output
 
 # DICOM passthrough — SVS / BigTIFF (format chosen by DICOM compression type)
-./target/release/slean /data/dicoms /data/output --legacy
+slean /data/dicoms /data/output --legacy
 
 # Downsample DICOM and TIFF/SVS to 0.5 µm/px
-./target/release/slean /data/slides /data/output --mpp 0.5
+slean /data/slides /data/output --mpp 0.5
 
 # Downsample to 1.0 µm/px, Lanczos3 filter, quality 90, 4 threads
-./target/release/slean /data/slides /data/output --mpp 1.0 --filter lanczos3 --quality 90 -j 4
+slean /data/slides /data/output --mpp 1.0 --filter lanczos3 --quality 90 -j 4
 
 # Halve width and height (fastest for JPEG sources: DCT-domain 1/2 decode + no resize)
-./target/release/slean /data/slides /data/output --half
+slean /data/slides /data/output --half
 
 # Bake ICC profile into pixels and write sRGB JPEG output without ICC tag (DICOM only)
-./target/release/slean /data/dicoms /data/output --icc-bake
+slean /data/dicoms /data/output --icc-bake
 
 # ICC bake combined with downsampling to 0.5 µm/px
-./target/release/slean /data/dicoms /data/output --icc-bake --mpp 0.5
+slean /data/dicoms /data/output --icc-bake --mpp 0.5
 
 # Mixed directory: DICOM passthrough + TIFF/SVS downsampled to 2.0 µm/px
-./target/release/slean /data/mixed /data/output --mpp 2.0
+slean /data/mixed /data/output --mpp 2.0
 ```
 
 ### Parallelism
@@ -163,6 +123,44 @@ TIFF/SVS files are always processed one file at a time (tile-level parallelism w
 | `triangle` | Bilinear | Smooth, slight blur |
 | `catmullrom` | Bicubic | Sharp, good general-purpose |
 | `lanczos3` | Lanczos (a=3) | Highest quality, slowest |
+
+---
+
+## GUI (`slean-gui`)
+
+`slean-gui` is a minimal desktop interface.
+It wraps `slean` and exposes the same options via a point-and-click window.
+Available for macOS and Windows from [Releases](../../releases/latest).
+
+---
+
+## Build from source (optional)
+
+### Prerequisites
+
+- Rust toolchain (edition 2024)
+- [libtiff](http://www.libtiff.org/)
+- [Little CMS 2](https://www.littlecms.com/)
+
+**macOS:** `brew install libtiff little-cms2`  
+**Debian/Ubuntu:** `sudo apt install libtiff-dev liblcms2-dev`  
+**Fedora/RHEL:** `sudo dnf install libtiff-devel lcms2-devel`
+
+### CLI only
+
+```sh
+cargo build --release --bin slean
+```
+
+### CLI + GUI
+
+```sh
+cargo build --release
+```
+
+Both binaries are placed in `target/release/`.
+
+---
 
 ## Dependencies
 

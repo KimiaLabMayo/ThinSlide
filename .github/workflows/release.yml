@@ -1,0 +1,246 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Linux x86_64 musl static (slean CLI only) ──────────────────────────────
+  build-linux-musl:
+    name: Linux x86_64 (musl static)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install system deps
+        run: sudo apt-get update && sudo apt-get install -y musl-tools musl-dev cmake nasm curl
+
+      - name: Build zlib (musl static)
+        run: |
+          curl -sL https://zlib.net/zlib-1.3.1.tar.gz | tar -xz
+          cd zlib-1.3.1
+          CC=musl-gcc ./configure --static --prefix=/usr/local/musl-libs
+          make -j$(nproc) && sudo make install
+
+      - name: Build libtiff (musl static, JPEG disabled)
+        run: |
+          curl -sL https://download.osgeo.org/libtiff/tiff-4.7.1.tar.gz | tar -xz
+          cd tiff-4.7.1
+          CC=musl-gcc \
+            CPPFLAGS="-I/usr/local/musl-libs/include" \
+            LDFLAGS="-L/usr/local/musl-libs/lib" \
+            ./configure \
+              --host=x86_64-linux-musl \
+              --prefix=/usr/local/musl-libs \
+              --enable-static --disable-shared \
+              --disable-jpeg --disable-old-jpeg \
+              --disable-jbig --disable-lzma \
+              --disable-zstd --disable-webp --disable-jpeg12 \
+              --without-x
+          make -j$(nproc) && sudo make install
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: linux-musl-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build slean
+        env:
+          CC: musl-gcc
+          CXX: musl-g++
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+          TIFF_LIB_DIR: /usr/local/musl-libs/lib
+          TIFF_STATIC: "1"
+          TURBOJPEG_SOURCE: vendor
+          TURBOJPEG_STATIC: "1"
+          LCMS2_STATIC: "1"
+          PKG_CONFIG_ALLOW_CROSS: "1"
+        run: cargo build --release --bin slean --target x86_64-unknown-linux-musl
+
+      - name: Verify static binary
+        run: |
+          file target/x86_64-unknown-linux-musl/release/slean
+          ldd target/x86_64-unknown-linux-musl/release/slean 2>&1 | grep -q "not a dynamic executable"
+          echo "OK: binary is statically linked"
+
+      - name: Rename artifact
+        run: cp target/x86_64-unknown-linux-musl/release/slean slean-linux-x86_64-musl
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slean-linux-musl
+          path: slean-linux-x86_64-musl
+
+  # ── macOS arm64 (slean + slean-gui) ────────────────────────────────────────
+  build-macos-arm64:
+    name: macOS arm64
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Homebrew deps
+        run: brew install libtiff little-cms2 pkg-config
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: macos-arm64-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build slean + slean-gui
+        env:
+          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig
+        run: cargo build --release --bin slean --bin slean-gui
+
+      - name: Rename artifacts
+        run: |
+          cp target/release/slean slean-macos-arm64
+          cp target/release/slean-gui slean-gui-macos-arm64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slean-macos-arm64
+          path: |
+            slean-macos-arm64
+            slean-gui-macos-arm64
+
+  # ── macOS x86_64 (slean + slean-gui) ───────────────────────────────────────
+  build-macos-x86_64:
+    name: macOS x86_64
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Homebrew deps + NASM
+        run: brew install libtiff little-cms2 pkg-config nasm
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: macos-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build slean + slean-gui
+        env:
+          PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
+        run: cargo build --release --bin slean --bin slean-gui
+
+      - name: Rename artifacts
+        run: |
+          cp target/release/slean slean-macos-x86_64
+          cp target/release/slean-gui slean-gui-macos-x86_64
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slean-macos-x86_64
+          path: |
+            slean-macos-x86_64
+            slean-gui-macos-x86_64
+
+  # ── Windows x86_64 MSVC (slean + slean-gui) ────────────────────────────────
+  build-windows:
+    name: Windows x86_64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install NASM
+        run: choco install nasm --yes
+
+      - name: Add NASM to PATH
+        run: echo "C:\Program Files\NASM" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
+
+      - name: Install zlib via vcpkg
+        run: vcpkg install zlib:x64-windows-static-md
+
+      - name: Build libtiff (MSVC static)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tiffVer = "4.7.1"
+          Invoke-WebRequest "https://download.osgeo.org/libtiff/tiff-$tiffVer.tar.gz" -OutFile tiff.tar.gz
+          tar -xf tiff.tar.gz
+          cd "tiff-$tiffVer"
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=OFF `
+            "-DCMAKE_INSTALL_PREFIX=C:\tiff-static" `
+            "-DCMAKE_PREFIX_PATH=C:\vcpkg\installed\x64-windows-static-md" `
+            -Dtiff-tools=OFF -Dtiff-tests=OFF -Dtiff-docs=OFF `
+            -Djpeg=OFF -Dold-jpeg=OFF -Dlzma=OFF -Dzstd=OFF -Dwebp=OFF -Djbig=OFF
+          cmake --build build --config Release --parallel
+          cmake --install build --config Release
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: windows-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build slean + slean-gui
+        env:
+          TIFF_LIB_DIR: C:\tiff-static\lib
+          TIFF_STATIC: "1"
+          TURBOJPEG_SOURCE: vendor
+          TURBOJPEG_STATIC: "1"
+        run: cargo build --release --bin slean --bin slean-gui
+
+      - name: Rename artifacts
+        run: |
+          Copy-Item target\release\slean.exe slean-windows-x86_64.exe
+          Copy-Item target\release\slean-gui.exe slean-gui-windows-x86_64.exe
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: slean-windows-x86_64
+          path: |
+            slean-windows-x86_64.exe
+            slean-gui-windows-x86_64.exe
+
+  # ── Create GitHub Release ───────────────────────────────────────────────────
+  release:
+    name: Create GitHub Release
+    needs: [build-linux-musl, build-macos-arm64, build-macos-x86_64, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            slean-linux-x86_64-musl
+            slean-macos-arm64
+            slean-gui-macos-arm64
+            slean-macos-x86_64
+            slean-gui-macos-x86_64
+            slean-windows-x86_64.exe
+            slean-gui-windows-x86_64.exe

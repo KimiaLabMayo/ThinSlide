@@ -1,16 +1,36 @@
-// build.rs
 fn main() {
-    // Try pkg-config first (works on Linux and macOS with pkg-config installed).
-    if pkg_config::probe_library("libtiff-4").is_ok() {
+    let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+    let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
+
+    // Highest priority: explicit env var (used by CI for musl/Windows builds).
+    if let Ok(lib_dir) = std::env::var("TIFF_LIB_DIR") {
+        println!("cargo:rustc-link-search=native={lib_dir}");
+        if std::env::var("TIFF_STATIC").is_ok() {
+            println!("cargo:rustc-link-lib=static=tiff");
+        } else {
+            println!("cargo:rustc-link-lib=tiff");
+        }
         return;
     }
 
-    // Fallback: Homebrew on Apple Silicon / Intel macOS.
-    for path in &["/opt/homebrew/lib", "/usr/local/lib"] {
-        if std::path::Path::new(path).exists() {
-            println!("cargo:rustc-link-search=native={}", path);
-            break;
+    // pkg-config (Linux glibc and macOS with pkg-config installed).
+    if target_env != "musl" && target_env != "msvc" {
+        if pkg_config::probe_library("libtiff-4").is_ok() {
+            return;
         }
     }
-    println!("cargo:rustc-link-lib=tiff");
+
+    // Fallback: Homebrew on Apple Silicon / Intel macOS.
+    if target_os == "macos" {
+        for path in &["/opt/homebrew/lib", "/usr/local/lib"] {
+            if std::path::Path::new(path).exists() {
+                println!("cargo:rustc-link-search=native={path}");
+                break;
+            }
+        }
+        println!("cargo:rustc-link-lib=tiff");
+        return;
+    }
+
+    panic!("libtiff not found. Set TIFF_LIB_DIR (and TIFF_STATIC for static linkage).");
 }
