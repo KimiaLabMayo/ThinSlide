@@ -103,6 +103,50 @@ pub(crate) fn generate_dicom_ome_xml(metadata_list: &[DcmMetadata]) -> String {
     )
 }
 
+/// Replace the first occurrence of `attr="..."` (word-boundary aware) in `xml`.
+fn replace_xml_attr(xml: &str, attr: &str, new_val: &str) -> String {
+    let needle = format!("{}=\"", attr);
+    let bytes  = xml.as_bytes();
+    let nb     = needle.as_bytes();
+    let mut pos = 0usize;
+    while pos + nb.len() <= bytes.len() {
+        if bytes[pos..].starts_with(nb) {
+            let before_ok = pos == 0
+                || (!bytes[pos - 1].is_ascii_alphanumeric() && bytes[pos - 1] != b'_');
+            if before_ok {
+                let val_start = pos + nb.len();
+                if let Some(end) = xml[val_start..].find('"') {
+                    let val_end = val_start + end;
+                    let mut result = xml.to_string();
+                    result.replace_range(val_start..val_end, new_val);
+                    return result;
+                }
+            }
+        }
+        pos += 1;
+    }
+    xml.to_string()
+}
+
+/// Update an existing OME-XML string with new output dimensions and physical size.
+/// Preserves all other metadata (Image name, Channel info, Instrument, etc.).
+pub(crate) fn update_ome_xml_for_output(
+    original: &str,
+    new_width: u32, new_height: u32,
+    new_mpp_x: f64, new_mpp_y: f64,
+) -> String {
+    let mut xml = original.to_string();
+    xml = replace_xml_attr(&xml, "SizeX",           &new_width.to_string());
+    xml = replace_xml_attr(&xml, "SizeY",           &new_height.to_string());
+    xml = replace_xml_attr(&xml, "PhysicalSizeX",   &format!("{new_mpp_x:.6}"));
+    xml = replace_xml_attr(&xml, "PhysicalSizeY",   &format!("{new_mpp_y:.6}"));
+    xml = replace_xml_attr(&xml, "PhysicalSizeXUnit", "µm");
+    xml = replace_xml_attr(&xml, "PhysicalSizeYUnit", "µm");
+    // Reset TiffData IFD to 0 (main image is always at IFD 0 in our output)
+    xml = replace_xml_attr(&xml, "IFD", "0");
+    xml
+}
+
 /// Build an OME-XML string for a TIFF/SVS-derived pyramid (simpler form without DICOM UUID).
 pub(crate) fn generate_tiff_ome_xml(
     name: &str,

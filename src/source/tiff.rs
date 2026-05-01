@@ -49,6 +49,7 @@ pub struct TiffSource {
     levels:     Vec<TiffLevel>,
     level_info: Vec<LevelInfo>,
     icc:        Option<Vec<u8>>,
+    pub ome_xml: Option<String>,
     metadata:   SlideMetadata,
 }
 
@@ -58,8 +59,26 @@ impl TiffSource {
         let mode_c  = CString::new("r").ok()?;
         let tiff = unsafe { TIFFOpen(path_c.as_ptr(), mode_c.as_ptr()) };
         if tiff.is_null() { return None; }
-        let levels = collect_pyramid_levels(tiff);
-        let icc    = read_icc_profile(tiff, &levels);
+        let mut levels = collect_pyramid_levels(tiff);
+        let icc     = read_icc_profile(tiff, &levels);
+        let ome_xml = read_ome_xml_str(tiff, &levels);
+
+        // OME-XML mpp fallback when TIFF resolution tags are absent
+        if !levels.is_empty() && levels[0].mpp_x <= 0.0 {
+            if let Some(ref xml) = ome_xml {
+                if let Some((mx, my)) = parse_mpp_from_ome_xml(xml) {
+                    let base_w = levels[0].img_w as f64;
+                    let base_h = levels[0].img_h as f64;
+                    levels[0].mpp_x = mx;
+                    levels[0].mpp_y = my;
+                    for lv in levels.iter_mut().skip(1) {
+                        if lv.img_w > 0 { lv.mpp_x = mx * base_w / lv.img_w as f64; }
+                        if lv.img_h > 0 { lv.mpp_y = my * base_h / lv.img_h as f64; }
+                    }
+                }
+            }
+        }
+
         unsafe { TIFFClose(tiff); }
         if levels.is_empty() { return None; }
         let name = std::path::Path::new(path)
@@ -71,12 +90,13 @@ impl TiffSource {
             levels,
             level_info,
             icc,
+            ome_xml,
             metadata: SlideMetadata { name },
         })
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<TiffLevel>, Option<Vec<u8>>, SlideMetadata) {
-        (self.levels, self.icc, self.metadata)
+    pub(crate) fn into_parts(self) -> (Vec<TiffLevel>, Option<Vec<u8>>, Option<String>, SlideMetadata) {
+        (self.levels, self.icc, self.ome_xml, self.metadata)
     }
 }
 
@@ -233,6 +253,68 @@ fn parse_mpp_from_image_description(tiff: *mut TIFF) -> Option<f64> {
                 if mpp > 0.0 { return Some(mpp); }
             }
         }
+    }
+    None
+}
+
+fn read_ome_xml_str(tiff: *mut TIFF, levels: &[TiffLevel]) -> Option<String> {
+    if levels.is_empty() { return None; }
+    unsafe { navigate(tiff, 0, levels); }
+    let mut desc_ptr: *const std::os::raw::c_char = std::ptr::null();
+    let ok = unsafe {
+        TIFFGetField(tiff, TIFFTAG_IMAGEDESCRIPTION,
+            &mut desc_ptr as *mut *const std::os::raw::c_char)
+    };
+    if ok == 0 || desc_ptr.is_null() { return None; }
+    let desc = unsafe { std::ffi::CStr::from_ptr(desc_ptr) }.to_string_lossy().to_string();
+    if desc.contains("openmicroscopy.org") || (desc.contains("<OME") && desc.contains("xmlns")) {
+        Some(desc)
+    } else {
+        None
+    }
+}
+
+/// Parse PhysicalSizeX/Y attributes from OME-XML and return (mpp_x, mpp_y) in µm.
+fn parse_mpp_from_ome_xml(xml: &str) -> Option<(f64, f64)> {
+    let px: f64 = extract_xml_attr(xml, "PhysicalSizeX")?.parse().ok()?;
+    let py: f64 = extract_xml_attr(xml, "PhysicalSizeY")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(px);
+    if px <= 0.0 || py <= 0.0 { return None; }
+    let ux = extract_xml_attr(xml, "PhysicalSizeXUnit").unwrap_or_else(|| "µm".to_string());
+    let uy = extract_xml_attr(xml, "PhysicalSizeYUnit").unwrap_or_else(|| "µm".to_string());
+    Some((to_um(px, &ux)?, to_um(py, &uy)?))
+}
+
+fn to_um(val: f64, unit: &str) -> Option<f64> {
+    match unit {
+        "µm" | "um" | "μm" | "micron" => Some(val),
+        "nm"                           => Some(val / 1000.0),
+        "mm"                           => Some(val * 1000.0),
+        "cm"                           => Some(val * 10_000.0),
+        "m"                            => Some(val * 1_000_000.0),
+        _                              => None,
+    }
+}
+
+/// Extract the value of the first XML attribute matching `attr="..."` with word-boundary check.
+fn extract_xml_attr(xml: &str, attr: &str) -> Option<String> {
+    let needle = format!("{}=\"", attr);
+    let bytes  = xml.as_bytes();
+    let nb     = needle.as_bytes();
+    let mut pos = 0usize;
+    while pos + nb.len() <= bytes.len() {
+        if bytes[pos..].starts_with(nb) {
+            let before_ok = pos == 0
+                || (!bytes[pos - 1].is_ascii_alphanumeric() && bytes[pos - 1] != b'_');
+            if before_ok {
+                let val_start = pos + nb.len();
+                if let Some(end) = xml[val_start..].find('"') {
+                    return Some(xml[val_start..val_start + end].to_string());
+                }
+            }
+        }
+        pos += 1;
     }
     None
 }

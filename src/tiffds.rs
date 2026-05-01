@@ -167,8 +167,13 @@ pub(crate) fn process_files(
         let src_path = path.to_string_lossy().to_string();
         let src_name = path.file_name().unwrap_or_default()
             .to_string_lossy().to_string();
-        let src_stem = path.file_stem().unwrap_or_default()
-            .to_string_lossy().to_string();
+        let raw_stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        // Strip ".ome" suffix so foo.ome.tiff → stem "foo", output "foo.ome.tiff"
+        let src_stem = if raw_stem.ends_with(".ome") {
+            raw_stem[..raw_stem.len() - 4].to_string()
+        } else {
+            raw_stem.to_string()
+        };
 
         let already_exists = [
             format!("{}.tiff",     src_stem),
@@ -301,6 +306,7 @@ fn process_file_icc_bake_only(
     args:       &crate::Args,
     icc_xform:  Arc<crate::IccTransform>,
     src_levels: &[TiffLevel],
+    ome_xml:    Option<&str>,
     pb:         &ProgressBar,
 ) {
     let out_path = if args.legacy {
@@ -318,15 +324,16 @@ fn process_file_icc_bake_only(
     let out_spp: u32 = if base.spp >= 3 { 3 } else { 1 };
     let out_photometric = if out_spp == 1 { PHOTOMETRIC_MINISBLACK } else { PHOTOMETRIC_YCBCR };
 
-    let file_stem = Path::new(src_path).file_stem()
-        .unwrap_or_default().to_string_lossy().to_string();
     let image_desc_c: Option<CString> = if ome {
-        let xml = crate::pipeline::ome::generate_tiff_ome_xml(
-            &file_stem,
-            base.img_w, base.img_h,
-            base.mpp_x, base.mpp_y,
-            out_spp,
-        );
+        let xml = if let Some(orig) = ome_xml {
+            crate::pipeline::ome::update_ome_xml_for_output(
+                orig, base.img_w, base.img_h, base.mpp_x, base.mpp_y,
+            )
+        } else {
+            crate::pipeline::ome::generate_tiff_ome_xml(
+                out_stem, base.img_w, base.img_h, base.mpp_x, base.mpp_y, out_spp,
+            )
+        };
         Some(CString::new(xml).unwrap())
     } else {
         None
@@ -587,7 +594,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         eprintln!("  [error] Cannot open: {src_path}");
         return;
     };
-    let (mut src_levels, icc_profile, _meta) = src.into_parts();
+    let (mut src_levels, icc_profile, ome_xml, _meta) = src.into_parts();
 
     if src_levels.is_empty() {
         eprintln!("  [warn] No tiled pyramid found in: {src_path}");
@@ -613,7 +620,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             if args.verbose {
                 vlog(Some(pb), format!("  [icc  ] baking {} bytes → sRGB", icc.len()));
             }
-            process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, pb);
+            process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb);
         } else {
             eprintln!("  [error] Invalid ICC profile in {src_path}; skipping.");
         }
@@ -658,7 +665,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                 if args.icc_bake {
                     let icc = icc_profile.as_deref().unwrap();
                     if let Some(xform) = crate::build_icc_transform(icc) {
-                        process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, pb);
+                        process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb);
                     } else {
                         eprintln!("  [error] Invalid ICC profile in {src_path}; skipping.");
                     }
@@ -722,18 +729,24 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         .sum();
     pb.set_length(total_tiles);
 
-    let file_stem = Path::new(src_path).file_stem()
-        .unwrap_or_default().to_string_lossy().to_string();
     let ome = !args.legacy;
 
     let base_lv = &output_levels[0];
     let image_desc_c: Option<CString> = if ome {
-        let xml = crate::pipeline::ome::generate_tiff_ome_xml(
-            &file_stem,
-            base_lv.out_img_w, base_lv.out_img_h,
-            base_lv.actual_mpp_x, base_lv.actual_mpp_y,
-            src_levels[base_lv.src_idx].spp as u32,
-        );
+        let xml = if let Some(ref orig) = ome_xml {
+            crate::pipeline::ome::update_ome_xml_for_output(
+                orig,
+                base_lv.out_img_w, base_lv.out_img_h,
+                base_lv.actual_mpp_x, base_lv.actual_mpp_y,
+            )
+        } else {
+            crate::pipeline::ome::generate_tiff_ome_xml(
+                out_stem,
+                base_lv.out_img_w, base_lv.out_img_h,
+                base_lv.actual_mpp_x, base_lv.actual_mpp_y,
+                src_levels[base_lv.src_idx].spp as u32,
+            )
+        };
         Some(CString::new(xml).unwrap())
     } else {
         None

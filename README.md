@@ -1,5 +1,5 @@
 # SlideLeaner (slean)
-**A high-speed WSI optimizer for DICOM/TIFF/SVS.**
+**A high-speed WSI optimizer for DICOM/TIFF/SVS/OME-TIFF.**
 
 ## Key Use Cases: Why use SlideLeaner?
 
@@ -15,7 +15,7 @@
 
 ### 3. Color correction with ICC profiles (`--icc-bake`)
 * **Problem**: WSI colors look inconsistent in AI scripts, web browsers, or non-specialized viewers.
-* **Solution**: Bakes ICC profiles directly into pixel data (supports DICOM, TIFF, and SVS).
+* **Solution**: Bakes ICC profiles directly into pixel data (supports DICOM, TIFF, SVS, and OME-TIFF).
 * **Benefit**: Consistent color in any environment.
 
 ---
@@ -49,7 +49,11 @@ slean <input_dir> <output_dir> [OPTIONS]
 | Source file type | Condition | Output |
 |---|---|---|
 | DICOM (`.dcm`) | always | OME-TIFF (or BigTIFF/SVS with `--legacy`) |
-| TIFF / SVS | `--mpp` or `--half` required | OME-TIFF (or BigTIFF with `--legacy`) |
+| TIFF / SVS (`.tiff`, `.svs`) | `--mpp`, `--half`, or `--icc-bake` required | OME-TIFF (or BigTIFF with `--legacy`) |
+| OME-TIFF (`.ome.tiff`) | `--mpp`, `--half`, or `--icc-bake` required | OME-TIFF with original metadata preserved |
+
+OME-TIFF input is detected by the presence of an OME-XML `ImageDescription` tag (namespace `openmicroscopy.org`), regardless of file extension.
+When the source is an OME-TIFF, the output OME-XML inherits all original metadata (Image name, Channel info, Instrument, etc.) and updates only the dimensions and physical pixel size.
 
 
 ### Output formats
@@ -60,7 +64,8 @@ By default the output is OME-TIFF. Pass `--legacy` to select a format based on t
 |---|---|---|---|
 | DICOM JPEG | OME-TIFF | BigTIFF | OME-TIFF (or BigTIFF with `--legacy`) |
 | DICOM JPEG 2000 | OME-TIFF | Aperio SVS | OME-TIFF (or BigTIFF with `--legacy`) |
-| TIFF/SVS (any) | — | — | OME-TIFF (or BigTIFF with `--legacy`) |
+| TIFF / SVS (any) | — | — | OME-TIFF (or BigTIFF with `--legacy`) |
+| OME-TIFF | — | — | OME-TIFF with inherited metadata (or BigTIFF with `--legacy`) |
 
 ### Options
 
@@ -94,14 +99,17 @@ slean /data/slides /data/output --mpp 1.0 --filter lanczos3 --quality 90 -j 4
 # Halve width and height (fastest for JPEG sources: DCT-domain 1/2 decode + no resize)
 slean /data/slides /data/output --half
 
-# Bake ICC profile into pixels and write sRGB JPEG output without ICC tag (DICOM only)
-slean /data/dicoms /data/output --icc-bake
+# Bake ICC profile into pixels and write sRGB JPEG output without ICC tag
+slean /data/slides /data/output --icc-bake
 
 # ICC bake combined with downsampling to 0.5 µm/px
-slean /data/dicoms /data/output --icc-bake --mpp 0.5
+slean /data/slides /data/output --icc-bake --mpp 0.5
 
-# Mixed directory: DICOM passthrough + TIFF/SVS downsampled to 2.0 µm/px
+# Mixed directory: DICOM passthrough + TIFF/SVS/OME-TIFF downsampled to 2.0 µm/px
 slean /data/mixed /data/output --mpp 2.0
+
+# Downsample an OME-TIFF to 0.5 µm/px, preserving original OME-XML metadata
+slean /data/ome /data/output --mpp 0.5
 ```
 
 ### Parallelism
