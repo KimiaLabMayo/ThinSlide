@@ -208,8 +208,8 @@ impl eframe::App for App {
 
             ui.horizontal(|ui| {
                 ui.label("Output format:");
-                ui.radio_value(&mut self.legacy, true, "OME-TIFF");
-                ui.radio_value(&mut self.legacy, false, "generic tiff/svs, openslide-compatible");
+                ui.radio_value(&mut self.legacy, false, "OME-TIFF");
+                ui.radio_value(&mut self.legacy, true, "generic tiff/svs, openslide-compatible");
             });
 
             ui.horizontal(|ui| {
