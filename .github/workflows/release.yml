@@ -73,7 +73,7 @@ jobs:
       - name: Verify static binary
         run: |
           file target/x86_64-unknown-linux-musl/release/slean
-          ldd target/x86_64-unknown-linux-musl/release/slean 2>&1 | grep -q "not a dynamic executable"
+          ldd target/x86_64-unknown-linux-musl/release/slean 2>&1 | grep -qE "not a dynamic executable|statically linked"
           echo "OK: binary is statically linked"
 
       - name: Rename artifact
