@@ -169,6 +169,7 @@ jobs:
         env:
           TIFF_LIB_DIR: C:\tiff-static\lib
           TIFF_STATIC: "1"
+          ZLIB_LIB_DIR: C:\vcpkg\installed\x64-windows-static-md\lib
           TURBOJPEG_SOURCE: vendor
           TURBOJPEG_STATIC: "1"
         run: cargo build --release --bin slean --bin slean-gui

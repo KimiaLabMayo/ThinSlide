@@ -118,7 +118,7 @@ impl Default for App {
             "  • Downsampling  (half / 20x / 10x)\n",
             "  • ICC profile baking  (converts to sRGB, removes embedded profile)\n",
             "\n",
-            "Supported input formats:  DICOM, SVS, TIFF\n",
+            "Supported input formats:  DICOM, SVS, TIFF, OME-TIFF\n",
             "Output formats:           OME-TIFF, generic TIFF/SVS (OpenSlide-compatible)\n",
             "\n",
             "Select input/output folders above, configure options, then click ▶ Run.\n",

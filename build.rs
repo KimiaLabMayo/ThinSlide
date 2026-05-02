@@ -7,6 +7,14 @@ fn main() {
         println!("cargo:rustc-link-search=native={lib_dir}");
         if std::env::var("TIFF_STATIC").is_ok() {
             println!("cargo:rustc-link-lib=static=tiff");
+            // libtiff's ZIP and PixarLog codecs depend on zlib; link it explicitly.
+            let zlib_dir = std::env::var("ZLIB_LIB_DIR").unwrap_or(lib_dir);
+            println!("cargo:rustc-link-search=native={zlib_dir}");
+            if target_os == "windows" {
+                println!("cargo:rustc-link-lib=static=zlib");
+            } else {
+                println!("cargo:rustc-link-lib=static=z");
+            }
         } else {
             println!("cargo:rustc-link-lib=tiff");
         }
