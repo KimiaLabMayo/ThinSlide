@@ -340,179 +340,176 @@ pub(crate) fn write_flat_multipage_tiff(
         .sum();
     if let Some(p) = pb { p.set_length(total_tiles); }
 
-    unsafe {
-        let tiff = TIFFOpen(
-            CString::new(output_path).unwrap().as_ptr(),
-            CString::new("w8").unwrap().as_ptr(),
-        );
-        assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
+    let output_path_c = CString::new(output_path).unwrap();
+    let w8_mode_c     = CString::new("w8").unwrap();
+    let tiff = unsafe { TIFFOpen(output_path_c.as_ptr(), w8_mode_c.as_ptr()) };
+    assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
 
-        let mut icc_written = false;
-        for (group_idx, group) in groups.iter().enumerate() {
-            let metadata  = group[0];
-            // Skip resolution levels where the entire image fits in a single tile
-            // (tile_size == None means tile dimensions equal image dimensions).
-            // Such levels provide no pyramid benefit and can have non-16-aligned
-            // dimensions that libtiff rejects for JPEG tiles.
-            if metadata.tile_size.is_none() {
-                if verbose {
-                    vlog(pb, format!("  [skip ] lv{}  {}x{}  no tile size",
-                        group_idx,
-                        metadata.px_columns.unwrap_or(0),
-                        metadata.px_rows.unwrap_or(0)));
-                }
-                continue;
-            }
-            let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
-
-            let ifd_width  = metadata.px_columns.unwrap_or(0);
-            let ifd_height = metadata.px_rows.unwrap_or(0);
-            let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
-
-            let color_space = infer_color_space(&first_dcm);
-            let baking = icc_transform.is_some() && !matches!(color_space, ColorSpace::Grayscale);
-            let photometric = if baking {
-                PHOTOMETRIC_YCBCR  // turbojpeg re-encodes as YCbCr JFIF
-            } else {
-                match color_space {
-                    ColorSpace::RGB       => PHOTOMETRIC_RGB,
-                    ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
-                    ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
-                }
-            };
-
-            let ts_uid      = first_dcm.meta().transfer_syntax();
-            let compression = tiff_compression_tag(ts_uid);
-
-            // For JPEG passthrough, libtiff checks that the JPEG SOF header dimensions match the TIFF tile declaration.
-            // If tiles are not multiples of 16, this mismatch causes an error, so we skip these levels.
-            if compression == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
-                if verbose {
-                    vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
-                        group_idx, ifd_width, ifd_height, tile_w, tile_h));
-                }
-                continue;
-            }
-
-            let mpp = metadata.mpp_x.unwrap_or(0.25);
-
-            let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+    let mut icc_written = false;
+    for (group_idx, group) in groups.iter().enumerate() {
+        let metadata  = group[0];
+        // Skip resolution levels where the entire image fits in a single tile
+        // (tile_size == None means tile dimensions equal image dimensions).
+        // Such levels provide no pyramid benefit and can have non-16-aligned
+        // dimensions that libtiff rejects for JPEG tiles.
+        if metadata.tile_size.is_none() {
             if verbose {
-                let tag = if baking { "bake " } else { "pass " };
-                vlog(pb, format!("  [{}] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                    tag, group_idx, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+                vlog(pb, format!("  [skip ] lv{}  {}x{}  no tile size",
+                    group_idx,
+                    metadata.px_columns.unwrap_or(0),
+                    metadata.px_rows.unwrap_or(0)));
             }
-
-            let subfile_type: u32 = if group_idx == 0 { 0 } else { FILETYPE_REDUCEDIMAGE };
-            set_tiff_ifd_tags(tiff, subfile_type,
-                ifd_width, ifd_height, tile_w, tile_h,
-                compression, photometric, 3,
-                mpp, mpp);
-
-            if baking {
-                // Baked tiles are re-encoded with turbojpeg Sub2x2 (4:2:0).
-                TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
-            } else if matches!(color_space, ColorSpace::YCbCr) {
-                // For YCbCr JPEG passthrough, detect actual subsampling from the first tile so
-                // the TIFF tag matches the JPEG payload (otherwise libtiff defaults
-                // to [2,2] regardless of the stream content, confusing QuPath).
-                let frags_tmp = pixel_fragments(&first_dcm);
-                if let Some(first) = frags_tmp.iter().find(|f| !f.is_empty()) {
-                    if let Some((h, v)) = detect_jpeg_subsampling(first) {
-                        TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
-                    }
-                }
-            }
-
-            if !icc_written {
-                if !baking {
-                    if let Some(ref icc) = icc_profile {
-                        TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                            icc.len() as u32, icc.as_ptr() as *const c_void);
-                    }
-                }
-                icc_written = true;
-            }
-
-            drop(first_dcm);
-
-            // Write tiles from every DICOM file in this resolution group.
-            // When baking: encode tiles in parallel per-file, then write serially.
-            // Otherwise: passthrough raw bytes with JPEGTABLES optimisation.
-            let mut registered_tables: Option<Vec<u8>> = None;
-            for dcm_meta in group.iter() {
-                let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
-                let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-                let fragments    = pixel_fragments(&dicom_obj);
-
-                if baking && compression == 7 {
-                    let xf = icc_transform.as_deref().unwrap();
-                    let frags: Vec<(u32, &[u8])> = fragments.iter().enumerate()
-                        .filter(|(_, f)| !f.is_empty())
-                        .map(|(i, f)| (tile_indices.get(i).copied().unwrap_or(i as u32), f.as_slice()))
-                        .collect();
-                    let mut encoded: Vec<(u32, Vec<u8>)> = frags.par_iter()
-                        .filter_map(|(tile_num, frag)| {
-                            let jpeg = bake_jpeg_tile(frag, xf, quality,
-                                tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize)?;
-                            Some((*tile_num, jpeg))
-                        })
-                        .collect();
-                    encoded.sort_unstable_by_key(|(n, _)| *n);
-                    for (tile_num, jpeg) in &encoded {
-                        let split = split_jpeg_to_tables_and_tile(jpeg);
-                        let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
-                            match registered_tables {
-                                None => {
-                                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                        tables.len() as u32, tables.as_ptr());
-                                    registered_tables = Some(tables.clone());
-                                    tile_data.as_slice()
-                                }
-                                Some(ref rt) if rt == tables => tile_data.as_slice(),
-                                _ => jpeg.as_slice(),
-                            }
-                        } else {
-                            jpeg.as_slice()
-                        };
-                        TIFFWriteRawTile(tiff, *tile_num,
-                            write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
-                    }
-                } else {
-                    for (frag_idx, fragment) in fragments.iter().enumerate() {
-                        if fragment.is_empty() { continue; }
-                        let tile_num = tile_indices.get(frag_idx).copied()
-                            .unwrap_or(frag_idx as u32);
-                        let split = (compression == 7)
-                            .then(|| split_jpeg_to_tables_and_tile(fragment))
-                            .flatten();
-                        let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
-                            match registered_tables {
-                                None => {
-                                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                        tables.len() as u32, tables.as_ptr());
-                                    registered_tables = Some(tables.clone());
-                                    tile_data.as_slice()
-                                }
-                                Some(ref rt) if rt == tables => tile_data.as_slice(),
-                                // Different DQT/DHT tables — write self-contained JPEG
-                                _ => fragment.as_slice(),
-                            }
-                        } else {
-                            fragment.as_slice()
-                        };
-                        TIFFWriteRawTile(tiff, tile_num,
-                            write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
-                    }
-                }
-            }
-
-            TIFFWriteDirectory(tiff);
-            let group_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
-            if let Some(p) = pb { p.inc(group_tiles); }
+            continue;
         }
-        TIFFClose(tiff);
+        let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
+
+        let ifd_width  = metadata.px_columns.unwrap_or(0);
+        let ifd_height = metadata.px_rows.unwrap_or(0);
+        let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
+
+        let color_space = infer_color_space(&first_dcm);
+        let baking = icc_transform.is_some() && !matches!(color_space, ColorSpace::Grayscale);
+        let photometric = if baking {
+            PHOTOMETRIC_YCBCR  // turbojpeg re-encodes as YCbCr JFIF
+        } else {
+            match color_space {
+                ColorSpace::RGB       => PHOTOMETRIC_RGB,
+                ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
+                ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
+            }
+        };
+
+        let ts_uid      = first_dcm.meta().transfer_syntax();
+        let compression = tiff_compression_tag(ts_uid);
+
+        // For JPEG passthrough, libtiff checks that the JPEG SOF header dimensions match the TIFF tile declaration.
+        // If tiles are not multiples of 16, this mismatch causes an error, so we skip these levels.
+        if compression == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
+            if verbose {
+                vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
+                    group_idx, ifd_width, ifd_height, tile_w, tile_h));
+            }
+            continue;
+        }
+
+        let mpp = metadata.mpp_x.unwrap_or(0.25);
+
+        let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+        if verbose {
+            let tag = if baking { "bake " } else { "pass " };
+            vlog(pb, format!("  [{}] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                tag, group_idx, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+        }
+
+        let subfile_type: u32 = if group_idx == 0 { 0 } else { FILETYPE_REDUCEDIMAGE };
+        unsafe { set_tiff_ifd_tags(tiff, subfile_type,
+            ifd_width, ifd_height, tile_w, tile_h,
+            compression, photometric, 3,
+            mpp, mpp); }
+
+        if baking {
+            // Baked tiles are re-encoded with turbojpeg Sub2x2 (4:2:0).
+            unsafe { TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32); }
+        } else if matches!(color_space, ColorSpace::YCbCr) {
+            // For YCbCr JPEG passthrough, detect actual subsampling from the first tile so
+            // the TIFF tag matches the JPEG payload (otherwise libtiff defaults
+            // to [2,2] regardless of the stream content, confusing QuPath).
+            let frags_tmp = pixel_fragments(&first_dcm);
+            if let Some(first) = frags_tmp.iter().find(|f| !f.is_empty()) {
+                if let Some((h, v)) = detect_jpeg_subsampling(first) {
+                    unsafe { TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32); }
+                }
+            }
+        }
+
+        if !icc_written {
+            if !baking {
+                if let Some(ref icc) = icc_profile {
+                    unsafe { TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                        icc.len() as u32, icc.as_ptr() as *const c_void); }
+                }
+            }
+            icc_written = true;
+        }
+
+        drop(first_dcm);
+
+        // Write tiles from every DICOM file in this resolution group.
+        // When baking: encode tiles in parallel per-file, then write serially.
+        // Otherwise: passthrough raw bytes with JPEGTABLES optimisation.
+        let mut registered_tables: Option<Vec<u8>> = None;
+        for dcm_meta in group.iter() {
+            let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+            let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
+            let fragments    = pixel_fragments(&dicom_obj);
+
+            if baking && compression == 7 {
+                let xf = icc_transform.as_deref().unwrap();
+                let frags: Vec<(u32, &[u8])> = fragments.iter().enumerate()
+                    .filter(|(_, f)| !f.is_empty())
+                    .map(|(i, f)| (tile_indices.get(i).copied().unwrap_or(i as u32), f.as_slice()))
+                    .collect();
+                let mut encoded: Vec<(u32, Vec<u8>)> = frags.par_iter()
+                    .filter_map(|(tile_num, frag)| {
+                        let jpeg = bake_jpeg_tile(frag, xf, quality,
+                            tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize)?;
+                        Some((*tile_num, jpeg))
+                    })
+                    .collect();
+                encoded.sort_unstable_by_key(|(n, _)| *n);
+                for (tile_num, jpeg) in &encoded {
+                    let split = split_jpeg_to_tables_and_tile(jpeg);
+                    let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                        match registered_tables {
+                            None => {
+                                unsafe { TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                    tables.len() as u32, tables.as_ptr()); }
+                                registered_tables = Some(tables.clone());
+                                tile_data.as_slice()
+                            }
+                            Some(ref rt) if rt == tables => tile_data.as_slice(),
+                            _ => jpeg.as_slice(),
+                        }
+                    } else {
+                        jpeg.as_slice()
+                    };
+                    unsafe { TIFFWriteRawTile(tiff, *tile_num,
+                        write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64); }
+                }
+            } else {
+                for (frag_idx, fragment) in fragments.iter().enumerate() {
+                    if fragment.is_empty() { continue; }
+                    let tile_num = tile_indices.get(frag_idx).copied()
+                        .unwrap_or(frag_idx as u32);
+                    let split = (compression == 7)
+                        .then(|| split_jpeg_to_tables_and_tile(fragment))
+                        .flatten();
+                    let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                        match registered_tables {
+                            None => {
+                                unsafe { TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                    tables.len() as u32, tables.as_ptr()); }
+                                registered_tables = Some(tables.clone());
+                                tile_data.as_slice()
+                            }
+                            Some(ref rt) if rt == tables => tile_data.as_slice(),
+                            // Different DQT/DHT tables — write self-contained JPEG
+                            _ => fragment.as_slice(),
+                        }
+                    } else {
+                        fragment.as_slice()
+                    };
+                    unsafe { TIFFWriteRawTile(tiff, tile_num,
+                        write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64); }
+                }
+            }
+        }
+
+        unsafe { TIFFWriteDirectory(tiff); }
+        let group_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+        if let Some(p) = pb { p.inc(group_tiles); }
     }
+    unsafe { TIFFClose(tiff); }
 }
 
 /// Round `v` up to the nearest multiple of `align`.
@@ -572,268 +569,266 @@ pub(crate) fn write_ome_tiff(
     // Exclude single-tile levels (tile_size == None) as they are skipped below.
     let n_subifds = groups[1..].iter().filter(|g| g[0].tile_size.is_some()).count();
 
-    unsafe {
-        let tiff = TIFFOpen(
-            CString::new(output_path).unwrap().as_ptr(),
-            CString::new("w8").unwrap().as_ptr(), // BigTIFF
-        );
-        assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
+    let output_path_c = CString::new(output_path).unwrap();
+    let w8_mode_c     = CString::new("w8").unwrap();
+    let tiff = unsafe { TIFFOpen(output_path_c.as_ptr(), w8_mode_c.as_ptr()) }; // BigTIFF
+    assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
 
-        // ── IFD 0: Full resolution (main chain) ───────────────────────────
-        {
-            let group     = &groups[0];
-            let metadata  = group[0];
-            let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
+    // ── IFD 0: Full resolution (main chain) ───────────────────────────
+    {
+        let group     = &groups[0];
+        let metadata  = group[0];
+        let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
 
-            let ifd_width  = metadata.px_columns.unwrap_or(0);
-            let ifd_height = metadata.px_rows.unwrap_or(0);
-            let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
+        let ifd_width  = metadata.px_columns.unwrap_or(0);
+        let ifd_height = metadata.px_rows.unwrap_or(0);
+        let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
 
-            let color_space  = infer_color_space(&first_dcm);
-            let icc_profile  = extract_icc_profile(&first_dcm);
-            let icc_transform = log_icc_and_build_transform(icc_profile.as_deref(), icc_bake, pb, verbose);
-            let jp2k_has_ict_rct = first_dcm.element_by_name("PhotometricInterpretation")
-                .ok().and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
-                .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT" | "YBR_FULL" | "YBR_FULL_422"))
-                .unwrap_or(false);
-            let baking = icc_transform.is_some() && !matches!(color_space, ColorSpace::Grayscale);
-            let photometric = if baking {
-                PHOTOMETRIC_YCBCR
-            } else {
-                match color_space {
-                    ColorSpace::RGB       => PHOTOMETRIC_RGB,
-                    ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
-                    ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
-                }
-            };
-            let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
-
-            let ts_uid = first_dcm.meta().transfer_syntax();
-            let compr  = tiff_compression_tag(ts_uid);
-            let mpp    = metadata.mpp_x.unwrap_or(0.25);
-
-            if verbose {
-                let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
-                let tag = if baking { "bake " } else { "pass " };
-                vlog(pb, format!("  [{}] lv0  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                    tag, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+        let color_space  = infer_color_space(&first_dcm);
+        let icc_profile  = extract_icc_profile(&first_dcm);
+        let icc_transform = log_icc_and_build_transform(icc_profile.as_deref(), icc_bake, pb, verbose);
+        let jp2k_has_ict_rct = first_dcm.element_by_name("PhotometricInterpretation")
+            .ok().and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
+            .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT" | "YBR_FULL" | "YBR_FULL_422"))
+            .unwrap_or(false);
+        let baking = icc_transform.is_some() && !matches!(color_space, ColorSpace::Grayscale);
+        let photometric = if baking {
+            PHOTOMETRIC_YCBCR
+        } else {
+            match color_space {
+                ColorSpace::RGB       => PHOTOMETRIC_RGB,
+                ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
+                ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
             }
+        };
+        let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
 
-            // Declare the SubIFD chain BEFORE calling TIFFWriteDirectory.
-            // libtiff copies the offset array; we only need it alive until
-            // TIFFSetField returns.  The actual offsets are back-patched by
-            // libtiff when it writes each SubIFD.
-            if n_subifds > 0 {
-                let subifd_offsets: Vec<u64> = vec![0u64; n_subifds];
-                TIFFSetField(tiff, TIFFTAG_SUBIFD,
-                    n_subifds as u32, subifd_offsets.as_ptr());
-            }
+        let ts_uid = first_dcm.meta().transfer_syntax();
+        let compr  = tiff_compression_tag(ts_uid);
+        let mpp    = metadata.mpp_x.unwrap_or(0.25);
 
+        if verbose {
+            let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+            let tag = if baking { "bake " } else { "pass " };
+            vlog(pb, format!("  [{}] lv0  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                tag, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+        }
+
+        // Declare the SubIFD chain BEFORE calling TIFFWriteDirectory.
+        // libtiff copies the offset array; we only need it alive until
+        // TIFFSetField returns.  The actual offsets are back-patched by
+        // libtiff when it writes each SubIFD.
+        if n_subifds > 0 {
+            let subifd_offsets: Vec<u64> = vec![0u64; n_subifds];
+            unsafe { TIFFSetField(tiff, TIFFTAG_SUBIFD,
+                n_subifds as u32, subifd_offsets.as_ptr()); }
+        }
+
+        unsafe {
             set_tiff_ifd_tags(tiff, 0,
                 ifd_width, ifd_height, tile_w, tile_h,
                 if baking { 7u32 } else { compr }, photometric, spp,
                 mpp, mpp);
             // OME-XML in ImageDescription marks this as an OME-TIFF.
             TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, image_desc_c.as_ptr());
-
-            if baking {
-                TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
-            } else if matches!(color_space, ColorSpace::YCbCr) {
-                let frags_tmp = pixel_fragments(&first_dcm);
-                if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
-                    if let Some((h, v)) = detect_jpeg_subsampling(frag) {
-                        TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
-                    }
-                }
-            }
-
-            if !baking {
-                if let Some(ref icc) = icc_profile {
-                    TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                        icc.len() as u32, icc.as_ptr() as *const c_void);
-                }
-            }
-
-            drop(first_dcm);
-
-            let mut registered_tables_lv0: Option<Vec<u8>> = None;
-            for dcm_meta in group.iter() {
-                let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
-                let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-                let fragments    = pixel_fragments(&dicom_obj);
-                for (fi, fragment) in fragments.iter().enumerate() {
-                    if !fragment.is_empty() {
-                        let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
-                        let baked: Option<Vec<u8>> = if baking {
-                            if compr == 7 {
-                                icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality, tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize))
-                            } else {
-                                icc_transform.as_deref().and_then(|xf| bake_jp2k_tile(fragment, jp2k_has_ict_rct, xf, quality))
-                            }
-                        } else { None };
-                        let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
-                        let split = (if baking { true } else { compr == 7 })
-                            .then(|| split_jpeg_to_tables_and_tile(src_bytes))
-                            .flatten();
-                        let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
-                            match registered_tables_lv0 {
-                                None => {
-                                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                        tables.len() as u32, tables.as_ptr());
-                                    registered_tables_lv0 = Some(tables.clone());
-                                    tile_data.as_slice()
-                                }
-                                Some(ref rt) if rt == tables => tile_data.as_slice(),
-                                // Different DQT/DHT tables — write self-contained JPEG
-                                _ => src_bytes,
-                            }
-                        } else {
-                            src_bytes
-                        };
-                        TIFFWriteRawTile(tiff, tile_num,
-                            write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
-                    }
-                }
-            }
-
-            // Finalise IFD 0.  libtiff now knows to route the next n_subifds
-            // TIFFWriteDirectory calls into the SubIFD chain.
-            TIFFWriteDirectory(tiff);
-            let ifd0_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
-            if let Some(p) = pb { p.inc(ifd0_tiles); }
         }
 
-        // ── SubIFDs: pyramid sub-resolutions (chained from IFD 0) ─────────
-        // libtiff automatically routes the next n_subifds WriteDirectory calls
-        // to the SubIFD chain declared above.  No special API call needed here.
-        for (sub_idx, group) in groups[1..].iter().enumerate() {
-            let metadata  = group[0];
-            if metadata.tile_size.is_none() {
-                if verbose {
-                    vlog(pb, format!("  [skip ] lv{}  {}x{}  no tile size",
-                        sub_idx + 1,
-                        metadata.px_columns.unwrap_or(0),
-                        metadata.px_rows.unwrap_or(0)));
-                }
-                continue;
-            }
-            let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
-
-            let ifd_width  = metadata.px_columns.unwrap_or(0);
-            let ifd_height = metadata.px_rows.unwrap_or(0);
-            let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
-
-            let color_space = infer_color_space(&first_dcm);
-            let jp2k_has_ict_rct_sub = first_dcm.element_by_name("PhotometricInterpretation")
-                .ok().and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
-                .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT" | "YBR_FULL" | "YBR_FULL_422"))
-                .unwrap_or(false);
-            let sub_icc_transform: Option<Arc<IccTransform>> = if icc_bake {
-                extract_icc_profile(&first_dcm).and_then(|icc| build_icc_transform(&icc))
-            } else {
-                None
-            };
-            let baking_sub = sub_icc_transform.is_some() && !matches!(color_space, ColorSpace::Grayscale);
-            let photometric = if baking_sub {
-                PHOTOMETRIC_YCBCR
-            } else {
-                match color_space {
-                    ColorSpace::RGB       => PHOTOMETRIC_RGB,
-                    ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
-                    ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
-                }
-            };
-            let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
-
-            let ts_uid = first_dcm.meta().transfer_syntax();
-            let compr  = tiff_compression_tag(ts_uid);
-
-            // For JPEG passthrough, libtiff checks that JPEG SOF dimensions match the TIFF tile declaration.
-            if !baking_sub && compr == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
-                if verbose {
-                    vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
-                        sub_idx + 1, ifd_width, ifd_height, tile_w, tile_h));
-                }
-                drop(first_dcm);
-                continue;
-            }
-
-            let mpp = metadata.mpp_x.unwrap_or(0.25);
-
-            if verbose {
-                let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
-                let tag = if baking_sub { "bake " } else { "pass " };
-                vlog(pb, format!("  [{}] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                    tag, sub_idx + 1, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
-            }
-
-            set_tiff_ifd_tags(tiff, FILETYPE_REDUCEDIMAGE,
-                ifd_width, ifd_height, tile_w, tile_h,
-                if baking_sub { 7u32 } else { compr }, photometric, spp,
-                mpp, mpp);
-
-            if baking_sub {
-                TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
-            } else if matches!(color_space, ColorSpace::YCbCr) {
-                let frags_tmp = pixel_fragments(&first_dcm);
-                if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
-                    if let Some((h, v)) = detect_jpeg_subsampling(frag) {
-                        TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
-                    }
+        if baking {
+            unsafe { TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32); }
+        } else if matches!(color_space, ColorSpace::YCbCr) {
+            let frags_tmp = pixel_fragments(&first_dcm);
+            if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
+                if let Some((h, v)) = detect_jpeg_subsampling(frag) {
+                    unsafe { TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32); }
                 }
             }
-            drop(first_dcm);
-
-            let mut registered_tables_sub: Option<Vec<u8>> = None;
-            for dcm_meta in group.iter() {
-                let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
-                let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-                let fragments    = pixel_fragments(&dicom_obj);
-                for (fi, fragment) in fragments.iter().enumerate() {
-                    if !fragment.is_empty() {
-                        let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
-                        let baked: Option<Vec<u8>> = if baking_sub {
-                            if compr == 7 {
-                                sub_icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality, tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize))
-                            } else {
-                                sub_icc_transform.as_deref().and_then(|xf| bake_jp2k_tile(fragment, jp2k_has_ict_rct_sub, xf, quality))
-                            }
-                        } else { None };
-                        let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
-                        let split = (if baking_sub { true } else { compr == 7 })
-                            .then(|| split_jpeg_to_tables_and_tile(src_bytes))
-                            .flatten();
-                        let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
-                            match registered_tables_sub {
-                                None => {
-                                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                        tables.len() as u32, tables.as_ptr());
-                                    registered_tables_sub = Some(tables.clone());
-                                    tile_data.as_slice()
-                                }
-                                Some(ref rt) if rt == tables => tile_data.as_slice(),
-                                // Different DQT/DHT tables — write self-contained JPEG
-                                _ => src_bytes,
-                            }
-                        } else {
-                            src_bytes
-                        };
-                        TIFFWriteRawTile(tiff, tile_num,
-                            write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
-                    }
-                }
-            }
-
-            // This call writes into the SubIFD chain while n_subifds > 0,
-            // then returns to the main IFD chain.
-            TIFFWriteDirectory(tiff);
-            let subifd_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
-            if let Some(p) = pb { p.inc(subifd_tiles); }
         }
 
+        if !baking {
+            if let Some(ref icc) = icc_profile {
+                unsafe { TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                    icc.len() as u32, icc.as_ptr() as *const c_void); }
+            }
+        }
 
-        TIFFClose(tiff);
+        drop(first_dcm);
+
+        let mut registered_tables_lv0: Option<Vec<u8>> = None;
+        for dcm_meta in group.iter() {
+            let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+            let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
+            let fragments    = pixel_fragments(&dicom_obj);
+            for (fi, fragment) in fragments.iter().enumerate() {
+                if !fragment.is_empty() {
+                    let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
+                    let baked: Option<Vec<u8>> = if baking {
+                        if compr == 7 {
+                            icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality, tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize))
+                        } else {
+                            icc_transform.as_deref().and_then(|xf| bake_jp2k_tile(fragment, jp2k_has_ict_rct, xf, quality))
+                        }
+                    } else { None };
+                    let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
+                    let split = (if baking { true } else { compr == 7 })
+                        .then(|| split_jpeg_to_tables_and_tile(src_bytes))
+                        .flatten();
+                    let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                        match registered_tables_lv0 {
+                            None => {
+                                unsafe { TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                    tables.len() as u32, tables.as_ptr()); }
+                                registered_tables_lv0 = Some(tables.clone());
+                                tile_data.as_slice()
+                            }
+                            Some(ref rt) if rt == tables => tile_data.as_slice(),
+                            // Different DQT/DHT tables — write self-contained JPEG
+                            _ => src_bytes,
+                        }
+                    } else {
+                        src_bytes
+                    };
+                    unsafe { TIFFWriteRawTile(tiff, tile_num,
+                        write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64); }
+                }
+            }
+        }
+
+        // Finalise IFD 0.  libtiff now knows to route the next n_subifds
+        // TIFFWriteDirectory calls into the SubIFD chain.
+        unsafe { TIFFWriteDirectory(tiff); }
+        let ifd0_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+        if let Some(p) = pb { p.inc(ifd0_tiles); }
     }
+
+    // ── SubIFDs: pyramid sub-resolutions (chained from IFD 0) ─────────
+    // libtiff automatically routes the next n_subifds WriteDirectory calls
+    // to the SubIFD chain declared above.  No special API call needed here.
+    for (sub_idx, group) in groups[1..].iter().enumerate() {
+        let metadata  = group[0];
+        if metadata.tile_size.is_none() {
+            if verbose {
+                vlog(pb, format!("  [skip ] lv{}  {}x{}  no tile size",
+                    sub_idx + 1,
+                    metadata.px_columns.unwrap_or(0),
+                    metadata.px_rows.unwrap_or(0)));
+            }
+            continue;
+        }
+        let first_dcm = dicom::object::open_file(&metadata.file_path).unwrap();
+
+        let ifd_width  = metadata.px_columns.unwrap_or(0);
+        let ifd_height = metadata.px_rows.unwrap_or(0);
+        let (tile_w, tile_h) = metadata.tile_size.unwrap_or((ifd_width, ifd_height));
+
+        let color_space = infer_color_space(&first_dcm);
+        let jp2k_has_ict_rct_sub = first_dcm.element_by_name("PhotometricInterpretation")
+            .ok().and_then(|e| e.to_str().ok().map(|s| s.trim().to_string()))
+            .map(|s| matches!(s.as_str(), "YBR_ICT" | "YBR_RCT" | "YBR_FULL" | "YBR_FULL_422"))
+            .unwrap_or(false);
+        let sub_icc_transform: Option<Arc<IccTransform>> = if icc_bake {
+            extract_icc_profile(&first_dcm).and_then(|icc| build_icc_transform(&icc))
+        } else {
+            None
+        };
+        let baking_sub = sub_icc_transform.is_some() && !matches!(color_space, ColorSpace::Grayscale);
+        let photometric = if baking_sub {
+            PHOTOMETRIC_YCBCR
+        } else {
+            match color_space {
+                ColorSpace::RGB       => PHOTOMETRIC_RGB,
+                ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR,
+                ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK,
+            }
+        };
+        let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
+
+        let ts_uid = first_dcm.meta().transfer_syntax();
+        let compr  = tiff_compression_tag(ts_uid);
+
+        // For JPEG passthrough, libtiff checks that JPEG SOF dimensions match the TIFF tile declaration.
+        if !baking_sub && compr == 7 && !is_jpeg_tile_aligned(tile_w, tile_h) {
+            if verbose {
+                vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
+                    sub_idx + 1, ifd_width, ifd_height, tile_w, tile_h));
+            }
+            drop(first_dcm);
+            continue;
+        }
+
+        let mpp = metadata.mpp_x.unwrap_or(0.25);
+
+        if verbose {
+            let n_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+            let tag = if baking_sub { "bake " } else { "pass " };
+            vlog(pb, format!("  [{}] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                tag, sub_idx + 1, ifd_width, ifd_height, mpp, tile_w, tile_h, n_tiles));
+        }
+
+        unsafe { set_tiff_ifd_tags(tiff, FILETYPE_REDUCEDIMAGE,
+            ifd_width, ifd_height, tile_w, tile_h,
+            if baking_sub { 7u32 } else { compr }, photometric, spp,
+            mpp, mpp); }
+
+        if baking_sub {
+            unsafe { TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32); }
+        } else if matches!(color_space, ColorSpace::YCbCr) {
+            let frags_tmp = pixel_fragments(&first_dcm);
+            if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
+                if let Some((h, v)) = detect_jpeg_subsampling(frag) {
+                    unsafe { TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32); }
+                }
+            }
+        }
+        drop(first_dcm);
+
+        let mut registered_tables_sub: Option<Vec<u8>> = None;
+        for dcm_meta in group.iter() {
+            let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+            let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
+            let fragments    = pixel_fragments(&dicom_obj);
+            for (fi, fragment) in fragments.iter().enumerate() {
+                if !fragment.is_empty() {
+                    let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
+                    let baked: Option<Vec<u8>> = if baking_sub {
+                        if compr == 7 {
+                            sub_icc_transform.as_deref().and_then(|xf| bake_jpeg_tile(fragment, xf, quality, tile_align(tile_w, 16) as usize, tile_align(tile_h, 16) as usize))
+                        } else {
+                            sub_icc_transform.as_deref().and_then(|xf| bake_jp2k_tile(fragment, jp2k_has_ict_rct_sub, xf, quality))
+                        }
+                    } else { None };
+                    let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
+                    let split = (if baking_sub { true } else { compr == 7 })
+                        .then(|| split_jpeg_to_tables_and_tile(src_bytes))
+                        .flatten();
+                    let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                        match registered_tables_sub {
+                            None => {
+                                unsafe { TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                    tables.len() as u32, tables.as_ptr()); }
+                                registered_tables_sub = Some(tables.clone());
+                                tile_data.as_slice()
+                            }
+                            Some(ref rt) if rt == tables => tile_data.as_slice(),
+                            // Different DQT/DHT tables — write self-contained JPEG
+                            _ => src_bytes,
+                        }
+                    } else {
+                        src_bytes
+                    };
+                    unsafe { TIFFWriteRawTile(tiff, tile_num,
+                        write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64); }
+                }
+            }
+        }
+
+        // This call writes into the SubIFD chain while n_subifds > 0,
+        // then returns to the main IFD chain.
+        unsafe { TIFFWriteDirectory(tiff); }
+        let subifd_tiles: u64 = group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum();
+        if let Some(p) = pb { p.inc(subifd_tiles); }
+    }
+
+    unsafe { TIFFClose(tiff); }
 }
 
 // ─── SVS writer (JPEG 2000-compressed DICOM → Aperio SVS) ───────────────────
@@ -1073,117 +1068,114 @@ pub(crate) fn write_svs(
     };
     if let Some(p) = pb { p.set_length(total_tiles); }
 
-    unsafe {
-        let tiff = TIFFOpen(
-            CString::new(output_path).unwrap().as_ptr(),
-            CString::new("w8").unwrap().as_ptr(),
-        );
-        assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
+    let output_path_c = CString::new(output_path).unwrap();
+    let w8_mode_c     = CString::new("w8").unwrap();
+    let tiff = unsafe { TIFFOpen(output_path_c.as_ptr(), w8_mode_c.as_ptr()) };
+    assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
 
-        // ── IFD 0: Full resolution ────────────────────────────────────────
-        if verbose {
-            let (btw, bth) = base.tile_size.unwrap_or((256, 256));
-            vlog(pb, format!("  [pass ] lv0  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                img_w, img_h, base_mpp_x, btw, bth,
-                base.n_frames.unwrap_or(0)));
+    // ── IFD 0: Full resolution ────────────────────────────────────────
+    if verbose {
+        let (btw, bth) = base.tile_size.unwrap_or((256, 256));
+        vlog(pb, format!("  [pass ] lv0  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+            img_w, img_h, base_mpp_x, btw, bth,
+            base.n_frames.unwrap_or(0)));
+    }
+    unsafe { write_svs_tiled_level(
+        tiff, base,
+        svs_compression, photometric,
+        base_res_x, base_res_y,
+        0,  // SubFileType: full image
+        Some(&image_desc_c),
+        icc_transform.as_deref(),
+        quality,
+        jp2k_has_ict_rct,
+    ); }
+    if !icc_bake {
+        if let Some(ref icc) = icc_profile {
+            unsafe { TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                icc.len() as u32, icc.as_ptr() as *const c_void); }
         }
-        write_svs_tiled_level(
-            tiff, base,
+    }
+    unsafe { TIFFWriteDirectory(tiff); }
+    if let Some(p) = pb { p.inc(base.n_frames.unwrap_or(0) as u64); }
+
+    // ── IFD 1: Thumbnail (decoded + re-encoded as JPEG) ──────────────
+    let thumb_written = thumbnail_meta
+        .and_then(|m| decode_frame_as_jpeg(&m.file_path, 0, 90))
+        .map(|(jpeg, w, h)| {
+            unsafe { write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE); }
+            unsafe { TIFFWriteDirectory(tiff); }
+            if let Some(p) = pb { p.inc(1); }
+        });
+    let _ = thumb_written;
+
+    // ── IFDs 2..N: Remaining pyramid levels ───────────────────────────
+    let base_cols = base.px_columns.unwrap_or(1) as f64;
+    for (_i, level) in slide_levels[1..].iter().enumerate() {
+        if level.tile_size.is_none() {
+            if verbose {
+                vlog(pb, format!("  [skip ] lv{}  {}x{}  no tile size",
+                    _i + 1,
+                    level.px_columns.unwrap_or(0),
+                    level.px_rows.unwrap_or(0)));
+            }
+            continue;
+        }
+
+        let (lvl_tile_w, lvl_tile_h) = level.tile_size.unwrap();
+        // For JPEG passthrough without baking, libtiff rejects non-16-aligned tiles.
+        if !icc_bake && svs_compression == 7 && !is_jpeg_tile_aligned(lvl_tile_w, lvl_tile_h) {
+            if verbose {
+                vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
+                    _i + 1, level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
+                    lvl_tile_w, lvl_tile_h));
+            }
+            continue;
+        }
+        let ds = base_cols / level.px_columns.unwrap_or(1) as f64;
+        let lv_mpp = base_mpp_x * ds;
+        if verbose {
+            let tag = if icc_bake { "bake " } else { "pass " };
+            vlog(pb, format!("  [{}] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                tag, _i + 1,
+                level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
+                lv_mpp, lvl_tile_w, lvl_tile_h,
+                level.n_frames.unwrap_or(0)));
+        }
+        unsafe { write_svs_tiled_level(
+            tiff, level,
             svs_compression, photometric,
-            base_res_x, base_res_y,
-            0,  // SubFileType: full image
-            Some(&image_desc_c),
+            base_res_x / ds, base_res_y / ds,
+            FILETYPE_REDUCEDIMAGE,
+            None,
             icc_transform.as_deref(),
             quality,
             jp2k_has_ict_rct,
-        );
-        if !icc_bake {
-            if let Some(ref icc) = icc_profile {
-                TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                    icc.len() as u32, icc.as_ptr() as *const c_void);
-            }
-        }
-        TIFFWriteDirectory(tiff);
-        if let Some(p) = pb { p.inc(base.n_frames.unwrap_or(0) as u64); }
-
-        // ── IFD 1: Thumbnail (decoded + re-encoded as JPEG) ──────────────
-        let thumb_written = thumbnail_meta
-            .and_then(|m| decode_frame_as_jpeg(&m.file_path, 0, 90))
-            .map(|(jpeg, w, h)| {
-                write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE);
-                TIFFWriteDirectory(tiff);
-                if let Some(p) = pb { p.inc(1); }
-            });
-        let _ = thumb_written;
-
-        // ── IFDs 2..N: Remaining pyramid levels ───────────────────────────
-        let base_cols = base.px_columns.unwrap_or(1) as f64;
-        for (_i, level) in slide_levels[1..].iter().enumerate() {
-            if level.tile_size.is_none() {
-                if verbose {
-                    vlog(pb, format!("  [skip ] lv{}  {}x{}  no tile size",
-                        _i + 1,
-                        level.px_columns.unwrap_or(0),
-                        level.px_rows.unwrap_or(0)));
-                }
-                continue;
-            }
-
-            let (lvl_tile_w, lvl_tile_h) = level.tile_size.unwrap();
-            // For JPEG passthrough without baking, libtiff rejects non-16-aligned tiles.
-            if !icc_bake && svs_compression == 7 && !is_jpeg_tile_aligned(lvl_tile_w, lvl_tile_h) {
-                if verbose {
-                    vlog(pb, format!("  [skip ] lv{}  {}x{}  tile {}x{} not 16-aligned",
-                        _i + 1, level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
-                        lvl_tile_w, lvl_tile_h));
-                }
-                continue;
-            }
-            let ds = base_cols / level.px_columns.unwrap_or(1) as f64;
-            let lv_mpp = base_mpp_x * ds;
-            if verbose {
-                let tag = if icc_bake { "bake " } else { "pass " };
-                vlog(pb, format!("  [{}] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                    tag, _i + 1,
-                    level.px_columns.unwrap_or(0), level.px_rows.unwrap_or(0),
-                    lv_mpp, lvl_tile_w, lvl_tile_h,
-                    level.n_frames.unwrap_or(0)));
-            }
-            write_svs_tiled_level(
-                tiff, level,
-                svs_compression, photometric,
-                base_res_x / ds, base_res_y / ds,
-                FILETYPE_REDUCEDIMAGE,
-                None,
-                icc_transform.as_deref(),
-                quality,
-                jp2k_has_ict_rct,
-            );
-            TIFFWriteDirectory(tiff);
-            if let Some(p) = pb { p.inc(level.n_frames.unwrap_or(0) as u64); }
-        }
-
-        // ── Label image ───────────────────────────────────────────────────
-        if let Some(m) = label_meta {
-            if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
-                write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE);
-                TIFFWriteDirectory(tiff);
-                if let Some(p) = pb { p.inc(1); }
-            }
-        }
-
-        // ── Macro / Overview image ────────────────────────────────────────
-        // SubFileType 9 = macro image (Aperio convention, SubFileType bit 3 = 0x8)
-        if let Some(m) = overview_meta {
-            if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
-                write_svs_stripped_jpeg(tiff, &jpeg, w, h, 9);
-                TIFFWriteDirectory(tiff);
-                if let Some(p) = pb { p.inc(1); }
-            }
-        }
-
-        TIFFClose(tiff);
+        ); }
+        unsafe { TIFFWriteDirectory(tiff); }
+        if let Some(p) = pb { p.inc(level.n_frames.unwrap_or(0) as u64); }
     }
+
+    // ── Label image ───────────────────────────────────────────────────
+    if let Some(m) = label_meta {
+        if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
+            unsafe { write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE); }
+            unsafe { TIFFWriteDirectory(tiff); }
+            if let Some(p) = pb { p.inc(1); }
+        }
+    }
+
+    // ── Macro / Overview image ────────────────────────────────────────
+    // SubFileType 9 = macro image (Aperio convention, SubFileType bit 3 = 0x8)
+    if let Some(m) = overview_meta {
+        if let Some((jpeg, w, h)) = decode_frame_as_jpeg(&m.file_path, 0, 90) {
+            unsafe { write_svs_stripped_jpeg(tiff, &jpeg, w, h, 9); }
+            unsafe { TIFFWriteDirectory(tiff); }
+            if let Some(p) = pb { p.inc(1); }
+        }
+    }
+
+    unsafe { TIFFClose(tiff); }
 }
 
 // ─── Resampled TIFF writer ────────────────────────────────────────────────────
@@ -1596,133 +1588,130 @@ pub(crate) fn write_resampled_tiff(
         compute_handle.join().expect("compute thread panicked");
     };
 
-    unsafe {
-        let tiff = TIFFOpen(
-            CString::new(output_path).unwrap().as_ptr(),
-            CString::new("w8").unwrap().as_ptr(), // BigTIFF
-        );
-        assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
+    let output_path_c = CString::new(output_path).unwrap();
+    let w8_mode_c     = CString::new("w8").unwrap();
+    let tiff = unsafe { TIFFOpen(output_path_c.as_ptr(), w8_mode_c.as_ptr()) }; // BigTIFF
+    assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
 
-        // For OME-TIFF: register the SubIFD chain on IFD 0 before writing anything.
-        if ome && n_subifds > 0 {
-            let zeros: Vec<u64> = vec![0u64; n_subifds];
-            TIFFSetField(tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr());
-        }
+    // For OME-TIFF: register the SubIFD chain on IFD 0 before writing anything.
+    if ome && n_subifds > 0 {
+        let zeros: Vec<u64> = vec![0u64; n_subifds];
+        unsafe { TIFFSetField(tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr()); }
+    }
 
-        for (lv_idx, lv) in active_levels.iter().enumerate() {
-            let is_base: bool    = lv_idx == 0;
-            let subfile_type: u32 = if is_base { 0 } else { FILETYPE_REDUCEDIMAGE };
+    for (lv_idx, lv) in active_levels.iter().enumerate() {
+        let is_base: bool    = lv_idx == 0;
+        let subfile_type: u32 = if is_base { 0 } else { FILETYPE_REDUCEDIMAGE };
 
-            if lv.passthrough {
-                // ── Passthrough: raw tile copy ────────────────────────────
-                // Derive compression and photometric from the chosen source.
-                let meta      = lv.src_group[0];
-                let first_dcm = dicom::object::open_file(&meta.file_path).unwrap();
-                let cs_lv     = infer_color_space(&first_dcm);
-                let ts_uid    = first_dcm.meta().transfer_syntax();
-                let compr     = tiff_compression_tag(ts_uid);
-                let photo_lv: u32 = match cs_lv {
-                    ColorSpace::RGB       => PHOTOMETRIC_RGB      as u32,
-                    ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR    as u32,
-                    ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK as u32,
-                };
-                let spp_lv: u32 = if matches!(cs_lv, ColorSpace::Grayscale) { 1 } else { 3 };
+        if lv.passthrough {
+            // ── Passthrough: raw tile copy ────────────────────────────
+            // Derive compression and photometric from the chosen source.
+            let meta      = lv.src_group[0];
+            let first_dcm = dicom::object::open_file(&meta.file_path).unwrap();
+            let cs_lv     = infer_color_space(&first_dcm);
+            let ts_uid    = first_dcm.meta().transfer_syntax();
+            let compr     = tiff_compression_tag(ts_uid);
+            let photo_lv: u32 = match cs_lv {
+                ColorSpace::RGB       => PHOTOMETRIC_RGB      as u32,
+                ColorSpace::YCbCr     => PHOTOMETRIC_YCBCR    as u32,
+                ColorSpace::Grayscale => PHOTOMETRIC_MINISBLACK as u32,
+            };
+            let spp_lv: u32 = if matches!(cs_lv, ColorSpace::Grayscale) { 1 } else { 3 };
 
-                set_tiff_ifd_tags(tiff, subfile_type,
-                    lv.out_img_w, lv.out_img_h, lv.out_tile_w, lv.out_tile_h,
-                    compr, photo_lv, spp_lv,
-                    lv.actual_mpp_x, lv.actual_mpp_y);
-                if matches!(cs_lv, ColorSpace::YCbCr) {
-                    let frags_tmp = pixel_fragments(&first_dcm);
-                    if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
-                        if let Some((h, v)) = detect_jpeg_subsampling(frag) {
-                            TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
-                        }
+            unsafe { set_tiff_ifd_tags(tiff, subfile_type,
+                lv.out_img_w, lv.out_img_h, lv.out_tile_w, lv.out_tile_h,
+                compr, photo_lv, spp_lv,
+                lv.actual_mpp_x, lv.actual_mpp_y); }
+            if matches!(cs_lv, ColorSpace::YCbCr) {
+                let frags_tmp = pixel_fragments(&first_dcm);
+                if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
+                    if let Some((h, v)) = detect_jpeg_subsampling(frag) {
+                        unsafe { TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32); }
                     }
                 }
-                if is_base {
-                    if let Some(ref desc) = image_desc_c {
-                        TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
-                    }
-                    if !icc_bake {
-                        if let Some(ref icc) = icc_profile {
-                            TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                                icc.len() as u32, icc.as_ptr() as *const c_void);
-                        }
+            }
+            if is_base {
+                if let Some(ref desc) = image_desc_c {
+                    unsafe { TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr()); }
+                }
+                if !icc_bake {
+                    if let Some(ref icc) = icc_profile {
+                        unsafe { TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                            icc.len() as u32, icc.as_ptr() as *const c_void); }
                     }
                 }
-                drop(first_dcm);
+            }
+            drop(first_dcm);
 
-                // Write raw tiles from every DICOM file in the source group.
-                // For JPEG sources, strip redundant DQT/DHT from each tile and store
-                // them once in TIFFTAG_JPEGTABLES (~550 bytes saved per tile).
-                // When a tile has different tables from the registered ones (e.g. blank
-                // stub tiles mixed with real tissue tiles), write it as a self-contained
-                // JPEG so the decoder always has the correct tables.
-                let mut registered_tables: Option<Vec<u8>> = None;
-                for dcm_meta in lv.src_group.iter() {
-                    let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
-                    let ifd_w        = dcm_meta.px_columns.unwrap_or(0);
-                    let tile_indices = frame_to_tile_indices(
-                        &dicom_obj, lv.src_tile_w, lv.src_tile_h, ifd_w,
-                    );
-                    let fragments = pixel_fragments(&dicom_obj);
-                    for (fi, fragment) in fragments.iter().enumerate() {
-                        if !fragment.is_empty() {
-                            let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
-                            let split = (compr == 7)
-                                .then(|| split_jpeg_to_tables_and_tile(fragment))
-                                .flatten();
-                            let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
-                                match registered_tables {
-                                    None => {
-                                        TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                            tables.len() as u32, tables.as_ptr());
-                                        registered_tables = Some(tables.clone());
-                                        tile_data.as_slice()
-                                    }
-                                    Some(ref rt) if rt == tables => tile_data.as_slice(),
-                                    _ => fragment.as_slice(),
+            // Write raw tiles from every DICOM file in the source group.
+            // For JPEG sources, strip redundant DQT/DHT from each tile and store
+            // them once in TIFFTAG_JPEGTABLES (~550 bytes saved per tile).
+            // When a tile has different tables from the registered ones (e.g. blank
+            // stub tiles mixed with real tissue tiles), write it as a self-contained
+            // JPEG so the decoder always has the correct tables.
+            let mut registered_tables: Option<Vec<u8>> = None;
+            for dcm_meta in lv.src_group.iter() {
+                let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+                let ifd_w        = dcm_meta.px_columns.unwrap_or(0);
+                let tile_indices = frame_to_tile_indices(
+                    &dicom_obj, lv.src_tile_w, lv.src_tile_h, ifd_w,
+                );
+                let fragments = pixel_fragments(&dicom_obj);
+                for (fi, fragment) in fragments.iter().enumerate() {
+                    if !fragment.is_empty() {
+                        let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
+                        let split = (compr == 7)
+                            .then(|| split_jpeg_to_tables_and_tile(fragment))
+                            .flatten();
+                        let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                            match registered_tables {
+                                None => {
+                                    unsafe { TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+                                        tables.len() as u32, tables.as_ptr()); }
+                                    registered_tables = Some(tables.clone());
+                                    tile_data.as_slice()
                                 }
-                            } else {
-                                fragment.as_slice()
-                            };
-                            TIFFWriteRawTile(tiff, tile_num,
-                                write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64);
-                        }
-                    }
-                    if let Some(p) = pb {
-                        p.inc(dcm_meta.n_frames.unwrap_or(0) as u64);
-                    }
-                }
-            } else {
-                // ── Resample: decode → resize → JPEG re-encode ───────────
-                set_tiff_ifd_tags(tiff, subfile_type,
-                    lv.out_img_w, lv.out_img_h, lv.out_tile_w, lv.out_tile_h,
-                    7, photometric, spp,
-                    lv.actual_mpp_x, lv.actual_mpp_y);
-                if photometric == PHOTOMETRIC_YCBCR as u32 {
-                    TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
-                }
-                if is_base {
-                    if let Some(ref desc) = image_desc_c {
-                        TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr());
-                    }
-                    if !icc_bake {
-                        if let Some(ref icc) = icc_profile {
-                            TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
-                                icc.len() as u32, icc.as_ptr() as *const c_void);
-                        }
+                                Some(ref rt) if rt == tables => tile_data.as_slice(),
+                                _ => fragment.as_slice(),
+                            }
+                        } else {
+                            fragment.as_slice()
+                        };
+                        unsafe { TIFFWriteRawTile(tiff, tile_num,
+                            write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64); }
                     }
                 }
-
-                write_level_tiles(tiff, lv, half);
+                if let Some(p) = pb {
+                    p.inc(dcm_meta.n_frames.unwrap_or(0) as u64);
+                }
+            }
+        } else {
+            // ── Resample: decode → resize → JPEG re-encode ───────────
+            unsafe { set_tiff_ifd_tags(tiff, subfile_type,
+                lv.out_img_w, lv.out_img_h, lv.out_tile_w, lv.out_tile_h,
+                7, photometric, spp,
+                lv.actual_mpp_x, lv.actual_mpp_y); }
+            if photometric == PHOTOMETRIC_YCBCR as u32 {
+                unsafe { TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32); }
+            }
+            if is_base {
+                if let Some(ref desc) = image_desc_c {
+                    unsafe { TIFFSetField(tiff, TIFFTAG_IMAGEDESCRIPTION as u32, desc.as_ptr()); }
+                }
+                if !icc_bake {
+                    if let Some(ref icc) = icc_profile {
+                        unsafe { TIFFSetField(tiff, TIFFTAG_ICCPROFILE as u32,
+                            icc.len() as u32, icc.as_ptr() as *const c_void); }
+                    }
+                }
             }
 
-            TIFFWriteDirectory(tiff);
+            write_level_tiles(tiff, lv, half);
         }
 
-        TIFFClose(tiff);
+        unsafe { TIFFWriteDirectory(tiff); }
     }
+
+    unsafe { TIFFClose(tiff); }
 }
 
