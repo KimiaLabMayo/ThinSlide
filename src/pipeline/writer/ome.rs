@@ -16,7 +16,7 @@
 // The OME-XML conforms to the OME 2016-06 schema and is parsed by BioFormats.
 
 use crate::bindings::{
-    TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteDirectory, TIFFClose,
+    TIFF, TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteDirectory, TIFFClose,
     TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_ICCPROFILE, TIFFTAG_JPEGTABLES,
     TIFFTAG_SUBIFD, TIFFTAG_IMAGEDESCRIPTION,
     PHOTOMETRIC_RGB, PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK,
@@ -34,6 +34,54 @@ use std::ffi::CString;
 use std::os::raw::c_void;
 use std::sync::Arc;
 use indicatif::ProgressBar;
+
+/// Write all tiles from `group` into the currently active TIFF IFD.
+/// Handles both baked (ICC-transformed) and passthrough tile paths,
+/// sharing JPEGTABLES when all tiles use identical quantisation tables.
+unsafe fn write_group_tiles(
+    tiff: *mut TIFF,
+    group: &[&DcmMetadata],
+    tile_w: u32, tile_h: u32, ifd_width: u32,
+    compr: u32, baking: bool,
+    icc_transform: Option<&IccTransform>,
+    jp2k_has_ict_rct: bool, quality: u8,
+) {
+    let mut registered_tables: Option<Vec<u8>> = None;
+    for dcm_meta in group.iter() {
+        let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
+        let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
+        let fragments    = super::pixel_fragments(&dicom_obj);
+        for (fi, fragment) in fragments.iter().enumerate() {
+            if fragment.is_empty() { continue; }
+            let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
+            let baked: Option<Vec<u8>> = if baking {
+                if compr == 7 {
+                    icc_transform.and_then(|xf| super::bake_jpeg_tile(fragment, xf, quality,
+                        crate::tile_align(tile_w, 16) as usize, crate::tile_align(tile_h, 16) as usize))
+                } else {
+                    icc_transform.and_then(|xf| super::bake_jp2k_tile(fragment, jp2k_has_ict_rct, xf, quality))
+                }
+            } else { None };
+            let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
+            let split = (baking || compr == 7)
+                .then(|| split_jpeg_to_tables_and_tile(src_bytes))
+                .flatten();
+            let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
+                match registered_tables {
+                    None => {
+                        unsafe { TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32, tables.len() as u32, tables.as_ptr()); }
+                        registered_tables = Some(tables.clone());
+                        tile_data.as_slice()
+                    }
+                    Some(ref rt) if rt == tables => tile_data.as_slice(),
+                    // Different DQT/DHT tables — write self-contained JPEG
+                    _ => src_bytes,
+                }
+            } else { src_bytes };
+            unsafe { TIFFWriteRawTile(tiff, tile_num, write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64); }
+        }
+    }
+}
 
 pub(crate) fn write_ome_tiff(
     slide_level_metadata_list: &[DcmMetadata],
@@ -144,45 +192,8 @@ pub(crate) fn write_ome_tiff(
 
         drop(first_dcm);
 
-        let mut registered_tables_lv0: Option<Vec<u8>> = None;
-        for dcm_meta in group.iter() {
-            let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
-            let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-            let fragments    = super::pixel_fragments(&dicom_obj);
-            for (fi, fragment) in fragments.iter().enumerate() {
-                if !fragment.is_empty() {
-                    let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
-                    let baked: Option<Vec<u8>> = if baking {
-                        if compr == 7 {
-                            icc_transform.as_deref().and_then(|xf| super::bake_jpeg_tile(fragment, xf, quality, crate::tile_align(tile_w, 16) as usize, crate::tile_align(tile_h, 16) as usize))
-                        } else {
-                            icc_transform.as_deref().and_then(|xf| super::bake_jp2k_tile(fragment, jp2k_has_ict_rct, xf, quality))
-                        }
-                    } else { None };
-                    let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
-                    let split = (if baking { true } else { compr == 7 })
-                        .then(|| split_jpeg_to_tables_and_tile(src_bytes))
-                        .flatten();
-                    let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
-                        match registered_tables_lv0 {
-                            None => {
-                                unsafe { TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                    tables.len() as u32, tables.as_ptr()); }
-                                registered_tables_lv0 = Some(tables.clone());
-                                tile_data.as_slice()
-                            }
-                            Some(ref rt) if rt == tables => tile_data.as_slice(),
-                            // Different DQT/DHT tables — write self-contained JPEG
-                            _ => src_bytes,
-                        }
-                    } else {
-                        src_bytes
-                    };
-                    unsafe { TIFFWriteRawTile(tiff, tile_num,
-                        write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64); }
-                }
-            }
-        }
+        unsafe { write_group_tiles(tiff, group, tile_w, tile_h, ifd_width,
+            compr, baking, icc_transform.as_deref(), jp2k_has_ict_rct, quality); }
 
         // Finalise IFD 0.  libtiff now knows to route the next n_subifds
         // TIFFWriteDirectory calls into the SubIFD chain.
@@ -272,45 +283,8 @@ pub(crate) fn write_ome_tiff(
         }
         drop(first_dcm);
 
-        let mut registered_tables_sub: Option<Vec<u8>> = None;
-        for dcm_meta in group.iter() {
-            let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
-            let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-            let fragments    = super::pixel_fragments(&dicom_obj);
-            for (fi, fragment) in fragments.iter().enumerate() {
-                if !fragment.is_empty() {
-                    let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
-                    let baked: Option<Vec<u8>> = if baking_sub {
-                        if compr == 7 {
-                            sub_icc_transform.as_deref().and_then(|xf| super::bake_jpeg_tile(fragment, xf, quality, crate::tile_align(tile_w, 16) as usize, crate::tile_align(tile_h, 16) as usize))
-                        } else {
-                            sub_icc_transform.as_deref().and_then(|xf| super::bake_jp2k_tile(fragment, jp2k_has_ict_rct_sub, xf, quality))
-                        }
-                    } else { None };
-                    let src_bytes: &[u8] = baked.as_deref().unwrap_or(fragment.as_slice());
-                    let split = (if baking_sub { true } else { compr == 7 })
-                        .then(|| split_jpeg_to_tables_and_tile(src_bytes))
-                        .flatten();
-                    let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
-                        match registered_tables_sub {
-                            None => {
-                                unsafe { TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                    tables.len() as u32, tables.as_ptr()); }
-                                registered_tables_sub = Some(tables.clone());
-                                tile_data.as_slice()
-                            }
-                            Some(ref rt) if rt == tables => tile_data.as_slice(),
-                            // Different DQT/DHT tables — write self-contained JPEG
-                            _ => src_bytes,
-                        }
-                    } else {
-                        src_bytes
-                    };
-                    unsafe { TIFFWriteRawTile(tiff, tile_num,
-                        write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64); }
-                }
-            }
-        }
+        unsafe { write_group_tiles(tiff, group, tile_w, tile_h, ifd_width,
+            compr, baking_sub, sub_icc_transform.as_deref(), jp2k_has_ict_rct_sub, quality); }
 
         // This call writes into the SubIFD chain while n_subifds > 0,
         // then returns to the main IFD chain.
