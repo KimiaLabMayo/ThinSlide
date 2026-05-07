@@ -87,8 +87,33 @@ impl TermBuf {
 
 // ---------- app state -------------------------------------------------------
 
-#[derive(PartialEq, Clone, Default)]
+#[derive(PartialEq, Clone, Default, serde::Serialize, serde::Deserialize)]
 enum MppMode { #[default] Passthrough, Half, X20, X10 }
+
+const STORAGE_KEY: &str = "slean_settings";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Settings {
+    input_dir:       String,
+    output_dir:      String,
+    legacy:          bool,
+    mpp_mode:        MppMode,
+    quality:         u8,
+    use_parent_name: bool,
+    icc_bake:        bool,
+    jobs:            String,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            input_dir: String::new(), output_dir: String::new(),
+            legacy: false, mpp_mode: MppMode::default(),
+            quality: 87, use_parent_name: false, icc_bake: false,
+            jobs: String::new(),
+        }
+    }
+}
 
 struct App {
     input_dir:       String,
@@ -143,7 +168,38 @@ impl Default for App {
 
 // ---------- eframe::App -----------------------------------------------------
 
+impl App {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let s: Settings = cc.storage
+            .and_then(|st| eframe::get_value(st, STORAGE_KEY))
+            .unwrap_or_default();
+        let mut app = App::default();
+        app.input_dir       = s.input_dir;
+        app.output_dir      = s.output_dir;
+        app.legacy          = s.legacy;
+        app.mpp_mode        = s.mpp_mode;
+        app.quality         = s.quality;
+        app.use_parent_name = s.use_parent_name;
+        app.icc_bake        = s.icc_bake;
+        app.jobs            = s.jobs;
+        app
+    }
+}
+
 impl eframe::App for App {
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, STORAGE_KEY, &Settings {
+            input_dir:       self.input_dir.clone(),
+            output_dir:      self.output_dir.clone(),
+            legacy:          self.legacy,
+            mpp_mode:        self.mpp_mode.clone(),
+            quality:         self.quality,
+            use_parent_name: self.use_parent_name,
+            icc_bake:        self.icc_bake,
+            jobs:            self.jobs.clone(),
+        });
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Drain bytes from the PTY reader thread
         if let Some(rx) = &self.rx {
@@ -172,6 +228,25 @@ impl eframe::App for App {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+
+            let dropped: Vec<std::path::PathBuf> = ctx.input(|i| {
+                i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
+            });
+            for path in dropped {
+                if path.is_dir() {
+                    if self.input_dir.is_empty() {
+                        self.input_dir = path.display().to_string();
+                    } else {
+                        self.output_dir = path.display().to_string();
+                    }
+                }
+            }
+            if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+                ui.colored_label(
+                    egui::Color32::from_rgb(60, 140, 220),
+                    "↓  Drop a folder to set input path (or output path if input is already set)",
+                );
+            }
 
             egui::Grid::new("folders").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
                 ui.label("Input folder:");
@@ -257,7 +332,14 @@ impl eframe::App for App {
                 }
                 if !self.running {
                     if let Some(msg) = &self.completion {
-                        ui.label(egui::RichText::new(msg).strong());
+                        let color = if msg.starts_with('✓') {
+                            egui::Color32::from_rgb(60, 180, 60)
+                        } else if msg.starts_with('✗') {
+                            egui::Color32::from_rgb(210, 50, 50)
+                        } else {
+                            egui::Color32::from_rgb(200, 160, 0)
+                        };
+                        ui.label(egui::RichText::new(msg).strong().color(color));
                     }
                     if !self.term.is_empty() {
                         if ui.button("Clear log").clicked() {
@@ -391,5 +473,5 @@ fn main() -> eframe::Result<()> {
             .with_inner_size([680.0, 560.0]),
         ..Default::default()
     };
-    eframe::run_native("Slide Leaner", options, Box::new(|_cc| Ok(Box::new(App::default()))))
+    eframe::run_native("Slide Leaner", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }
