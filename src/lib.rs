@@ -54,6 +54,13 @@ pub(crate) fn vlog(pb: Option<&ProgressBar>, msg: impl AsRef<str>) {
     else { eprintln!("{}", msg.as_ref()); }
 }
 
+fn pixel_fragments(dcm: &dicom::object::DefaultDicomObject) -> &[Vec<u8>] {
+    dcm.element_by_name("PixelData")
+        .expect("No PixelData")
+        .fragments()
+        .expect("Not encapsulated pixel data")
+}
+
 fn bake_jpeg_tile(fragment: &[u8], xform: &IccTransform, quality: u8, out_w: usize, out_h: usize) -> Option<Vec<u8>> {
     let img = turbojpeg::decompress(fragment, turbojpeg::PixelFormat::RGB).ok()?;
     let (w, h) = (img.width, img.height);
@@ -409,8 +416,7 @@ pub(crate) fn write_flat_multipage_tiff(
                 // For YCbCr JPEG passthrough, detect actual subsampling from the first tile so
                 // the TIFF tag matches the JPEG payload (otherwise libtiff defaults
                 // to [2,2] regardless of the stream content, confusing QuPath).
-                let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
-                let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
+                let frags_tmp = pixel_fragments(&first_dcm);
                 if let Some(first) = frags_tmp.iter().find(|f| !f.is_empty()) {
                     if let Some((h, v)) = detect_jpeg_subsampling(first) {
                         TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
@@ -437,8 +443,7 @@ pub(crate) fn write_flat_multipage_tiff(
             for dcm_meta in group.iter() {
                 let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                 let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-                let px_elem      = dicom_obj.element_by_name("PixelData").expect("No PixelData");
-                let fragments    = px_elem.fragments().expect("Not encapsulated pixel data");
+                let fragments    = pixel_fragments(&dicom_obj);
 
                 if baking && compression == 7 {
                     let xf = icc_transform.as_deref().unwrap();
@@ -634,8 +639,7 @@ pub(crate) fn write_ome_tiff(
             if baking {
                 TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
             } else if matches!(color_space, ColorSpace::YCbCr) {
-                let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
-                let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
+                let frags_tmp = pixel_fragments(&first_dcm);
                 if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
                     if let Some((h, v)) = detect_jpeg_subsampling(frag) {
                         TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
@@ -656,8 +660,7 @@ pub(crate) fn write_ome_tiff(
             for dcm_meta in group.iter() {
                 let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                 let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-                let px_elem      = dicom_obj.element_by_name("PixelData").expect("No PixelData");
-                let fragments    = px_elem.fragments().expect("Not encapsulated pixel data");
+                let fragments    = pixel_fragments(&dicom_obj);
                 for (fi, fragment) in fragments.iter().enumerate() {
                     if !fragment.is_empty() {
                         let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
@@ -772,8 +775,7 @@ pub(crate) fn write_ome_tiff(
             if baking_sub {
                 TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
             } else if matches!(color_space, ColorSpace::YCbCr) {
-                let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
-                let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
+                let frags_tmp = pixel_fragments(&first_dcm);
                 if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
                     if let Some((h, v)) = detect_jpeg_subsampling(frag) {
                         TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
@@ -786,8 +788,7 @@ pub(crate) fn write_ome_tiff(
             for dcm_meta in group.iter() {
                 let dicom_obj    = dicom::object::open_file(&dcm_meta.file_path).unwrap();
                 let tile_indices = frame_to_tile_indices(&dicom_obj, tile_w, tile_h, ifd_width);
-                let px_elem      = dicom_obj.element_by_name("PixelData").expect("No PixelData");
-                let fragments    = px_elem.fragments().expect("Not encapsulated pixel data");
+                let fragments    = pixel_fragments(&dicom_obj);
                 for (fi, fragment) in fragments.iter().enumerate() {
                     if !fragment.is_empty() {
                         let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
@@ -860,8 +861,7 @@ unsafe fn write_svs_tiled_level(
     jp2k_has_ict_rct: bool,
 ) { unsafe {
     let dicom_obj  = dicom::object::open_file(&metadata.file_path).unwrap();
-    let px_elem    = dicom_obj.element_by_name("PixelData").expect("No PixelData");
-    let fragments  = px_elem.fragments().expect("Not encapsulated pixel data");
+    let fragments  = pixel_fragments(&dicom_obj);
 
     let ifd_width  = metadata.px_columns.unwrap_or(0);
     let ifd_height = metadata.px_rows.unwrap_or(0);
@@ -1491,8 +1491,7 @@ pub(crate) fn write_resampled_tiff(
             let n_frames = dcm_meta.n_frames.unwrap_or(0);
 
             if is_jpeg_src || is_jp2k_src {
-                let px = dicom_obj.element_by_name("PixelData").expect("No PixelData");
-                let fragments = px.fragments().expect("Not encapsulated pixel data");
+                let fragments = pixel_fragments(&dicom_obj);
                 for (fi, frag) in fragments.iter().enumerate() {
                     if frag.is_empty() { continue; }
                     let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
@@ -1634,8 +1633,7 @@ pub(crate) fn write_resampled_tiff(
                     compr, photo_lv, spp_lv,
                     lv.actual_mpp_x, lv.actual_mpp_y);
                 if matches!(cs_lv, ColorSpace::YCbCr) {
-                    let px_tmp    = first_dcm.element_by_name("PixelData").expect("No PixelData");
-                    let frags_tmp = px_tmp.fragments().expect("Not encapsulated pixel data");
+                    let frags_tmp = pixel_fragments(&first_dcm);
                     if let Some(frag) = frags_tmp.iter().find(|f| !f.is_empty()) {
                         if let Some((h, v)) = detect_jpeg_subsampling(frag) {
                             TIFFSetField(tiff, TIFFTAG_YCBCRSUBSAMPLING as u32, h as u32, v as u32);
@@ -1668,8 +1666,7 @@ pub(crate) fn write_resampled_tiff(
                     let tile_indices = frame_to_tile_indices(
                         &dicom_obj, lv.src_tile_w, lv.src_tile_h, ifd_w,
                     );
-                    let px_elem   = dicom_obj.element_by_name("PixelData").expect("No PixelData");
-                    let fragments = px_elem.fragments().expect("Not encapsulated pixel data");
+                    let fragments = pixel_fragments(&dicom_obj);
                     for (fi, fragment) in fragments.iter().enumerate() {
                         if !fragment.is_empty() {
                             let tile_num = tile_indices.get(fi).copied().unwrap_or(fi as u32);
