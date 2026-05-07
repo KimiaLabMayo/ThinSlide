@@ -341,38 +341,38 @@ fn process_file_icc_bake_only(
 
     let chunk_size = (rayon::current_num_threads() * 4).max(1);
 
-    unsafe {
-        let src_c   = CString::new(src_path).unwrap();
-        let tmp_c   = CString::new(tmp_path.as_str()).unwrap();
-        let r_mode  = CString::new("r").unwrap();
-        let w8_mode = CString::new("w8").unwrap();
+    let src_c   = CString::new(src_path).unwrap();
+    let tmp_c   = CString::new(tmp_path.as_str()).unwrap();
+    let r_mode  = CString::new("r").unwrap();
+    let w8_mode = CString::new("w8").unwrap();
 
-        let src_tiff = TIFFOpen(src_c.as_ptr(), r_mode.as_ptr());
-        if src_tiff.is_null() {
-            eprintln!("  [error] Cannot open: {src_path}");
-            return;
-        }
-        let dst_tiff = TIFFOpen(tmp_c.as_ptr(), w8_mode.as_ptr());
-        if dst_tiff.is_null() {
-            eprintln!("  [error] Cannot create: {tmp_path}");
-            TIFFClose(src_tiff);
-            return;
-        }
+    let src_tiff = unsafe { TIFFOpen(src_c.as_ptr(), r_mode.as_ptr()) };
+    if src_tiff.is_null() {
+        eprintln!("  [error] Cannot open: {src_path}");
+        return;
+    }
+    let dst_tiff = unsafe { TIFFOpen(tmp_c.as_ptr(), w8_mode.as_ptr()) };
+    if dst_tiff.is_null() {
+        eprintln!("  [error] Cannot create: {tmp_path}");
+        unsafe { TIFFClose(src_tiff); }
+        return;
+    }
 
-        let n_subifds = src_levels.len().saturating_sub(1);
-        if ome && n_subifds > 0 {
-            let zeros: Vec<u64> = vec![0u64; n_subifds];
-            TIFFSetField(dst_tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr());
-        }
+    let n_subifds = src_levels.len().saturating_sub(1);
+    if ome && n_subifds > 0 {
+        let zeros: Vec<u64> = vec![0u64; n_subifds];
+        unsafe { TIFFSetField(dst_tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr()); }
+    }
 
-        for (lv_idx, src_lv) in src_levels.iter().enumerate() {
-            navigate(src_tiff, lv_idx, src_levels);
+    for (lv_idx, src_lv) in src_levels.iter().enumerate() {
+        unsafe { navigate(src_tiff, lv_idx, src_levels); }
 
-            let is_base  = lv_idx == 0;
-            let subfile  = if is_base { 0u32 } else { FILETYPE_REDUCEDIMAGE };
-            let out_tile_w = tile_align(src_lv.tile_w, 16);
-            let out_tile_h = tile_align(src_lv.tile_h, 16);
+        let is_base  = lv_idx == 0;
+        let subfile  = if is_base { 0u32 } else { FILETYPE_REDUCEDIMAGE };
+        let out_tile_w = tile_align(src_lv.tile_w, 16);
+        let out_tile_h = tile_align(src_lv.tile_h, 16);
 
+        unsafe {
             set_tiff_ifd_tags(dst_tiff, subfile,
                 src_lv.img_w, src_lv.img_h, out_tile_w, out_tile_h,
                 COMPRESSION_JPEG as u32, out_photometric as u32, out_spp,
@@ -386,116 +386,116 @@ fn process_file_icc_bake_only(
                 }
                 // ICC is baked in; do not embed the profile in the output
             }
-
-            let src_is_jp2k   = is_jp2k(src_lv.compression as u32);
-            let src_is_jpeg   = src_lv.compression as u32 == COMPRESSION_JPEG;
-            let src_jp2k_is_ycbcr =
-                src_is_jp2k && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
-
-            let jpeg_tables_arc: Option<Arc<Vec<u8>>> = if src_is_jpeg {
-                let mut tlen: u32 = 0;
-                let mut tptr: *const u8 = std::ptr::null();
-                let ok = TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
-                    &mut tlen as *mut u32, &mut tptr as *mut *const u8);
-                if ok != 0 && !tptr.is_null() && tlen > 2 {
-                    Some(Arc::new(std::slice::from_raw_parts(tptr, tlen as usize).to_vec()))
-                } else { None }
-            } else { None };
-
-            let raw_buf_size = (TIFFTileSize(src_tiff) as usize)
-                .max(src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize)
-                .max(1 << 17);
-            let pix_size = src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize;
-            let tile_ids: Vec<u32> = (0..src_lv.n_tiles).collect();
-
-            type BakeTile = (u32, Option<(Vec<u8>, bool, bool)>);
-
-            let (raw_tx, raw_rx) = mpsc::sync_channel::<Vec<BakeTile>>(2);
-            let (enc_tx, enc_rx) = mpsc::sync_channel::<EncChunk>(2);
-
-            let xform_t        = Arc::clone(&icc_xform);
-            let tables_t       = jpeg_tables_arc.clone();
-            let quality        = args.quality;
-            let spp            = out_spp;
-            let src_tile_w     = src_lv.tile_w;
-            let src_tile_h     = src_lv.tile_h;
-            let src_photometric = src_lv.photometric as u32;
-
-            let compute_handle = std::thread::spawn(move || {
-                for raw_chunk in raw_rx {
-                    let mut encoded: EncChunk = raw_chunk.par_iter()
-                        .filter_map(|(id, tile_opt)| {
-                            let (data, is_raw_jpeg, is_jp2k_tile) = tile_opt.as_ref()?;
-                            let jpeg = bake_single_tile(
-                                data, *is_raw_jpeg, *is_jp2k_tile, src_jp2k_is_ycbcr,
-                                spp, src_tile_w, src_tile_h, quality,
-                                &xform_t,
-                                tables_t.as_deref().map(|v| v.as_slice()),
-                                src_photometric,
-                            )?;
-                            Some((*id, jpeg))
-                        })
-                        .collect();
-                    encoded.sort_unstable_by_key(|(n, _)| *n);
-                    if enc_tx.send(encoded).is_err() { break; }
-                }
-            });
-
-            let mut jpegtables_registered = false;
-            let mut pending_write: Option<EncChunk> = None;
-
-            for chunk in tile_ids.chunks(chunk_size) {
-                let raw_chunk: Vec<BakeTile> = chunk.iter()
-                    .map(|&tile_num| {
-                        if src_is_jp2k || src_is_jpeg {
-                            let mut buf = vec![0u8; raw_buf_size];
-                            let n = TIFFReadRawTile(src_tiff, tile_num,
-                                buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
-                            if n > 0 {
-                                buf.truncate(n as usize);
-                                (tile_num, Some((buf, src_is_jpeg, src_is_jp2k)))
-                            } else {
-                                (tile_num, None)
-                            }
-                        } else {
-                            let mut buf = vec![0u8; pix_size];
-                            let n = TIFFReadEncodedTile(src_tiff, tile_num,
-                                buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
-                            if n > 0 { (tile_num, Some((buf, false, false))) }
-                            else { (tile_num, None) }
-                        }
-                    })
-                    .collect();
-
-                raw_tx.send(raw_chunk).expect("compute thread dropped");
-
-                if let Some(prev) = pending_write.take() {
-                    let n = prev.len() as u64;
-                    write_enc_chunk(dst_tiff, &prev, &mut jpegtables_registered);
-                    pb.inc(n);
-                }
-                pending_write = enc_rx.recv().ok();
-            }
-
-            drop(raw_tx);
-            if let Some(last) = pending_write.take() {
-                let n = last.len() as u64;
-                write_enc_chunk(dst_tiff, &last, &mut jpegtables_registered);
-                pb.inc(n);
-            }
-            for enc in enc_rx {
-                let n = enc.len() as u64;
-                write_enc_chunk(dst_tiff, &enc, &mut jpegtables_registered);
-                pb.inc(n);
-            }
-            compute_handle.join().expect("compute thread panicked");
-
-            TIFFWriteDirectory(dst_tiff);
         }
 
-        TIFFClose(dst_tiff);
-        TIFFClose(src_tiff);
+        let src_is_jp2k   = is_jp2k(src_lv.compression as u32);
+        let src_is_jpeg   = src_lv.compression as u32 == COMPRESSION_JPEG;
+        let src_jp2k_is_ycbcr =
+            src_is_jp2k && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
+
+        let jpeg_tables_arc: Option<Arc<Vec<u8>>> = if src_is_jpeg {
+            let mut tlen: u32 = 0;
+            let mut tptr: *const u8 = std::ptr::null();
+            let ok = unsafe { TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
+                &mut tlen as *mut u32, &mut tptr as *mut *const u8) };
+            if ok != 0 && !tptr.is_null() && tlen > 2 {
+                Some(Arc::new(unsafe { std::slice::from_raw_parts(tptr, tlen as usize) }.to_vec()))
+            } else { None }
+        } else { None };
+
+        let raw_buf_size = (unsafe { TIFFTileSize(src_tiff) } as usize)
+            .max(src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize)
+            .max(1 << 17);
+        let pix_size = src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize;
+        let tile_ids: Vec<u32> = (0..src_lv.n_tiles).collect();
+
+        type BakeTile = (u32, Option<(Vec<u8>, bool, bool)>);
+
+        let (raw_tx, raw_rx) = mpsc::sync_channel::<Vec<BakeTile>>(2);
+        let (enc_tx, enc_rx) = mpsc::sync_channel::<EncChunk>(2);
+
+        let xform_t        = Arc::clone(&icc_xform);
+        let tables_t       = jpeg_tables_arc.clone();
+        let quality        = args.quality;
+        let spp            = out_spp;
+        let src_tile_w     = src_lv.tile_w;
+        let src_tile_h     = src_lv.tile_h;
+        let src_photometric = src_lv.photometric as u32;
+
+        let compute_handle = std::thread::spawn(move || {
+            for raw_chunk in raw_rx {
+                let mut encoded: EncChunk = raw_chunk.par_iter()
+                    .filter_map(|(id, tile_opt)| {
+                        let (data, is_raw_jpeg, is_jp2k_tile) = tile_opt.as_ref()?;
+                        let jpeg = bake_single_tile(
+                            data, *is_raw_jpeg, *is_jp2k_tile, src_jp2k_is_ycbcr,
+                            spp, src_tile_w, src_tile_h, quality,
+                            &xform_t,
+                            tables_t.as_deref().map(|v| v.as_slice()),
+                            src_photometric,
+                        )?;
+                        Some((*id, jpeg))
+                    })
+                    .collect();
+                encoded.sort_unstable_by_key(|(n, _)| *n);
+                if enc_tx.send(encoded).is_err() { break; }
+            }
+        });
+
+        let mut jpegtables_registered = false;
+        let mut pending_write: Option<EncChunk> = None;
+
+        for chunk in tile_ids.chunks(chunk_size) {
+            let raw_chunk: Vec<BakeTile> = chunk.iter()
+                .map(|&tile_num| {
+                    if src_is_jp2k || src_is_jpeg {
+                        let mut buf = vec![0u8; raw_buf_size];
+                        let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
+                            buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
+                        if n > 0 {
+                            buf.truncate(n as usize);
+                            (tile_num, Some((buf, src_is_jpeg, src_is_jp2k)))
+                        } else {
+                            (tile_num, None)
+                        }
+                    } else {
+                        let mut buf = vec![0u8; pix_size];
+                        let n = unsafe { TIFFReadEncodedTile(src_tiff, tile_num,
+                            buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
+                        if n > 0 { (tile_num, Some((buf, false, false))) }
+                        else { (tile_num, None) }
+                    }
+                })
+                .collect();
+
+            raw_tx.send(raw_chunk).expect("compute thread dropped");
+
+            if let Some(prev) = pending_write.take() {
+                let n = prev.len() as u64;
+                unsafe { write_enc_chunk(dst_tiff, &prev, &mut jpegtables_registered); }
+                pb.inc(n);
+            }
+            pending_write = enc_rx.recv().ok();
+        }
+
+        drop(raw_tx);
+        if let Some(last) = pending_write.take() {
+            let n = last.len() as u64;
+            unsafe { write_enc_chunk(dst_tiff, &last, &mut jpegtables_registered); }
+            pb.inc(n);
+        }
+        for enc in enc_rx {
+            let n = enc.len() as u64;
+            unsafe { write_enc_chunk(dst_tiff, &enc, &mut jpegtables_registered); }
+            pb.inc(n);
+        }
+        compute_handle.join().expect("compute thread panicked");
+
+        unsafe { TIFFWriteDirectory(dst_tiff); }
     }
+
+    unsafe { TIFFClose(dst_tiff); }
+    unsafe { TIFFClose(src_tiff); }
 
     if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
         eprintln!("  [error] Failed to rename {tmp_path} → {out_path}: {e}");
@@ -523,32 +523,32 @@ fn write_jp2k_svs_from_tiff(
     let total_tiles: u64 = levels.iter().map(|lv| lv.n_tiles as u64).sum();
     pb.set_length(total_tiles);
 
-    unsafe {
-        let src_c = CString::new(src_path).unwrap();
-        let dst_c = CString::new(dst_path).unwrap();
-        let r_mode  = CString::new("r").unwrap();
-        let w8_mode = CString::new("w8").unwrap();
+    let src_c   = CString::new(src_path).unwrap();
+    let dst_c   = CString::new(dst_path).unwrap();
+    let r_mode  = CString::new("r").unwrap();
+    let w8_mode = CString::new("w8").unwrap();
 
-        let src_tiff = TIFFOpen(src_c.as_ptr(), r_mode.as_ptr());
-        if src_tiff.is_null() {
-            eprintln!("  [error] Cannot open source for JP2K passthrough: {src_path}");
-            return;
-        }
-        let dst_tiff = TIFFOpen(dst_c.as_ptr(), w8_mode.as_ptr());
-        if dst_tiff.is_null() {
-            eprintln!("  [error] Cannot create SVS: {dst_path}");
-            TIFFClose(src_tiff);
-            return;
-        }
+    let src_tiff = unsafe { TIFFOpen(src_c.as_ptr(), r_mode.as_ptr()) };
+    if src_tiff.is_null() {
+        eprintln!("  [error] Cannot open source for JP2K passthrough: {src_path}");
+        return;
+    }
+    let dst_tiff = unsafe { TIFFOpen(dst_c.as_ptr(), w8_mode.as_ptr()) };
+    if dst_tiff.is_null() {
+        eprintln!("  [error] Cannot create SVS: {dst_path}");
+        unsafe { TIFFClose(src_tiff); }
+        return;
+    }
 
-        for (idx, lv) in levels.iter().enumerate() {
-            navigate(src_tiff, idx, levels);
+    for (idx, lv) in levels.iter().enumerate() {
+        unsafe { navigate(src_tiff, idx, levels); }
 
-            let aperio_compr: u32 =
-                if lv.photometric as u32 == PHOTOMETRIC_YCBCR { COMPRESSION_APERIO_JP2_YCBCR }
-                else { crate::source::tiff::COMPRESSION_APERIO_JP2_RGB };
+        let aperio_compr: u32 =
+            if lv.photometric as u32 == PHOTOMETRIC_YCBCR { COMPRESSION_APERIO_JP2_YCBCR }
+            else { crate::source::tiff::COMPRESSION_APERIO_JP2_RGB };
 
-            let subfile: u32 = if idx == 0 { 0 } else { FILETYPE_REDUCEDIMAGE };
+        let subfile: u32 = if idx == 0 { 0 } else { FILETYPE_REDUCEDIMAGE };
+        unsafe {
             set_tiff_ifd_tags(dst_tiff, subfile,
                 lv.img_w, lv.img_h, lv.tile_w, lv.tile_h,
                 aperio_compr, lv.photometric as u32, lv.spp as u32,
@@ -556,35 +556,35 @@ fn write_jp2k_svs_from_tiff(
             if lv.photometric as u32 == PHOTOMETRIC_YCBCR {
                 TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING, 2u32, 2u32);
             }
-
-            if idx == 0 {
-                let desc_c = CString::new(img_desc.as_str()).unwrap();
-                TIFFSetField(dst_tiff, TIFFTAG_IMAGEDESCRIPTION, desc_c.as_ptr());
-            }
-
-            if verbose {
-                vlog(Some(pb), format!("  [pass ] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                    idx, lv.img_w, lv.img_h, lv.mpp_x, lv.tile_w, lv.tile_h, lv.n_tiles));
-            }
-
-            let raw_buf_size = (TIFFTileSize(src_tiff) as usize).max(1 << 17);
-            for tile_num in 0..lv.n_tiles {
-                let mut buf = vec![0u8; raw_buf_size];
-                let n = TIFFReadRawTile(src_tiff, tile_num,
-                    buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
-                if n > 0 {
-                    TIFFWriteRawTile(dst_tiff, tile_num,
-                        buf.as_ptr() as *mut c_void, n);
-                }
-                pb.inc(1);
-            }
-
-            TIFFWriteDirectory(dst_tiff);
         }
 
-        TIFFClose(dst_tiff);
-        TIFFClose(src_tiff);
+        if idx == 0 {
+            let desc_c = CString::new(img_desc.as_str()).unwrap();
+            unsafe { TIFFSetField(dst_tiff, TIFFTAG_IMAGEDESCRIPTION, desc_c.as_ptr()); }
+        }
+
+        if verbose {
+            vlog(Some(pb), format!("  [pass ] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
+                idx, lv.img_w, lv.img_h, lv.mpp_x, lv.tile_w, lv.tile_h, lv.n_tiles));
+        }
+
+        let raw_buf_size = (unsafe { TIFFTileSize(src_tiff) } as usize).max(1 << 17);
+        for tile_num in 0..lv.n_tiles {
+            let mut buf = vec![0u8; raw_buf_size];
+            let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
+                buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
+            if n > 0 {
+                unsafe { TIFFWriteRawTile(dst_tiff, tile_num,
+                    buf.as_ptr() as *mut c_void, n); }
+            }
+            pb.inc(1);
+        }
+
+        unsafe { TIFFWriteDirectory(dst_tiff); }
     }
+
+    unsafe { TIFFClose(dst_tiff); }
+    unsafe { TIFFClose(src_tiff); }
 }
 
 // ─── Per-file processing ──────────────────────────────────────────────────────
@@ -785,264 +785,262 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     let r_mode  = CString::new("r").unwrap();
     let w8_mode = CString::new("w8").unwrap();
 
-    unsafe {
-        let src_tiff = TIFFOpen(src_c.as_ptr(), r_mode.as_ptr());
-        if src_tiff.is_null() {
-            eprintln!("  [error] Cannot re-open: {src_path}");
-            return;
-        }
-        let dst_tiff = TIFFOpen(tmp_c.as_ptr(), w8_mode.as_ptr());
-        if dst_tiff.is_null() {
-            eprintln!("  [error] Cannot create: {tmp_path}");
-            TIFFClose(src_tiff);
-            return;
-        }
+    let src_tiff = unsafe { TIFFOpen(src_c.as_ptr(), r_mode.as_ptr()) };
+    if src_tiff.is_null() {
+        eprintln!("  [error] Cannot re-open: {src_path}");
+        return;
+    }
+    let dst_tiff = unsafe { TIFFOpen(tmp_c.as_ptr(), w8_mode.as_ptr()) };
+    if dst_tiff.is_null() {
+        eprintln!("  [error] Cannot create: {tmp_path}");
+        unsafe { TIFFClose(src_tiff); }
+        return;
+    }
 
-        let n_subifds = output_levels.len() - 1;
-        if ome && n_subifds > 0 {
-            let zeros: Vec<u64> = vec![0u64; n_subifds];
-            TIFFSetField(dst_tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr());
-        }
+    let n_subifds = output_levels.len() - 1;
+    if ome && n_subifds > 0 {
+        let zeros: Vec<u64> = vec![0u64; n_subifds];
+        unsafe { TIFFSetField(dst_tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr()); }
+    }
 
-        let chunk_size = (rayon::current_num_threads() * 4).max(1);
+    let chunk_size = (rayon::current_num_threads() * 4).max(1);
 
-        for (lv_idx, lv_out) in output_levels.iter().enumerate() {
-            let src_lv  = &src_levels[lv_out.src_idx];
-            let is_base = lv_idx == 0;
-            let subfile = if is_base { 0u32 } else { FILETYPE_REDUCEDIMAGE };
+    for (lv_idx, lv_out) in output_levels.iter().enumerate() {
+        let src_lv  = &src_levels[lv_out.src_idx];
+        let is_base = lv_idx == 0;
+        let subfile = if is_base { 0u32 } else { FILETYPE_REDUCEDIMAGE };
 
-            navigate(src_tiff, lv_out.src_idx, &src_levels);
+        unsafe { navigate(src_tiff, lv_out.src_idx, &src_levels); }
 
-            let (src_subsamp_h, src_subsamp_v) = if src_lv.compression as u32 == COMPRESSION_JPEG
-                && src_lv.photometric as u32 == PHOTOMETRIC_YCBCR
-            {
-                let mut sh: u16 = 2;
-                let mut sv: u16 = 2;
-                TIFFGetField(src_tiff, TIFFTAG_YCBCRSUBSAMPLING,
-                    &mut sh as *mut u16, &mut sv as *mut u16);
-                (sh, sv)
-            } else {
-                (2u16, 2u16)
-            };
+        let (src_subsamp_h, src_subsamp_v) = if src_lv.compression as u32 == COMPRESSION_JPEG
+            && src_lv.photometric as u32 == PHOTOMETRIC_YCBCR
+        {
+            let mut sh: u16 = 2;
+            let mut sv: u16 = 2;
+            unsafe { TIFFGetField(src_tiff, TIFFTAG_YCBCRSUBSAMPLING,
+                &mut sh as *mut u16, &mut sv as *mut u16); }
+            (sh, sv)
+        } else {
+            (2u16, 2u16)
+        };
 
-            let ifd_compr = if lv_out.passthrough { src_lv.compression as u32 } else { COMPRESSION_JPEG };
-            let ifd_photo = if lv_out.passthrough { src_lv.photometric as u32 } else { out_photometric };
-            set_tiff_ifd_tags(dst_tiff, subfile,
-                lv_out.out_img_w, lv_out.out_img_h,
-                lv_out.out_tile_w, lv_out.out_tile_h,
-                ifd_compr, ifd_photo, out_spp,
-                lv_out.actual_mpp_x, lv_out.actual_mpp_y);
+        let ifd_compr = if lv_out.passthrough { src_lv.compression as u32 } else { COMPRESSION_JPEG };
+        let ifd_photo = if lv_out.passthrough { src_lv.photometric as u32 } else { out_photometric };
+        unsafe { set_tiff_ifd_tags(dst_tiff, subfile,
+            lv_out.out_img_w, lv_out.out_img_h,
+            lv_out.out_tile_w, lv_out.out_tile_h,
+            ifd_compr, ifd_photo, out_spp,
+            lv_out.actual_mpp_x, lv_out.actual_mpp_y); }
 
-            if lv_out.passthrough {
-                if src_lv.photometric as u32 == PHOTOMETRIC_YCBCR {
-                    TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING,
-                        src_subsamp_h as u32, src_subsamp_v as u32);
-                }
-                if src_lv.compression as u32 == COMPRESSION_JPEG {
-                    let mut tlen: u32 = 0;
-                    let mut tptr: *const u8 = std::ptr::null();
-                    let ok = TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
-                        &mut tlen as *mut u32,
-                        &mut tptr as *mut *const u8);
-                    if ok != 0 && !tptr.is_null() && tlen > 2 {
-                        TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES, tlen, tptr);
-                    }
-                }
-            } else if out_photometric == PHOTOMETRIC_YCBCR {
-                TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING, 2u32, 2u32);
+        if lv_out.passthrough {
+            if src_lv.photometric as u32 == PHOTOMETRIC_YCBCR {
+                unsafe { TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING,
+                    src_subsamp_h as u32, src_subsamp_v as u32); }
             }
-
-            if is_base {
-                if let Some(ref desc) = image_desc_c {
-                    TIFFSetField(dst_tiff, TIFFTAG_IMAGEDESCRIPTION, desc.as_ptr());
-                }
-                if !args.icc_bake {
-                    if let Some(ref icc) = icc_profile {
-                        TIFFSetField(dst_tiff, TIFFTAG_ICCPROFILE,
-                            icc.len() as u32, icc.as_ptr() as *const c_void);
-                    }
-                }
-            }
-
-            let raw_buf_size = (TIFFTileSize(src_tiff) as usize)
-                .max(src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize)
-                .max(1 << 17);
-
-            let n_tiles  = src_lv.n_tiles;
-            let tile_ids: Vec<u32> = (0..n_tiles).collect();
-
-            let pix_size    = src_lv.tile_w as usize
-                * src_lv.tile_h as usize
-                * src_lv.spp as usize;
-            let src_is_jp2k   = is_jp2k(src_lv.compression as u32);
-            let src_is_jpeg   = src_lv.compression as u32 == COMPRESSION_JPEG;
-            let src_jp2k_is_ycbcr =
-                src_is_jp2k && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
-
-            let n_reduce: u32 = if src_is_jp2k && !lv_out.passthrough {
-                let nat_otw = (lv_out.out_tile_w / 2).max(1);
-                let nat_oth = (lv_out.out_tile_h / 2).max(1);
-                let scale_down = (src_lv.tile_w as f64 / nat_otw as f64)
-                    .min(src_lv.tile_h as f64 / nat_oth as f64);
-                if scale_down > 1.0 { scale_down.log2().floor() as u32 } else { 0 }
-            } else {
-                0
-            };
-
-            let jpeg_tables_arc: Option<Arc<Vec<u8>>> = if src_is_jpeg && !lv_out.passthrough {
+            if src_lv.compression as u32 == COMPRESSION_JPEG {
                 let mut tlen: u32 = 0;
                 let mut tptr: *const u8 = std::ptr::null();
-                let ok = TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
+                let ok = unsafe { TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
                     &mut tlen as *mut u32,
-                    &mut tptr as *mut *const u8);
+                    &mut tptr as *mut *const u8) };
                 if ok != 0 && !tptr.is_null() && tlen > 2 {
-                    Some(Arc::new(std::slice::from_raw_parts(tptr, tlen as usize).to_vec()))
-                } else {
-                    None
+                    unsafe { TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES, tlen, tptr); }
                 }
-            } else {
-                None
-            };
-
-            if lv_out.passthrough {
-                for chunk in tile_ids.chunks(chunk_size) {
-                    let raw_chunk: Vec<(u32, Vec<u8>)> = chunk.iter()
-                        .map(|&tile_num| {
-                            let mut buf = vec![0u8; raw_buf_size];
-                            let n = TIFFReadRawTile(src_tiff, tile_num,
-                                buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
-                            if n > 0 { buf.truncate(n as usize); (tile_num, buf) }
-                            else { (tile_num, Vec::new()) }
-                        })
-                        .collect();
-                    for (tile_num, data) in raw_chunk {
-                        if !data.is_empty() {
-                            TIFFWriteRawTile(dst_tiff, tile_num,
-                                data.as_ptr() as *mut c_void, data.len() as i64);
-                        }
-                        pb.inc(1);
-                    }
-                }
-            } else {
-                let src_tile_w = src_lv.tile_w;
-                let src_tile_h = src_lv.tile_h;
-                let out_tile_w = lv_out.out_tile_w;
-                let out_tile_h = lv_out.out_tile_h;
-                let src_ntx = (src_lv.img_w + src_tile_w - 1) / src_tile_w;
-                let src_nty = (src_lv.img_h + src_tile_h - 1) / src_tile_h;
-                let out_ntx = (lv_out.out_img_w + out_tile_w - 1) / out_tile_w;
-                let out_nty = (lv_out.out_img_h + out_tile_h - 1) / out_tile_h;
-                let out_tile_ids: Vec<u32> = (0..out_ntx * out_nty).collect();
-
-                let enc_params = Arc::new(EncodeParams {
-                    quality:           args.quality,
-                    src_tile_w,
-                    src_tile_h,
-                    out_tile_w,
-                    out_tile_h,
-                    spp:               out_spp,
-                    resize_opts:       resize_opts.clone(),
-                    fpt:               fir_pixel_type,
-                    src_is_jpeg,
-                    src_jp2k_is_ycbcr,
-                    src_photometric:   src_lv.photometric as u32,
-                    n_reduce,
-                    half:              args.half,
-                    jpeg_tables:       jpeg_tables_arc.clone(),
-                    icc_transform:     icc_transform_arc.clone(),
-                });
-
-                let (raw_tx, raw_rx) = mpsc::sync_channel::<RawChunk>(2);
-                let (enc_tx, enc_rx) = mpsc::sync_channel::<EncChunk>(2);
-                let params_t = Arc::clone(&enc_params);
-                let compute_handle = std::thread::spawn(move || {
-                    compute_thread(raw_rx, enc_tx, |id, quads| encode_one_tile(id, quads, &params_t));
-                });
-
-                let mut jpegtables_registered = false;
-                let mut pending_write: Option<EncChunk> = None;
-
-                for chunk in out_tile_ids.chunks(chunk_size) {
-                    let raw_chunk: RawChunk = chunk.iter()
-                        .map(|&out_id| {
-                            let oc  = out_id % out_ntx;
-                            let or_ = out_id / out_ntx;
-                            let mut quads: RawQuad = [None, None, None, None];
-                            for qi in 0..4usize {
-                                let dc = (qi % 2) as u32;
-                                let dr = (qi / 2) as u32;
-                                let sc = 2 * oc + dc;
-                                let sr = 2 * or_ + dr;
-                                if sc >= src_ntx || sr >= src_nty { continue; }
-                                let tile_num = sr * src_ntx + sc;
-                                if src_is_jp2k {
-                                    let mut buf = vec![0u8; raw_buf_size];
-                                    let n = TIFFReadRawTile(src_tiff, tile_num,
-                                        buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
-                                    if n > 0 {
-                                        buf.truncate(n as usize);
-                                        quads[qi] = Some((buf, true));
-                                    }
-                                } else if src_is_jpeg {
-                                    let mut raw_buf = vec![0u8; raw_buf_size];
-                                    let raw_n = TIFFReadRawTile(src_tiff, tile_num,
-                                        raw_buf.as_mut_ptr() as *mut c_void,
-                                        raw_buf.len() as i64);
-                                    if raw_n > 2
-                                        && raw_buf[0] == 0xFF && raw_buf[1] == 0xD8
-                                    {
-                                        raw_buf.truncate(raw_n as usize);
-                                        quads[qi] = Some((raw_buf, true));
-                                    } else {
-                                        let mut pix_buf = vec![0u8; pix_size];
-                                        let n = TIFFReadEncodedTile(src_tiff, tile_num,
-                                            pix_buf.as_mut_ptr() as *mut c_void,
-                                            pix_buf.len() as i64);
-                                        if n > 0 { quads[qi] = Some((pix_buf, false)); }
-                                    }
-                                } else {
-                                    let mut buf = vec![0u8; pix_size];
-                                    let n = TIFFReadEncodedTile(src_tiff, tile_num,
-                                        buf.as_mut_ptr() as *mut c_void, buf.len() as i64);
-                                    if n > 0 { quads[qi] = Some((buf, false)); }
-                                }
-                            }
-                            (out_id, quads)
-                        })
-                        .collect();
-
-                    raw_tx.send(raw_chunk).expect("compute thread dropped");
-
-                    if let Some(prev) = pending_write.take() {
-                        let n = prev.len() as u64;
-                        write_enc_chunk(dst_tiff, &prev, &mut jpegtables_registered);
-                        pb.inc(n);
-                    }
-
-                    pending_write = enc_rx.recv().ok();
-                }
-
-                drop(raw_tx);
-
-                if let Some(last) = pending_write.take() {
-                    let n = last.len() as u64;
-                    write_enc_chunk(dst_tiff, &last, &mut jpegtables_registered);
-                    pb.inc(n);
-                }
-                for enc in enc_rx {
-                    let n = enc.len() as u64;
-                    write_enc_chunk(dst_tiff, &enc, &mut jpegtables_registered);
-                    pb.inc(n);
-                }
-                compute_handle.join().expect("compute thread panicked");
             }
-
-            TIFFWriteDirectory(dst_tiff);
+        } else if out_photometric == PHOTOMETRIC_YCBCR {
+            unsafe { TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING, 2u32, 2u32); }
         }
 
-        TIFFClose(dst_tiff);
-        TIFFClose(src_tiff);
+        if is_base {
+            if let Some(ref desc) = image_desc_c {
+                unsafe { TIFFSetField(dst_tiff, TIFFTAG_IMAGEDESCRIPTION, desc.as_ptr()); }
+            }
+            if !args.icc_bake {
+                if let Some(ref icc) = icc_profile {
+                    unsafe { TIFFSetField(dst_tiff, TIFFTAG_ICCPROFILE,
+                        icc.len() as u32, icc.as_ptr() as *const c_void); }
+                }
+            }
+        }
+
+        let raw_buf_size = (unsafe { TIFFTileSize(src_tiff) } as usize)
+            .max(src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize)
+            .max(1 << 17);
+
+        let n_tiles  = src_lv.n_tiles;
+        let tile_ids: Vec<u32> = (0..n_tiles).collect();
+
+        let pix_size    = src_lv.tile_w as usize
+            * src_lv.tile_h as usize
+            * src_lv.spp as usize;
+        let src_is_jp2k   = is_jp2k(src_lv.compression as u32);
+        let src_is_jpeg   = src_lv.compression as u32 == COMPRESSION_JPEG;
+        let src_jp2k_is_ycbcr =
+            src_is_jp2k && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
+
+        let n_reduce: u32 = if src_is_jp2k && !lv_out.passthrough {
+            let nat_otw = (lv_out.out_tile_w / 2).max(1);
+            let nat_oth = (lv_out.out_tile_h / 2).max(1);
+            let scale_down = (src_lv.tile_w as f64 / nat_otw as f64)
+                .min(src_lv.tile_h as f64 / nat_oth as f64);
+            if scale_down > 1.0 { scale_down.log2().floor() as u32 } else { 0 }
+        } else {
+            0
+        };
+
+        let jpeg_tables_arc: Option<Arc<Vec<u8>>> = if src_is_jpeg && !lv_out.passthrough {
+            let mut tlen: u32 = 0;
+            let mut tptr: *const u8 = std::ptr::null();
+            let ok = unsafe { TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
+                &mut tlen as *mut u32,
+                &mut tptr as *mut *const u8) };
+            if ok != 0 && !tptr.is_null() && tlen > 2 {
+                Some(Arc::new(unsafe { std::slice::from_raw_parts(tptr, tlen as usize) }.to_vec()))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if lv_out.passthrough {
+            for chunk in tile_ids.chunks(chunk_size) {
+                let raw_chunk: Vec<(u32, Vec<u8>)> = chunk.iter()
+                    .map(|&tile_num| {
+                        let mut buf = vec![0u8; raw_buf_size];
+                        let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
+                            buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
+                        if n > 0 { buf.truncate(n as usize); (tile_num, buf) }
+                        else { (tile_num, Vec::new()) }
+                    })
+                    .collect();
+                for (tile_num, data) in raw_chunk {
+                    if !data.is_empty() {
+                        unsafe { TIFFWriteRawTile(dst_tiff, tile_num,
+                            data.as_ptr() as *mut c_void, data.len() as i64); }
+                    }
+                    pb.inc(1);
+                }
+            }
+        } else {
+            let src_tile_w = src_lv.tile_w;
+            let src_tile_h = src_lv.tile_h;
+            let out_tile_w = lv_out.out_tile_w;
+            let out_tile_h = lv_out.out_tile_h;
+            let src_ntx = (src_lv.img_w + src_tile_w - 1) / src_tile_w;
+            let src_nty = (src_lv.img_h + src_tile_h - 1) / src_tile_h;
+            let out_ntx = (lv_out.out_img_w + out_tile_w - 1) / out_tile_w;
+            let out_nty = (lv_out.out_img_h + out_tile_h - 1) / out_tile_h;
+            let out_tile_ids: Vec<u32> = (0..out_ntx * out_nty).collect();
+
+            let enc_params = Arc::new(EncodeParams {
+                quality:           args.quality,
+                src_tile_w,
+                src_tile_h,
+                out_tile_w,
+                out_tile_h,
+                spp:               out_spp,
+                resize_opts:       resize_opts.clone(),
+                fpt:               fir_pixel_type,
+                src_is_jpeg,
+                src_jp2k_is_ycbcr,
+                src_photometric:   src_lv.photometric as u32,
+                n_reduce,
+                half:              args.half,
+                jpeg_tables:       jpeg_tables_arc.clone(),
+                icc_transform:     icc_transform_arc.clone(),
+            });
+
+            let (raw_tx, raw_rx) = mpsc::sync_channel::<RawChunk>(2);
+            let (enc_tx, enc_rx) = mpsc::sync_channel::<EncChunk>(2);
+            let params_t = Arc::clone(&enc_params);
+            let compute_handle = std::thread::spawn(move || {
+                compute_thread(raw_rx, enc_tx, |id, quads| encode_one_tile(id, quads, &params_t));
+            });
+
+            let mut jpegtables_registered = false;
+            let mut pending_write: Option<EncChunk> = None;
+
+            for chunk in out_tile_ids.chunks(chunk_size) {
+                let raw_chunk: RawChunk = chunk.iter()
+                    .map(|&out_id| {
+                        let oc  = out_id % out_ntx;
+                        let or_ = out_id / out_ntx;
+                        let mut quads: RawQuad = [None, None, None, None];
+                        for qi in 0..4usize {
+                            let dc = (qi % 2) as u32;
+                            let dr = (qi / 2) as u32;
+                            let sc = 2 * oc + dc;
+                            let sr = 2 * or_ + dr;
+                            if sc >= src_ntx || sr >= src_nty { continue; }
+                            let tile_num = sr * src_ntx + sc;
+                            if src_is_jp2k {
+                                let mut buf = vec![0u8; raw_buf_size];
+                                let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
+                                    buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
+                                if n > 0 {
+                                    buf.truncate(n as usize);
+                                    quads[qi] = Some((buf, true));
+                                }
+                            } else if src_is_jpeg {
+                                let mut raw_buf = vec![0u8; raw_buf_size];
+                                let raw_n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
+                                    raw_buf.as_mut_ptr() as *mut c_void,
+                                    raw_buf.len() as i64) };
+                                if raw_n > 2
+                                    && raw_buf[0] == 0xFF && raw_buf[1] == 0xD8
+                                {
+                                    raw_buf.truncate(raw_n as usize);
+                                    quads[qi] = Some((raw_buf, true));
+                                } else {
+                                    let mut pix_buf = vec![0u8; pix_size];
+                                    let n = unsafe { TIFFReadEncodedTile(src_tiff, tile_num,
+                                        pix_buf.as_mut_ptr() as *mut c_void,
+                                        pix_buf.len() as i64) };
+                                    if n > 0 { quads[qi] = Some((pix_buf, false)); }
+                                }
+                            } else {
+                                let mut buf = vec![0u8; pix_size];
+                                let n = unsafe { TIFFReadEncodedTile(src_tiff, tile_num,
+                                    buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
+                                if n > 0 { quads[qi] = Some((buf, false)); }
+                            }
+                        }
+                        (out_id, quads)
+                    })
+                    .collect();
+
+                raw_tx.send(raw_chunk).expect("compute thread dropped");
+
+                if let Some(prev) = pending_write.take() {
+                    let n = prev.len() as u64;
+                    unsafe { write_enc_chunk(dst_tiff, &prev, &mut jpegtables_registered); }
+                    pb.inc(n);
+                }
+
+                pending_write = enc_rx.recv().ok();
+            }
+
+            drop(raw_tx);
+
+            if let Some(last) = pending_write.take() {
+                let n = last.len() as u64;
+                unsafe { write_enc_chunk(dst_tiff, &last, &mut jpegtables_registered); }
+                pb.inc(n);
+            }
+            for enc in enc_rx {
+                let n = enc.len() as u64;
+                unsafe { write_enc_chunk(dst_tiff, &enc, &mut jpegtables_registered); }
+                pb.inc(n);
+            }
+            compute_handle.join().expect("compute thread panicked");
+        }
+
+        unsafe { TIFFWriteDirectory(dst_tiff); }
     }
+
+    unsafe { TIFFClose(dst_tiff); }
+    unsafe { TIFFClose(src_tiff); }
 
     if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
         eprintln!("  [error] Failed to rename {tmp_path} → {out_path}: {e}");
