@@ -173,7 +173,7 @@ fn convert_one_series(
     let tmp_path = format!("{}.tmp", output_path);
 
     if let Some(skip) = jp2k_svs_skip {
-        crate::write_svs(
+        writer::write_svs(
             &src.slide_levels[skip..],
             src.thumbnail.as_ref(),
             src.label.as_ref(),
@@ -185,7 +185,7 @@ fn convert_one_series(
             args.icc_bake,
         );
     } else if let Some(target_mpp) = effective_mpp {
-        crate::write_resampled_tiff(
+        writer::write_resampled_tiff(
             &src.slide_levels, &tmp_path,
             target_mpp, args.quality, args.filter,
             !args.legacy,
@@ -196,7 +196,7 @@ fn convert_one_series(
         );
     } else if args.legacy {
         if is_jpeg2000(&comp) {
-            crate::write_svs(
+            writer::write_svs(
                 &src.slide_levels,
                 src.thumbnail.as_ref(),
                 src.label.as_ref(),
@@ -208,7 +208,7 @@ fn convert_one_series(
                 args.icc_bake,
             );
         } else {
-            crate::write_flat_multipage_tiff(
+            writer::write_flat_multipage_tiff(
                 &src.slide_levels,
                 &tmp_path,
                 Some(&pb),
@@ -218,7 +218,7 @@ fn convert_one_series(
             );
         }
     } else {
-        crate::write_ome_tiff(
+        writer::write_ome_tiff(
             &src.slide_levels,
             src.thumbnail.as_ref(),
             src.overview.as_ref(),
