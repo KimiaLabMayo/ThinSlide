@@ -6,5 +6,6 @@
 *.svs
 *.tmp
 CLAUDE*.md
+*.log
 
 .DS_Store

@@ -7,6 +7,7 @@
 #[allow(non_snake_case)]
 pub mod bindings;
 pub mod args;
+pub mod logger;
 pub mod pipeline;
 pub mod source;
 pub use args::Args;

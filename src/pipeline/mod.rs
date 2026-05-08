@@ -16,6 +16,7 @@ use crate::source::dicom::{
 };
 use crate::source::SlideSource;
 use crate::Args;
+use crate::logger::{ConversionDetail, ConversionLogger, ConversionStats, datetime_display, timestamp_string};
 use crate::tiffds;
 
 // Strips directory components and rejects characters unsafe in filenames so
@@ -41,13 +42,25 @@ fn convert_one_series(
     series_idx: usize,
     args: &Args,
     mp: &MultiProgress,
-    skipped: &AtomicUsize,
+    logger: &ConversionLogger,
+    stats: &ConversionStats,
 ) {
     let convert_start = std::time::Instant::now();
 
+    let input_bytes: u64 = series_meta.iter()
+        .filter_map(|m| std::fs::metadata(&m.file_path).ok())
+        .map(|fm| fm.len()).sum();
+    let series_uid_for_log = series_meta.first()
+        .map(|m| m.series_instance_uid.clone())
+        .unwrap_or_default();
+
     let src = match DicomSource::from_series(series_meta) {
         Some(s) => s,
-        None    => return,
+        None => {
+            stats.fail.fetch_add(1, Ordering::Relaxed);
+            logger.log_fail(series_idx, &series_uid_for_log, "failed to build DicomSource");
+            return;
+        }
     };
 
     let series_id   = src.metadata().name.clone();
@@ -165,7 +178,8 @@ fn convert_one_series(
     pb.set_message(pb_msg.clone());
 
     if Path::new(&output_path).exists() {
-        skipped.fetch_add(1, Ordering::Relaxed);
+        stats.skipped.fetch_add(1, Ordering::Relaxed);
+        logger.log_skip(series_idx, fname);
         pb.finish_and_clear();
         return;
     }
@@ -231,11 +245,55 @@ fn convert_one_series(
         );
     }
 
-    std::fs::rename(&tmp_path, &output_path)
-        .expect("Failed to rename tmp file to output");
+    if let Err(e) = std::fs::rename(&tmp_path, &output_path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        stats.fail.fetch_add(1, Ordering::Relaxed);
+        logger.log_fail(series_idx, &series_id, &format!("rename failed: {}", e));
+        pb.finish_and_clear();
+        return;
+    }
 
-    let elapsed = convert_start.elapsed();
-    mp.println(format!("  {} {:.2}s", pb_msg, elapsed.as_millis() as f64 / 1000.0)).ok();
+    let elapsed_s = convert_start.elapsed().as_millis() as f64 / 1000.0;
+    let out_bytes = std::fs::metadata(&output_path).map(|m| m.len()).unwrap_or(0);
+    stats.ok.fetch_add(1, Ordering::Relaxed);
+    stats.in_bytes.fetch_add(input_bytes, Ordering::Relaxed);
+    stats.out_bytes.fetch_add(out_bytes, Ordering::Relaxed);
+
+    let base        = &src.slide_levels[0];
+    let in_tile     = base.tile_size;
+    let in_dim      = base.px_columns.zip(base.px_rows);
+    let (out_tile, out_dim, out_mpp_log) = if let Some(skip) = jp2k_svs_skip {
+        let lv = &src.slide_levels[skip];
+        (lv.tile_size, lv.px_columns.zip(lv.px_rows), lv.mpp_x.unwrap_or(src_mpp))
+    } else if let Some(target) = effective_mpp {
+        let (tw, th) = in_tile.unwrap_or((0, 0));
+        let out_t = if tw > 0 && th > 0 {
+            Some((
+                crate::nearest_16(tw as f64 * src_mpp / target * 2.0),
+                crate::nearest_16(th as f64 * src_mpp / target * 2.0),
+            ))
+        } else { None };
+        let out_d = in_dim.map(|(w, h)| (
+            (w as f64 * src_mpp / target).round() as u32,
+            (h as f64 * src_mpp / target).round() as u32,
+        ));
+        (out_t, out_d, target)
+    } else {
+        (in_tile, in_dim, src_mpp)
+    };
+    let input_dir = Path::new(&base.file_path)
+        .parent().and_then(|p| p.to_str()).unwrap_or("").to_string();
+    let detail = ConversionDetail {
+        input_path:  input_dir,
+        output_path: output_path.clone(),
+        encoding:    comp.to_string(),
+        in_tile, out_tile, in_dim, out_dim,
+        in_mpp:  src_mpp,
+        out_mpp: out_mpp_log,
+    };
+
+    logger.log_ok(series_idx, fname, elapsed_s, input_bytes, out_bytes, detail);
+    mp.println(format!("  {} {:.2}s", pb_msg, elapsed_s)).ok();
     pb.finish_and_clear();
 }
 
@@ -254,6 +312,14 @@ pub fn run(args: Args) {
     if !Path::new(&args.output_dir).exists() {
         std::fs::create_dir_all(&args.output_dir).expect("Failed to create output directory");
     }
+
+    let run_start = std::time::Instant::now();
+    let start_dt  = datetime_display();
+    let log_path  = args.log_file.clone()
+        .unwrap_or_else(|| format!("{}/conversion_{}.log", args.output_dir, timestamp_string()));
+    let logger = ConversionLogger::open(&log_path, &args, &start_dt)
+        .expect("Failed to open log file");
+    let stats  = ConversionStats::new();
 
     for entry in std::fs::read_dir(&args.output_dir).into_iter().flatten().flatten() {
         let p = entry.path();
@@ -327,7 +393,6 @@ pub fn run(args: Args) {
     );
 
     let series_counter = AtomicUsize::new(0);
-    let skipped_count  = AtomicUsize::new(0);
 
     let (tx, rx) = mpsc::channel::<Vec<DcmMetadata>>();
 
@@ -357,9 +422,10 @@ pub fn run(args: Args) {
         }
     });
 
-    let mp_ref      = &mp;
-    let args_ref    = &args;
-    let skipped_ref = &skipped_count;
+    let mp_ref     = &mp;
+    let args_ref   = &args;
+    let logger_ref = &logger;
+    let stats_ref  = &stats;
 
     rayon::scope(|s| {
         let n_concurrent = rayon::current_num_threads();
@@ -368,9 +434,9 @@ pub fn run(args: Args) {
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
             if args_ref.mpp.is_some() || args_ref.half {
-                convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
+                convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
             } else if n_concurrent <= 1 {
-                convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
+                convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
             } else {
                 if args.verbose {
                     println!("Passthrough mode");
@@ -385,7 +451,7 @@ pub fn run(args: Args) {
                 }
                 let sem_clone = Arc::clone(&sem);
                 s.spawn(move |_| {
-                    convert_one_series(series_meta, series_idx, args_ref, mp_ref, skipped_ref);
+                    convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
                     let (lock, cvar) = &*sem_clone;
                     let mut active = lock.lock().unwrap();
                     *active -= 1;
@@ -399,11 +465,14 @@ pub fn run(args: Args) {
     meta_pb.finish_and_clear();
 
     let total_processed = series_counter.load(Ordering::Relaxed);
-    let skipped = skipped_count.load(Ordering::Relaxed);
-    if skipped > 0 {
-        println!("  {} of {} series skipped (output already exists).",
-            skipped, total_processed);
-    }
+    let _ = total_processed;
+    let ok      = stats.ok.load(Ordering::Relaxed);
+    let fail    = stats.fail.load(Ordering::Relaxed);
+    let skipped = stats.skipped.load(Ordering::Relaxed);
+    println!("Total: {}  OK: {}  FAIL: {}  SKIP: {}", ok + fail + skipped, ok, fail, skipped);
+    let duration_s = run_start.elapsed().as_millis() as f64 / 1000.0;
+    logger.write_summary(&stats, duration_s);
+    println!("Log: {}", log_path);
 
     if !tiff_paths.is_empty() {
         if args.mpp.is_some() || args.half || args.icc_bake {

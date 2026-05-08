@@ -23,6 +23,8 @@ pub struct Args {
     /// Apply ICC color profile to pixel data, converting to sRGB.
     /// The ICC profile tag is omitted from the output.
     pub icc_bake:        bool,
+    /// Override the default log file path.
+    pub log_file:        Option<String>,
 }
 
 impl Args {
@@ -41,6 +43,11 @@ impl Args {
             } else {
                 None
             }
+        });
+
+        // Parse --log-file PATH
+        let log_file = all.windows(2).find_map(|w| {
+            if w[0] == "--log-file" { Some(w[1].clone()) } else { None }
         });
 
         // Parse --mpp N
@@ -82,7 +89,7 @@ impl Args {
         let mut skip_next = false;
         for token in &all[1..] {
             if skip_next { skip_next = false; continue; }
-            if matches!(token.as_str(), "--jobs" | "-j" | "--mpp" | "--quality" | "--filter") {
+            if matches!(token.as_str(), "--jobs" | "-j" | "--mpp" | "--quality" | "--filter" | "--log-file") {
                 skip_next = true; continue;
             }
             if token.starts_with('-') { continue; }
@@ -94,6 +101,6 @@ impl Args {
             return Err("--half and --mpp are mutually exclusive");
         }
         Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter,
-                  use_parent_name, half, icc_bake })
+                  use_parent_name, half, icc_bake, log_file })
     }
 }
