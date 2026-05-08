@@ -1,106 +1,107 @@
+use std::path::Path;
 use image::imageops::FilterType;
+use clap::Parser;
 
+#[derive(Parser)]
+#[command(name = "slean", about = "Whole Slide Image Optimizer")]
 pub struct Args {
-    pub input_dir:       String,
-    pub output_dir:      String,
-    pub legacy:          bool,
-    pub verbose:         bool,
-    pub jobs:            Option<usize>,
-    /// Target resolution in microns-per-pixel.  When set, tiles are decoded,
-    /// resampled to the nearest valid tile size, and re-encoded as JPEG.
-    pub mpp:             Option<f64>,
-    /// JPEG quality used when resampling (--mpp).  Default 87.
-    pub quality:         u8,
-    /// Resampling filter used when resizing tiles (--mpp).  Default Nearest.
-    pub filter:          FilterType,
-    /// When true, use the parent directory name of the DICOM files as the
-    /// output filename instead of the Series Instance UID.
+    /// Input directory containing DICOM files (must exist)
+    #[arg(value_parser = parse_input_dir)]
+    pub input_dir: String,
+
+    /// Output directory (created if it does not exist; parent must exist)
+    #[arg(value_parser = parse_output_dir)]
+    pub output_dir: String,
+
+    /// Use legacy format (SVS / generic BigTIFF instead of OME-TIFF)
+    #[arg(long)]
+    pub legacy: bool,
+
+    /// Enable verbose output
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
+
+    /// Use parent directory name instead of Series Instance UID
+    #[arg(long)]
     pub use_parent_name: bool,
-    /// When true, halve both width and height (1/4 area).
-    /// JPEG tiles are decoded at 1/2 via DCT-domain scaling; JP2K uses n_reduce=1.
-    /// Mutually exclusive with --mpp.
-    pub half:            bool,
-    /// Apply ICC color profile to pixel data, converting to sRGB.
-    /// The ICC profile tag is omitted from the output.
-    pub icc_bake:        bool,
-    /// Override the default log file path.
-    pub log_file:        Option<String>,
+
+    /// Halve both width and height (1/4 area); mutually exclusive with --mpp
+    #[arg(long, conflicts_with = "mpp")]
+    pub half: bool,
+
+    /// Apply ICC color profile and convert to sRGB
+    #[arg(long)]
+    pub icc_bake: bool,
+
+    /// Number of parallel threads (>= 1)
+    #[arg(short = 'j', long, value_parser = parse_jobs)]
+    pub jobs: Option<usize>,
+
+    /// Target resolution in microns-per-pixel [0.001..=2.0]
+    #[arg(long, value_parser = parse_mpp)]
+    pub mpp: Option<f64>,
+
+    /// JPEG quality for resampling [20..=100]
+    #[arg(long, default_value_t = 87, value_parser = clap::value_parser!(u8).range(20..=100))]
+    pub quality: u8,
+
+    /// Resampling filter [nearest, triangle, catmullrom, gaussian, lanczos3]
+    #[arg(long, default_value = "nearest", value_parser = parse_filter)]
+    pub filter: FilterType,
+
+    /// Override the default log file path (parent directory must exist)
+    #[arg(long, value_parser = parse_log_file)]
+    pub log_file: Option<String>,
 }
 
-impl Args {
-    pub fn build(args: impl Iterator<Item = String>) -> Result<Args, &'static str> {
-        let all: Vec<String> = args.collect();
-        let legacy          = all.iter().any(|a| a == "--legacy");
-        let verbose         = all.iter().any(|a| a == "-v" || a == "--verbose");
-        let use_parent_name = all.iter().any(|a| a == "--use-parent-name");
-        let half            = all.iter().any(|a| a == "--half");
-        let icc_bake        = all.iter().any(|a| a == "--icc-bake");
+fn parse_jobs(s: &str) -> Result<usize, String> {
+    let v: usize = s.parse().map_err(|_| format!("'{}' is not a valid integer", s))?;
+    if v == 0 { return Err("--jobs must be >= 1".to_string()); }
+    Ok(v)
+}
 
-        // Parse --jobs N or -j N
-        let jobs = all.windows(2).find_map(|w| {
-            if w[0] == "--jobs" || w[0] == "-j" {
-                w[1].parse::<usize>().ok()
-            } else {
-                None
-            }
-        });
+fn parse_input_dir(s: &str) -> Result<String, String> {
+    let p = Path::new(s);
+    if !p.exists() { return Err(format!("'{}' does not exist", s)); }
+    if !p.is_dir() { return Err(format!("'{}' is not a directory", s)); }
+    Ok(s.to_string())
+}
 
-        // Parse --log-file PATH
-        let log_file = all.windows(2).find_map(|w| {
-            if w[0] == "--log-file" { Some(w[1].clone()) } else { None }
-        });
-
-        // Parse --mpp N
-        let mpp = all.windows(2).find_map(|w| {
-            if w[0] == "--mpp" {
-                w[1].parse::<f64>().ok()
-            } else {
-                None
-            }
-        });
-
-        // Parse --quality N (default 87)
-        let quality = all.windows(2).find_map(|w| {
-            if w[0] == "--quality" {
-                w[1].parse::<u8>().ok()
-            } else {
-                None
-            }
-        }).unwrap_or(87);
-
-        // Parse --filter NAME (default: nearest)
-        let filter = all.windows(2).find_map(|w| {
-            if w[0] == "--filter" {
-                match w[1].to_lowercase().as_str() {
-                    "nearest"               => Some(FilterType::Nearest),
-                    "triangle" | "bilinear" => Some(FilterType::Triangle),
-                    "catmullrom"| "bicubic" => Some(FilterType::CatmullRom),
-                    "gaussian"              => Some(FilterType::Gaussian),
-                    "lanczos3"              => Some(FilterType::Lanczos3),
-                    _                       => None,
-                }
-            } else {
-                None
-            }
-        }).unwrap_or(FilterType::Nearest);
-
-        // Collect positional args, skipping flags and their values
-        let mut positional: Vec<&str> = Vec::new();
-        let mut skip_next = false;
-        for token in &all[1..] {
-            if skip_next { skip_next = false; continue; }
-            if matches!(token.as_str(), "--jobs" | "-j" | "--mpp" | "--quality" | "--filter" | "--log-file") {
-                skip_next = true; continue;
-            }
-            if token.starts_with('-') { continue; }
-            positional.push(token.as_str());
-        }
-        let input_dir  = positional.first().ok_or("Didn't get an input directory path")?.to_string();
-        let output_dir = positional.get(1).ok_or("Didn't get an output directory path")?.to_string();
-        if half && mpp.is_some() {
-            return Err("--half and --mpp are mutually exclusive");
-        }
-        Ok(Args { input_dir, output_dir, legacy, verbose, jobs, mpp, quality, filter,
-                  use_parent_name, half, icc_bake, log_file })
+fn parse_output_dir(s: &str) -> Result<String, String> {
+    let p = Path::new(s);
+    let parent = p.parent().unwrap_or(Path::new("."));
+    if !parent.as_os_str().is_empty() && !parent.exists() {
+        return Err(format!("parent directory '{}' does not exist", parent.display()));
     }
+    Ok(s.to_string())
+}
+
+fn parse_mpp(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("'{}' is not a valid number", s))?;
+    if !(0.001..=2.0).contains(&v) {
+        return Err(format!("--mpp must be between 0.001 and 2.0, got {}", v));
+    }
+    Ok(v)
+}
+
+fn parse_filter(s: &str) -> Result<FilterType, String> {
+    match s.to_lowercase().as_str() {
+        "nearest"                => Ok(FilterType::Nearest),
+        "triangle" | "bilinear" => Ok(FilterType::Triangle),
+        "catmullrom"| "bicubic" => Ok(FilterType::CatmullRom),
+        "gaussian"              => Ok(FilterType::Gaussian),
+        "lanczos3"              => Ok(FilterType::Lanczos3),
+        _ => Err(format!(
+            "'{}' is not a valid filter [nearest, triangle, catmullrom, gaussian, lanczos3]", s
+        ))
+    }
+}
+
+fn parse_log_file(s: &str) -> Result<String, String> {
+    let p = Path::new(s);
+    let parent = p.parent().unwrap_or(Path::new("."));
+    if !parent.as_os_str().is_empty() && !parent.exists() {
+        return Err(format!("parent directory '{}' does not exist", parent.display()));
+    }
+    Ok(s.to_string())
 }

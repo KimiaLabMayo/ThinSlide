@@ -1,12 +1,10 @@
+use clap::Parser;
 use slide_leaner::{Args, run};
 
 fn main() {
     let start_time = std::time::Instant::now();
 
-    let args = Args::build(std::env::args()).unwrap_or_else(|err| {
-        eprintln!("Problem parsing arguments: {}", err);
-        std::process::exit(1);
-    });
+    let args = Args::parse();
     run(args);
 
     let elapsed = start_time.elapsed();

@@ -35,3 +35,4 @@ serde = { version = "1", features = ["derive"] }
 rfd = "0.14"
 portable-pty = "0.8"
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+clap = { version = "4", features = ["derive"] }

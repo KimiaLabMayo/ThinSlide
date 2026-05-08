@@ -1,3 +1,4 @@
+use clap::Parser;
 use eframe::egui;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use slide_leaner::{Args, run};
@@ -459,10 +460,7 @@ fn main() -> eframe::Result<()> {
     // Positional args present → CLI mode (no GUI window)
     if raw[1..].iter().any(|a| !a.starts_with('-')) {
         let start_time = std::time::Instant::now();
-        let args = Args::build(raw.into_iter()).unwrap_or_else(|err| {
-            eprintln!("Problem parsing arguments: {err}");
-            std::process::exit(1);
-        });
+        let args = Args::parse();
         run(args);
         println!("Total execution time: {:.2?}", start_time.elapsed());
         return Ok(());
