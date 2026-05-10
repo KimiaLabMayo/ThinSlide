@@ -1,9 +1,9 @@
 // SVS writer (JPEG 2000-compressed DICOM → Aperio SVS).
 //
-// SVS IFD order (required by OpenSlide):
+// SVS IFD order (Aperio convention — NOT standard TIFF REDUCEDIMAGE convention):
 //   IFD 0:         Full resolution pyramid level (largest), tiled, SubFileType=0
-//   IFD 1:         Thumbnail (stripped JPEG, small), SubFileType=1
-//   IFDs 2..N:     Remaining pyramid levels (descending), tiled, SubFileType=1
+//   IFD 1:         Thumbnail (stripped JPEG, small), SubFileType=0
+//   IFDs 2..N:     Remaining pyramid levels (descending), tiled, SubFileType=0
 //   IFD N+1:       Label image (stripped JPEG), SubFileType=1   [optional]
 //   IFD N+2:       Macro/Overview image (stripped JPEG), SubFileType=9 [optional]
 
@@ -235,10 +235,25 @@ pub(crate) fn write_svs(
         // Estimate from MPP: 40x ≈ 0.25 µm/px
         (0.25 / base_mpp_x * 40.0).round()
     });
+    // Effective compression after optional ICC baking
+    let (eff_compression, eff_photometric) = if icc_transform.is_some() {
+        (7u32, PHOTOMETRIC_YCBCR as u32)
+    } else {
+        (svs_compression, photometric)
+    };
+    let comp_desc = if eff_compression == COMPRESSION_APERIO_JP2_YCBCR {
+        "J2K/YCB".to_string()
+    } else if eff_compression == COMPRESSION_APERIO_JP2_RGB {
+        "J2K/RGB".to_string()
+    } else if eff_photometric == PHOTOMETRIC_YCBCR as u32 {
+        format!("JPEG/YCC Q={}", quality)
+    } else {
+        format!("JPEG/RGB Q={}", quality)
+    };
     let image_desc = format!(
         "Aperio Image Library (DICOM converted)\n\
-         {}x{} ({}x{}) JPEG2000|AppMag={:.0}|MPP={:.6}",
-        img_w, img_h, tile_w, tile_h, mag, base_mpp_x
+         {}x{} [0,0 {}x{}] ({}x{}) {}|AppMag = {:.0}|MPP = {:.6}",
+        img_w, img_h, img_w, img_h, tile_w, tile_h, comp_desc, mag, base_mpp_x
     );
     let image_desc_c = CString::new(image_desc).unwrap();
 
@@ -292,7 +307,7 @@ pub(crate) fn write_svs(
     let thumb_written = thumbnail_meta
         .and_then(|m| super::decode_frame_as_jpeg(&m.file_path, 0, 90))
         .map(|(jpeg, w, h)| {
-            unsafe { write_svs_stripped_jpeg(tiff, &jpeg, w, h, FILETYPE_REDUCEDIMAGE); }
+            unsafe { write_svs_stripped_jpeg(tiff, &jpeg, w, h, 0); }
             unsafe { TIFFWriteDirectory(tiff); }
             if let Some(p) = pb { p.inc(1); }
         });
@@ -335,7 +350,7 @@ pub(crate) fn write_svs(
             tiff, level,
             svs_compression, photometric,
             base_res_x / ds, base_res_y / ds,
-            FILETYPE_REDUCEDIMAGE,
+            0,
             None,
             icc_transform.as_deref(),
             quality,
