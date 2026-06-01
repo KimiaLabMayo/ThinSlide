@@ -77,7 +77,7 @@ By default the output is OME-TIFF. Pass `--legacy` to select a format based on t
 | `--legacy` | Write BigTIFF or SVS instead of OME-TIFF | off |
 | `-j` / `--jobs <N>` | Number of parallel threads | all CPUs |
 | `--quality <N>` | JPEG quality for re-encoding (1–100); used with `--mpp`, `--half`, or `--icc-bake` | 87 |
-| `--filter <NAME>` | Downsampling filter: `nearest`, `triangle`, `catmullrom`, `lanczos3` | `nearest` |
+| `--filter <NAME>` | Resampling filter for `--mpp`: `nearest`, `triangle`, `catmullrom`, `lanczos3`. **Ignored with `--half`** — decode-side halving produces the exact target size with no resize step. | `nearest` |
 | `--use-parent-name` | Name DICOM output files after parent directory instead of Series Instance UID | off |
 | `-v` / `--verbose` | Print input/output paths and scan summary | off |
 
@@ -124,6 +124,8 @@ TIFF/SVS files are always processed one file at a time (tile-level parallelism w
 
 
 ### Downsampling filters
+
+`--filter` applies only to `--mpp` mode. It is **ignored with `--half`**: JPEG sources are halved in the DCT domain (turbojpeg `ONE_HALF`), and JPEG 2000 sources are halved via DWT level-1 reduction. Both paths produce the exact half-size output directly, so no pixel-domain resize step is performed.
 
 | Filter | Algorithm | Notes |
 |---|---|---|

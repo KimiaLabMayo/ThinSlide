@@ -219,29 +219,53 @@ pub(crate) fn write_resampled_tiff(
                 // No scaling: output dimensions equal the source dimensions.
                 (chosen_w, chosen_h, chosen_tw, chosen_th, chosen_mpp_x, chosen_mpp_y)
             } else {
-                // Output tile covers a 2×2 block of source tiles (one source tile maps to
-                // nat_otw_f × nat_oth_f output pixels); apply nearest_16 to the full output
-                // tile size so that rounding on the doubled value is more accurate than
-                // rounding each half and doubling (e.g. nearest_16(120)*2=256 vs nearest_16(240)=240).
-                let nat_otw_f = chosen_tw as f64 * chosen_mpp_x / target_lv_mpp_x;
-                let nat_oth_f = chosen_th as f64 * chosen_mpp_y / target_lv_mpp_y;
-                let otw = crate::nearest_16(nat_otw_f * 2.0);
-                let oth = crate::nearest_16(nat_oth_f * 2.0);
-                let nat_otw = (otw / 2).max(1);
-                let nat_oth = (oth / 2).max(1);
-                // Image dimensions and actual MPP derived from the natural tile scale.
-                let scale_x = if chosen_tw > 0 { nat_otw as f64 / chosen_tw as f64 } else { 1.0 };
-                let scale_y = if chosen_th > 0 { nat_oth as f64 / chosen_th as f64 } else { 1.0 };
-                let oiw = (chosen_w as f64 * scale_x).round() as u32;
-                let oih = (chosen_h as f64 * scale_y).round() as u32;
-                // When MPP is unknown, leave actual_mpp as 0.0 (written as no resolution tag).
-                let amx = if half_unknown { 0.0 }
-                          else if nat_otw > 0 { chosen_mpp_x * chosen_tw as f64 / nat_otw as f64 }
-                          else { chosen_mpp_x };
-                let amy = if half_unknown { 0.0 }
-                          else if nat_oth > 0 { chosen_mpp_y * chosen_th as f64 / nat_oth as f64 }
-                          else { chosen_mpp_y };
-                (oiw, oih, otw, oth, amx, amy)
+                // For --half + JP2K: DWT level-1 yields ceil(tw/2) per quad; use that directly
+                // so the assembled canvas matches out_tile exactly — no correction resize needed.
+                let is_jp2k_half = half && matches!(
+                    map_transfer_syntax_to_compression(&chosen_meta.transfer_syntax_uid),
+                    CompressionType::Jpeg2000Lossless | CompressionType::Jpeg2000
+                    | CompressionType::Jpeg2000Part2MulticomponentLossless
+                    | CompressionType::Jpeg2000Part2Multicomponent
+                );
+                if is_jp2k_half {
+                    let nat_otw = ((chosen_tw + 1) / 2).max(1);  // ceil(tw/2)
+                    let nat_oth = ((chosen_th + 1) / 2).max(1);
+                    let scale_x = if chosen_tw > 0 { nat_otw as f64 / chosen_tw as f64 } else { 1.0 };
+                    let scale_y = if chosen_th > 0 { nat_oth as f64 / chosen_th as f64 } else { 1.0 };
+                    let oiw = (chosen_w as f64 * scale_x).round() as u32;
+                    let oih = (chosen_h as f64 * scale_y).round() as u32;
+                    let amx = if half_unknown { 0.0 }
+                              else if nat_otw > 0 { chosen_mpp_x * chosen_tw as f64 / nat_otw as f64 }
+                              else { chosen_mpp_x };
+                    let amy = if half_unknown { 0.0 }
+                              else if nat_oth > 0 { chosen_mpp_y * chosen_th as f64 / nat_oth as f64 }
+                              else { chosen_mpp_y };
+                    (oiw, oih, nat_otw * 2, nat_oth * 2, amx, amy)
+                } else {
+                    // Output tile covers a 2×2 block of source tiles (one source tile maps to
+                    // nat_otw_f × nat_oth_f output pixels); apply nearest_16 to the full output
+                    // tile size so that rounding on the doubled value is more accurate than
+                    // rounding each half and doubling (e.g. nearest_16(120)*2=256 vs nearest_16(240)=240).
+                    let nat_otw_f = chosen_tw as f64 * chosen_mpp_x / target_lv_mpp_x;
+                    let nat_oth_f = chosen_th as f64 * chosen_mpp_y / target_lv_mpp_y;
+                    let otw = crate::nearest_16(nat_otw_f * 2.0);
+                    let oth = crate::nearest_16(nat_oth_f * 2.0);
+                    let nat_otw = (otw / 2).max(1);
+                    let nat_oth = (oth / 2).max(1);
+                    // Image dimensions and actual MPP derived from the natural tile scale.
+                    let scale_x = if chosen_tw > 0 { nat_otw as f64 / chosen_tw as f64 } else { 1.0 };
+                    let scale_y = if chosen_th > 0 { nat_oth as f64 / chosen_th as f64 } else { 1.0 };
+                    let oiw = (chosen_w as f64 * scale_x).round() as u32;
+                    let oih = (chosen_h as f64 * scale_y).round() as u32;
+                    // When MPP is unknown, leave actual_mpp as 0.0 (written as no resolution tag).
+                    let amx = if half_unknown { 0.0 }
+                              else if nat_otw > 0 { chosen_mpp_x * chosen_tw as f64 / nat_otw as f64 }
+                              else { chosen_mpp_x };
+                    let amy = if half_unknown { 0.0 }
+                              else if nat_oth > 0 { chosen_mpp_y * chosen_th as f64 / nat_oth as f64 }
+                              else { chosen_mpp_y };
+                    (oiw, oih, otw, oth, amx, amy)
+                }
             };
 
         if out_img_w.max(out_img_h) < crate::MIN_PYRAMID_SIDE {
@@ -368,14 +392,6 @@ pub(crate) fn write_resampled_tiff(
     let write_level_tiles = |tiff: *mut TIFF, lv: &LevelInfo, half: bool| {
         let chunk_size = (rayon::current_num_threads() * 4).max(1);
 
-        // n_reduce for JP2K DWT: each source tile is scaled to nat_otw = out_tile_w/2
-        // (the 2×2 canvas is then resized to out_tile_w). Use nat_otw for the ratio.
-        let nat_otw = (lv.out_tile_w / 2).max(1);
-        let nat_oth = (lv.out_tile_h / 2).max(1);
-        let scale_down = (lv.src_tile_w as f64 / nat_otw as f64)
-            .min(lv.src_tile_h as f64 / nat_oth as f64);
-        let n_reduce: u32 = if scale_down > 1.0 { scale_down.log2().floor() as u32 } else { 0 };
-
         // Source image dimensions for grid computation (shared across group files).
         let src_img_w = lv.src_group[0].px_columns.unwrap_or(0);
         let src_img_h = lv.src_group[0].px_rows.unwrap_or(0);
@@ -391,6 +407,19 @@ pub(crate) fn write_resampled_tiff(
             | CompressionType::Jpeg2000Part2MulticomponentLossless
             | CompressionType::Jpeg2000Part2Multicomponent
         );
+
+        // n_reduce for JP2K DWT: choose the number of resolution reduction levels.
+        // For --half the out_tile was computed from ceil(src/2), so n_reduce=1 is exact.
+        // For --mpp, derive n_reduce from the scale ratio so DWT does most of the work.
+        let n_reduce: u32 = if is_jp2k_src && half {
+            1
+        } else {
+            let nat_otw = (lv.out_tile_w / 2).max(1);
+            let nat_oth = (lv.out_tile_h / 2).max(1);
+            let scale_down = (lv.src_tile_w as f64 / nat_otw as f64)
+                .min(lv.src_tile_h as f64 / nat_oth as f64);
+            if scale_down > 1.0 { scale_down.log2().floor() as u32 } else { 0 }
+        };
 
         // Phase 1: aggregate all source tile data keyed by TIFF tile_num.
         // JPEG / JP2K: store raw encoded bytes (decoded in parallel during stitch).

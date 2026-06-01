@@ -45,7 +45,9 @@ pub struct Args {
     #[arg(long, default_value_t = 87, value_parser = clap::value_parser!(u8).range(20..=100))]
     pub quality: u8,
 
-    /// Resampling filter [nearest, triangle, catmullrom, gaussian, lanczos3]
+    /// Resampling filter for --mpp [nearest, triangle, catmullrom, gaussian, lanczos3].
+    /// Ignored with --half: decode-side halving (DCT 1/2 / DWT level-1) produces the
+    /// exact target size, so no pixel-domain resize step is performed.
     #[arg(long, default_value = "nearest", value_parser = parse_filter)]
     pub filter: FilterType,
 

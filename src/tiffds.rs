@@ -704,7 +704,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return;
     }
 
-    let mut output_levels = compute_output_levels(&src_levels, target_mpp, args.verbose, args.icc_bake);
+    let mut output_levels = compute_output_levels(&src_levels, target_mpp, args.verbose, args.icc_bake, args.half);
     if mpp_unknown {
         for lv in output_levels.iter_mut() {
             lv.actual_mpp_x = 0.0;
@@ -879,11 +879,15 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             src_is_jp2k && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
 
         let n_reduce: u32 = if src_is_jp2k && !lv_out.passthrough {
-            let nat_otw = (lv_out.out_tile_w / 2).max(1);
-            let nat_oth = (lv_out.out_tile_h / 2).max(1);
-            let scale_down = (src_lv.tile_w as f64 / nat_otw as f64)
-                .min(src_lv.tile_h as f64 / nat_oth as f64);
-            if scale_down > 1.0 { scale_down.log2().floor() as u32 } else { 0 }
+            if args.half {
+                1  // out_tile was derived from ceil(src/2), so DWT level-1 is exact
+            } else {
+                let nat_otw = (lv_out.out_tile_w / 2).max(1);
+                let nat_oth = (lv_out.out_tile_h / 2).max(1);
+                let scale_down = (src_lv.tile_w as f64 / nat_otw as f64)
+                    .min(src_lv.tile_h as f64 / nat_oth as f64);
+                if scale_down > 1.0 { scale_down.log2().floor() as u32 } else { 0 }
+            }
         } else {
             0
         };
@@ -1055,6 +1059,7 @@ fn compute_output_levels(
     target_mpp: f64,
     verbose: bool,
     icc_bake: bool,
+    half: bool,
 ) -> Vec<OutputLevel> {
     let base_mpp = src_levels[0].mpp_x;
     let mut out  = Vec::new();
@@ -1080,6 +1085,18 @@ fn compute_output_levels(
         let (out_img_w, out_img_h, out_tile_w, out_tile_h, actual_mpp_x, actual_mpp_y) =
             if passthrough {
                 (best.img_w, best.img_h, best.tile_w, best.tile_h, best.mpp_x, best.mpp_y)
+            } else if half && is_jp2k(best.compression as u32) {
+                // DWT level-1 gives ceil(tw/2) per quad; use that directly
+                // so the assembled canvas matches out_tile exactly — no correction resize needed.
+                let nat_otw = ((best.tile_w + 1) / 2).max(1);  // ceil(tw/2)
+                let nat_oth = ((best.tile_h + 1) / 2).max(1);
+                let sx  = if best.tile_w > 0 { nat_otw as f64 / best.tile_w as f64 } else { 1.0 };
+                let sy  = if best.tile_h > 0 { nat_oth as f64 / best.tile_h as f64 } else { 1.0 };
+                let oiw = (best.img_w as f64 * sx).round() as u32;
+                let oih = (best.img_h as f64 * sy).round() as u32;
+                let amx = if nat_otw > 0 { best.mpp_x * best.tile_w as f64 / nat_otw as f64 } else { best.mpp_x };
+                let amy = if nat_oth > 0 { best.mpp_y * best.tile_h as f64 / nat_oth as f64 } else { best.mpp_y };
+                (oiw, oih, nat_otw * 2, nat_oth * 2, amx, amy)
             } else {
                 let nat_otw = nearest_16(best.tile_w as f64 * best.mpp_x / target_lv_mpp_x);
                 let nat_oth = nearest_16(best.tile_h as f64 * best.mpp_y / target_lv_mpp_y);

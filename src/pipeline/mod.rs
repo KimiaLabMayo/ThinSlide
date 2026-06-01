@@ -304,6 +304,10 @@ pub fn run(args: Args) {
             .build_global();
     }
 
+    if args.half && !matches!(args.filter, image::imageops::FilterType::Nearest) {
+        eprintln!("[warn] --filter is ignored with --half: decode-side halving skips the resize step");
+    }
+
     if args.verbose {
         eprintln!("[src] {}", args.input_dir);
         eprintln!("[out] {}", args.output_dir);
