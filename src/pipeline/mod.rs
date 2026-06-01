@@ -344,6 +344,7 @@ pub fn run(args: Args) {
     let mut dir_map: std::collections::HashMap<std::path::PathBuf, Vec<String>> =
         std::collections::HashMap::new();
     let mut tiff_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut vsi_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut last_dir_count   = 0usize;
     let mut total_file_count = 0usize;
     for entry in WalkDir::new(&args.input_dir).into_iter().filter_map(|e| e.ok()) {
@@ -368,6 +369,9 @@ pub fn run(args: Args) {
                 tiff_paths.push(entry.path().to_owned());
                 scan_pb.set_message(format!("{} DCM in {} dirs, {} TIFF/SVS",
                     total_file_count, dir_map.len(), tiff_paths.len()));
+            }
+            "vsi" => {
+                vsi_paths.push(entry.path().to_owned());
             }
             _ => {}
         }
@@ -486,5 +490,53 @@ pub fn run(args: Args) {
             eprintln!("  {} TIFF/SVS file(s) found; specify --mpp, --half, or --icc-bake to process them.",
                 tiff_paths.len());
         }
+    }
+
+    if !vsi_paths.is_empty() {
+        vsi_paths.sort();
+        convert_vsi_files(&vsi_paths, &args, &mp);
+    }
+}
+
+// Experimental: transcode the main 2D pyramid of each CellSens .vsi to TIFF.
+fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress) {
+    for path in paths {
+        let src = path.to_string_lossy().to_string();
+        let stem = sanitize_file_stem(
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
+        let out_path = if args.legacy {
+            format!("{}/{}.tiff", args.output_dir, stem)
+        } else {
+            format!("{}/{}.ome.tiff", args.output_dir, stem)
+        };
+        if Path::new(&out_path).exists() {
+            if args.verbose { eprintln!("  [skip ] exists: {}", out_path); }
+            continue;
+        }
+
+        let pb = mp.add(ProgressBar::new(0));
+        pb.set_style(ProgressStyle::with_template(
+            "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
+        ).unwrap().progress_chars("=>-"));
+        pb.set_message(stem.clone());
+
+        let tmp_path = format!("{}.tmp", out_path);
+        match crate::source::vsi::convert_vsi(
+            &src, &tmp_path, args.legacy, args.quality, args.verbose, Some(&pb),
+        ) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    eprintln!("  [error] rename failed for {}: {}", stem, e);
+                } else {
+                    mp.println(format!("  {} (vsi)", stem)).ok();
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                eprintln!("  [skip ] {}: {}", stem, e);
+            }
+        }
+        pb.finish_and_clear();
     }
 }
