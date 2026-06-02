@@ -555,16 +555,21 @@ pub(crate) fn convert_vsi(
 
     let spp = ets.size_c as usize;
     let mut levels = build_levels(ets, meta);
-    // --half: emit at half width/height (1/4 area). The ETS pyramid already
-    // stores res=1 at exactly half resolution, so drop the full-res level and
-    // promote res=1 to base — lossless, no resize, JPEG tiles still pass
-    // through verbatim. A single-resolution source can't be halved this way.
-    if half {
-        if levels.len() > 1 {
-            levels.remove(0);
-        } else if verbose {
+    // CellSens stores a downsampling level for every 1/2 step (res 0,1,2,...),
+    // which is wasteful: 1/4 steps suffice in practice. Keep only every other
+    // level so the output pyramid steps by 1/4, dropping the rest verbatim
+    // (JPEG tiles still pass through losslessly — no resize):
+    //   - default/passthrough: res 0, 2, 4, ...  → 1, 1/4, 1/16, ...
+    //   - --half:              res 1, 3, 5, ...  → 1/2, 1/8, 1/32, ...
+    // --half also drops the full-resolution level by starting at res=1. A
+    // single-resolution source can't be halved, so leave it untouched.
+    if half && levels.len() < 2 {
+        if verbose {
             vlog(pb, "  [vsi  ] --half ignored: source has no sub-resolution level".to_string());
         }
+    } else {
+        let parity = if half { 1 } else { 0 };
+        levels.retain(|lv| lv.res % 2 == parity);
     }
     if verbose {
         let mode = if ets.comp_type == COMP_JPEG { "pass" } else { "transcode" };
