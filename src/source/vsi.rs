@@ -16,8 +16,10 @@ use std::path::{Path, PathBuf};
 use indicatif::ProgressBar;
 use rayon::prelude::*;
 
+use std::os::raw::c_void;
+
 use crate::bindings::{
-    TIFFOpen, TIFFClose, TIFFSetField, TIFFWriteDirectory,
+    TIFFOpen, TIFFClose, TIFFSetField, TIFFWriteDirectory, TIFFWriteRawTile,
     TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_SUBIFD, TIFFTAG_YCBCRSUBSAMPLING,
     PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK, COMPRESSION_JPEG, FILETYPE_REDUCEDIMAGE,
 };
@@ -196,8 +198,19 @@ struct Chunk {
     nbytes: u32,
 }
 
+// Raw byte slice of a chunk's compressed payload, or None if the offset/length
+// fall outside the file.
+fn chunk_bytes<'a>(ets: &'a Ets, c: &Chunk) -> Option<&'a [u8]> {
+    let d = ets.data();
+    let s = c.offset as usize;
+    let e = (s + c.nbytes as usize).min(d.len());
+    if s < e { Some(&d[s..e]) } else { None }
+}
+
 pub(crate) struct Ets {
-    bytes:           Vec<u8>,
+    // Memory-mapped .ets file: tiles are read straight from the OS page cache,
+    // so a multi-GB stream never lands fully in RSS.
+    mmap:            memmap2::Mmap,
     n_dim:           usize,
     pixel_type:      i32,
     size_c:          i32,
@@ -219,8 +232,16 @@ const COMP_BMP: i32 = 9;
 const PIXEL_UCHAR: i32 = 2;
 
 impl Ets {
+    fn data(&self) -> &[u8] { &self.mmap }
+
     fn parse(path: &Path) -> Option<Ets> {
-        let bytes = std::fs::read(path).ok()?;
+        let file = std::fs::File::open(path).ok()?;
+        let mmap = unsafe { memmap2::Mmap::map(&file).ok()? };
+        // Each tile is read exactly once, in a single forward pass; ask the
+        // kernel to read ahead and drop already-consumed pages so resident
+        // memory stays bounded even for multi-GB streams.
+        let _ = mmap.advise(memmap2::Advice::Sequential);
+        let bytes: &[u8] = &mmap;
         if bytes.len() < 48 || &bytes[0..3] != b"SIS" { return None; }
 
         let n_dim          = rd_i32(&bytes, 12) as usize;
@@ -265,7 +286,7 @@ impl Ets {
         }
 
         Some(Ets {
-            bytes, n_dim, pixel_type, size_c, comp_type,
+            mmap, n_dim, pixel_type, size_c, comp_type,
             tile_w, tile_h, component_order, use_pyramid,
             background, chunks, max_res,
         })
@@ -336,10 +357,11 @@ fn decode_tile(ets: &Ets, chunk: Option<&Chunk>, spp: usize) -> Vec<u8> {
     let Some(chunk) = chunk else {
         return background_tile(ets, full, spp);
     };
+    let bytes = ets.data();
     let start = chunk.offset as usize;
-    let endb  = (start + chunk.nbytes as usize).min(ets.bytes.len());
+    let endb  = (start + chunk.nbytes as usize).min(bytes.len());
     if start >= endb { return background_tile(ets, full, spp); }
-    let data = &ets.bytes[start..endb];
+    let data = &bytes[start..endb];
 
     let decoded: Option<Vec<u8>> = match ets.comp_type {
         COMP_JPEG => {
@@ -485,6 +507,7 @@ pub(crate) fn convert_vsi(
     out_path: &str,
     legacy: bool,
     quality: u8,
+    half: bool,
     verbose: bool,
     pb: Option<&ProgressBar>,
 ) -> Result<(), String> {
@@ -531,12 +554,24 @@ pub(crate) fn convert_vsi(
     }
 
     let spp = ets.size_c as usize;
-    let levels = build_levels(ets, meta);
+    let mut levels = build_levels(ets, meta);
+    // --half: emit at half width/height (1/4 area). The ETS pyramid already
+    // stores res=1 at exactly half resolution, so drop the full-res level and
+    // promote res=1 to base — lossless, no resize, JPEG tiles still pass
+    // through verbatim. A single-resolution source can't be halved this way.
+    if half {
+        if levels.len() > 1 {
+            levels.remove(0);
+        } else if verbose {
+            vlog(pb, "  [vsi  ] --half ignored: source has no sub-resolution level".to_string());
+        }
+    }
     if verbose {
+        let mode = if ets.comp_type == COMP_JPEG { "pass" } else { "transcode" };
         vlog(pb, format!(
-            "  [vsi  ] main '{}'  {}x{}  {} levels  spp={}  comp={}",
+            "  [vsi  ] main '{}'  {}x{}  {} levels  spp={}  comp={}  ({})",
             meta.name.as_deref().unwrap_or("?"),
-            levels[0].img_w, levels[0].img_h, levels.len(), spp, ets.comp_type,
+            levels[0].img_w, levels[0].img_h, levels.len(), spp, ets.comp_type, mode,
         ));
     }
 
@@ -575,6 +610,21 @@ pub(crate) fn convert_vsi(
     let th = ets.tile_h as usize;
     let index = ets.plane_index();
 
+    // When the source tiles are already JPEG, copy them verbatim instead of
+    // decoding + re-encoding: far faster and lossless (no chroma resampling).
+    let jpeg_pass = ets.comp_type == COMP_JPEG;
+    // Mirror the source chroma subsampling in the TIFF tag so viewers don't
+    // mis-render colors (libtiff would otherwise default to [2,2]).
+    let pass_subsamp: (u32, u32) = if jpeg_pass {
+        ets.chunks.iter()
+            .filter_map(|c| chunk_bytes(ets, c))
+            .find_map(crate::detect_jpeg_subsampling)
+            .map(|(h, v)| (h as u32, v as u32))
+            .unwrap_or((2, 2))
+    } else {
+        (2, 2)
+    };
+
     for (lv_idx, lv) in levels.iter().enumerate() {
         let subfile = if lv_idx == 0 { 0u32 } else { FILETYPE_REDUCEDIMAGE };
         unsafe {
@@ -583,7 +633,8 @@ pub(crate) fn convert_vsi(
                 COMPRESSION_JPEG, out_photometric, spp as u32,
                 lv.mpp_x, lv.mpp_y);
             if out_photometric == PHOTOMETRIC_YCBCR {
-                TIFFSetField(dst, TIFFTAG_YCBCRSUBSAMPLING as u32, 2u32, 2u32);
+                TIFFSetField(dst, TIFFTAG_YCBCRSUBSAMPLING as u32,
+                    pass_subsamp.0, pass_subsamp.1);
             }
             if lv_idx == 0 {
                 if let Some(ref desc) = image_desc_c {
@@ -596,19 +647,52 @@ pub(crate) fn convert_vsi(
         let nty = (lv.img_h + ets.tile_h - 1) / ets.tile_h;
         let ids: Vec<u32> = (0..ntx * nty).collect();
 
-        // Decode + re-encode every tile in parallel, then write in tile order.
-        let mut encoded: Vec<(u32, Vec<u8>)> = ids.par_iter().filter_map(|&id| {
-            let tc = id % ntx;
-            let tr = id / ntx;
-            let chunk = index.get(&(lv.res, tc, tr)).map(|&i| &ets.chunks[i]);
-            let pixels = decode_tile(ets, chunk, spp);
-            encode_tile(&pixels, tw, th, spp, quality).map(|j| (id, j))
-        }).collect();
-        encoded.sort_unstable_by_key(|(id, _)| *id);
+        if jpeg_pass {
+            // Passthrough: copy source JPEG tiles verbatim as self-contained
+            // streams, written straight from the mmap with no intermediate
+            // accumulation. Missing grid positions get an encoded background
+            // tile. (libtiff copies the buffer it is handed, so pointing it at
+            // the mmap slice is safe.)
+            for (n, &id) in ids.iter().enumerate() {
+                let tc = id % ntx;
+                let tr = id / ntx;
+                match index.get(&(lv.res, tc, tr))
+                    .and_then(|&i| chunk_bytes(ets, &ets.chunks[i]))
+                {
+                    Some(b) => unsafe {
+                        TIFFWriteRawTile(dst, id, b.as_ptr() as *mut c_void, b.len() as i64);
+                    },
+                    None => {
+                        let pixels = background_tile(ets, tw * th * spp, spp);
+                        if let Some(enc) = encode_tile(&pixels, tw, th, spp, quality) {
+                            unsafe { TIFFWriteRawTile(dst, id,
+                                enc.as_ptr() as *mut c_void, enc.len() as i64); }
+                        }
+                    }
+                }
+                // Periodically drop already-consumed clean pages: each chunk is
+                // read exactly once, so this keeps resident memory bounded
+                // instead of pinning gigabytes of file cache for the whole run.
+                if (n + 1) % 2048 == 0 {
+                    unsafe { let _ = ets.mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed); }
+                }
+            }
+            if let Some(p) = pb { p.inc(ids.len() as u64); }
+        } else {
+            // Decode + re-encode every tile in parallel, then write in tile order.
+            let mut encoded: Vec<(u32, Vec<u8>)> = ids.par_iter().filter_map(|&id| {
+                let tc = id % ntx;
+                let tr = id / ntx;
+                let chunk = index.get(&(lv.res, tc, tr)).map(|&i| &ets.chunks[i]);
+                let pixels = decode_tile(ets, chunk, spp);
+                encode_tile(&pixels, tw, th, spp, quality).map(|j| (id, j))
+            }).collect();
+            encoded.sort_unstable_by_key(|(id, _)| *id);
 
-        let mut registered = false;
-        unsafe { write_enc_chunk(dst, &encoded, &mut registered); }
-        if let Some(p) = pb { p.inc(encoded.len() as u64); }
+            let mut registered = false;
+            unsafe { write_enc_chunk(dst, &encoded, &mut registered); }
+            if let Some(p) = pb { p.inc(encoded.len() as u64); }
+        }
 
         unsafe { TIFFWriteDirectory(dst); }
     }

@@ -4275,6 +4275,7 @@ dependencies = [
  "indicatif",
  "jpeg2k",
  "lcms2",
+ "memmap2",
  "pkg-config",
  "portable-pty",
  "rayon",

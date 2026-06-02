@@ -522,7 +522,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
 
         let tmp_path = format!("{}.tmp", out_path);
         match crate::source::vsi::convert_vsi(
-            &src, &tmp_path, args.legacy, args.quality, args.verbose, Some(&pb),
+            &src, &tmp_path, args.legacy, args.quality, args.half, args.verbose, Some(&pb),
         ) {
             Ok(()) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
