@@ -19,11 +19,11 @@ use rayon::prelude::*;
 use std::os::raw::c_void;
 
 use crate::bindings::{
-    TIFFOpen, TIFFClose, TIFFSetField, TIFFWriteDirectory, TIFFWriteRawTile,
-    TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_SUBIFD, TIFFTAG_YCBCRSUBSAMPLING,
+    TIFF, TIFFOpen, TIFFClose, TIFFSetField, TIFFWriteDirectory, TIFFWriteRawTile,
+    TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_SUBIFD, TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_JPEGTABLES,
     PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK, COMPRESSION_JPEG, FILETYPE_REDUCEDIMAGE,
 };
-use crate::{set_tiff_ifd_tags, write_enc_chunk, vlog};
+use crate::{set_tiff_ifd_tags, write_enc_chunk, split_jpeg_to_tables_and_tile, vlog};
 
 // ─── Little-endian scalar readers ─────────────────────────────────────────────
 
@@ -430,6 +430,30 @@ fn encode_tile(pixels: &[u8], tw: usize, th: usize, spp: usize, quality: u8) -> 
     }
 }
 
+// Write one JPEG tile, hoisting its DQT/DHT segments into the per-directory
+// JPEGTABLES tag so those bytes aren't repeated in every tile. The first tile
+// registers the tables; later tiles whose tables match write only the stripped
+// scan, and any tile with different tables falls back to a self-contained
+// stream. Mirrors the DICOM passthrough logic in pipeline::writer::flat.
+unsafe fn write_jpeg_tile(dst: *mut TIFF, id: u32, jpeg: &[u8], registered: &mut Option<Vec<u8>>) {
+    let split = split_jpeg_to_tables_and_tile(jpeg);
+    let write_bytes: &[u8] = match &split {
+        Some((tables, tile_data)) => {
+            if registered.is_none() {
+                unsafe { TIFFSetField(dst, TIFFTAG_JPEGTABLES as u32, tables.len() as u32, tables.as_ptr()); }
+                *registered = Some(tables.clone());
+                tile_data
+            } else if registered.as_ref() == Some(tables) {
+                tile_data
+            } else {
+                jpeg
+            }
+        }
+        None => jpeg,
+    };
+    unsafe { TIFFWriteRawTile(dst, id, write_bytes.as_ptr() as *mut c_void, write_bytes.len() as i64); }
+}
+
 // ─── File discovery ───────────────────────────────────────────────────────────
 
 // Collect "frame*.ets" files under the "_<stem>_" sibling directory, sorted by
@@ -653,11 +677,13 @@ pub(crate) fn convert_vsi(
         let ids: Vec<u32> = (0..ntx * nty).collect();
 
         if jpeg_pass {
-            // Passthrough: copy source JPEG tiles verbatim as self-contained
-            // streams, written straight from the mmap with no intermediate
-            // accumulation. Missing grid positions get an encoded background
-            // tile. (libtiff copies the buffer it is handed, so pointing it at
-            // the mmap slice is safe.)
+            // Passthrough: copy source JPEG tiles verbatim, written straight
+            // from the mmap with no intermediate accumulation. Their shared
+            // DQT/DHT tables are hoisted into the directory's JPEGTABLES tag so
+            // the bytes aren't repeated in every tile. Missing grid positions
+            // get an encoded background tile. (libtiff copies the buffer it is
+            // handed, so pointing it at the mmap slice is safe.)
+            let mut registered: Option<Vec<u8>> = None;
             for (n, &id) in ids.iter().enumerate() {
                 let tc = id % ntx;
                 let tr = id / ntx;
@@ -665,24 +691,27 @@ pub(crate) fn convert_vsi(
                     .and_then(|&i| chunk_bytes(ets, &ets.chunks[i]))
                 {
                     Some(b) => unsafe {
-                        TIFFWriteRawTile(dst, id, b.as_ptr() as *mut c_void, b.len() as i64);
+                        write_jpeg_tile(dst, id, b, &mut registered);
                     },
                     None => {
                         let pixels = background_tile(ets, tw * th * spp, spp);
                         if let Some(enc) = encode_tile(&pixels, tw, th, spp, quality) {
-                            unsafe { TIFFWriteRawTile(dst, id,
-                                enc.as_ptr() as *mut c_void, enc.len() as i64); }
+                            unsafe { write_jpeg_tile(dst, id, &enc, &mut registered); }
                         }
                     }
                 }
                 // Periodically drop already-consumed clean pages: each chunk is
                 // read exactly once, so this keeps resident memory bounded
                 // instead of pinning gigabytes of file cache for the whole run.
+                // Advance the bar in the same step so the largest (level 0)
+                // pass shows steady progress instead of jumping only once it
+                // finishes.
                 if (n + 1) % 2048 == 0 {
                     unsafe { let _ = ets.mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed); }
+                    if let Some(p) = pb { p.inc(2048); }
                 }
             }
-            if let Some(p) = pb { p.inc(ids.len() as u64); }
+            if let Some(p) = pb { p.inc((ids.len() % 2048) as u64); }
         } else {
             // Decode + re-encode every tile in parallel, then write in tile order.
             let mut encoded: Vec<(u32, Vec<u8>)> = ids.par_iter().filter_map(|&id| {
