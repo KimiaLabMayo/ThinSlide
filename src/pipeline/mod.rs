@@ -472,20 +472,10 @@ pub fn run(args: Args) {
     scanner.join().unwrap();
     meta_pb.finish_and_clear();
 
-    let total_processed = series_counter.load(Ordering::Relaxed);
-    let _ = total_processed;
-    let ok      = stats.ok.load(Ordering::Relaxed);
-    let fail    = stats.fail.load(Ordering::Relaxed);
-    let skipped = stats.skipped.load(Ordering::Relaxed);
-    println!("Total: {}  OK: {}  FAIL: {}  SKIP: {}", ok + fail + skipped, ok, fail, skipped);
-    let duration_s = run_start.elapsed().as_millis() as f64 / 1000.0;
-    logger.write_summary(&stats, duration_s);
-    println!("Log: {}", log_path);
-
     if !tiff_paths.is_empty() {
         if args.mpp.is_some() || args.half || args.icc_bake {
             tiff_paths.sort();
-            tiffds::process_files(&tiff_paths, &args, &mp);
+            tiffds::process_files(&tiff_paths, &args, &mp, &stats);
         } else {
             eprintln!("  {} TIFF/SVS file(s) found; specify --mpp, --half, or --icc-bake to process them.",
                 tiff_paths.len());
@@ -494,12 +484,22 @@ pub fn run(args: Args) {
 
     if !vsi_paths.is_empty() {
         vsi_paths.sort();
-        convert_vsi_files(&vsi_paths, &args, &mp);
+        convert_vsi_files(&vsi_paths, &args, &mp, &stats);
     }
+
+    // Report after every format has been converted, not just DICOM.
+    let ok      = stats.ok.load(Ordering::Relaxed);
+    let fail    = stats.fail.load(Ordering::Relaxed);
+    let skipped = stats.skipped.load(Ordering::Relaxed);
+    println!("Total: {}  OK: {}  FAIL: {}  SKIP: {}", ok + fail + skipped, ok, fail, skipped);
+    let duration_s = run_start.elapsed().as_millis() as f64 / 1000.0;
+    logger.write_summary(&stats, duration_s);
+    println!("Log: {}", log_path);
 }
 
 // Experimental: transcode the main 2D pyramid of each CellSens .vsi to TIFF.
-fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress) {
+fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress,
+                     stats: &ConversionStats) {
     for path in paths {
         let src = path.to_string_lossy().to_string();
         let stem = sanitize_file_stem(
@@ -511,6 +511,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
         };
         if Path::new(&out_path).exists() {
             if args.verbose { eprintln!("  [skip ] exists: {}", out_path); }
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
             continue;
         }
 
@@ -528,13 +529,20 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
                     let _ = std::fs::remove_file(&tmp_path);
                     eprintln!("  [error] rename failed for {}: {}", stem, e);
+                    stats.fail.fetch_add(1, Ordering::Relaxed);
                 } else {
                     mp.println(format!("  {} (vsi)", stem)).ok();
+                    let in_b  = crate::source::vsi::input_size(&src);
+                    let out_b = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+                    stats.ok.fetch_add(1, Ordering::Relaxed);
+                    stats.in_bytes.fetch_add(in_b, Ordering::Relaxed);
+                    stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
                 }
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp_path);
                 eprintln!("  [skip ] {}: {}", stem, e);
+                stats.fail.fetch_add(1, Ordering::Relaxed);
             }
         }
         pb.finish_and_clear();

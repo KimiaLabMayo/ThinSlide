@@ -147,6 +147,7 @@ pub(crate) fn process_files(
     paths: &[std::path::PathBuf],
     args: &crate::Args,
     mp: &MultiProgress,
+    stats: &crate::logger::ConversionStats,
 ) {
     if paths.is_empty() { return; }
 
@@ -175,15 +176,18 @@ pub(crate) fn process_files(
             raw_stem.to_string()
         };
 
-        let already_exists = [
+        let candidates = [
             format!("{}.tiff",     src_stem),
             format!("{}.ome.tiff", src_stem),
             format!("{}.svs",      src_stem),
-        ].iter().any(|name| Path::new(&args.output_dir).join(name).exists());
+        ];
+        let output_exists = || candidates.iter()
+            .any(|name| Path::new(&args.output_dir).join(name).exists());
 
-        if already_exists {
+        if output_exists() {
             if args.verbose { vlog(None, format!("  [skip ] exists: {src_name}")); }
             skipped.fetch_add(1, Ordering::Relaxed);
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
             file_bar.inc(1);
             continue;
         }
@@ -193,6 +197,20 @@ pub(crate) fn process_files(
         pb.set_message(src_name.clone());
 
         process_file(&src_path, &args.output_dir, &src_stem, args, &pb);
+
+        // process_file has no return value; infer success from output presence.
+        let produced: Option<std::path::PathBuf> = candidates.iter()
+            .map(|name| Path::new(&args.output_dir).join(name))
+            .find(|p| p.exists());
+        if let Some(out) = produced {
+            let in_b  = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let out_b = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+            stats.ok.fetch_add(1, Ordering::Relaxed);
+            stats.in_bytes.fetch_add(in_b, Ordering::Relaxed);
+            stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
+        } else {
+            stats.fail.fetch_add(1, Ordering::Relaxed);
+        }
 
         pb.finish_and_clear();
         file_bar.inc(1);

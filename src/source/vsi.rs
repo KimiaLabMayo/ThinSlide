@@ -479,6 +479,19 @@ fn collect_ets_files(vsi_path: &Path) -> Vec<PathBuf> {
     out
 }
 
+// Total on-disk input size: the .vsi index plus every "frame*.ets" tile-stream
+// file under the sibling "_<stem>_" directory, which holds the actual pixels.
+pub fn input_size(vsi_path: &str) -> u64 {
+    let path = Path::new(vsi_path);
+    let vsi_bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let ets_bytes: u64 = collect_ets_files(path)
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    vsi_bytes + ets_bytes
+}
+
 // ─── Output pyramid level ─────────────────────────────────────────────────────
 
 struct VsiLevel {
