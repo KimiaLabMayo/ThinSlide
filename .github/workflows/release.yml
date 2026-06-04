@@ -139,6 +139,24 @@ jobs:
       - name: Install zlib via vcpkg
         run: vcpkg install zlib:x64-windows-static-md
 
+      - name: Locate static zlib
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "zlib*.lib found under C:\vcpkg\installed:"
+          Get-ChildItem -Path C:\vcpkg\installed -Recurse -Filter 'zlib*.lib' |
+            ForEach-Object { Write-Host "  $($_.FullName)" }
+          $lib = Get-ChildItem -Path C:\vcpkg\installed -Recurse -Filter '*.lib' |
+            Where-Object {
+              ($_.Name -eq 'zlib.lib' -or $_.Name -eq 'zlibstatic.lib') -and
+              $_.FullName -notmatch '\\debug\\'
+            } | Select-Object -First 1
+          if (-not $lib) { throw "static zlib library not found under C:\vcpkg\installed" }
+          $name = [System.IO.Path]::GetFileNameWithoutExtension($lib.Name)
+          "ZLIB_LIB_DIR=$($lib.DirectoryName)" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "ZLIB_LIB_NAME=$name"               | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          Write-Host "Using $($lib.FullName) (link name: $name)"
+
       - name: Build libtiff (MSVC static)
         shell: pwsh
         run: |
@@ -169,7 +187,7 @@ jobs:
         env:
           TIFF_LIB_DIR: C:\tiff-static\lib
           TIFF_STATIC: "1"
-          ZLIB_LIB_DIR: C:\vcpkg\installed\x64-windows-static-md\lib
+          # ZLIB_LIB_DIR / ZLIB_LIB_NAME come from the "Locate static zlib" step.
           TURBOJPEG_SOURCE: vendor
           TURBOJPEG_STATIC: "1"
         run: cargo build --release --bin slean --bin slean-gui

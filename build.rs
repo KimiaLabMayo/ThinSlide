@@ -11,7 +11,11 @@ fn main() {
             let zlib_dir = std::env::var("ZLIB_LIB_DIR").unwrap_or(lib_dir);
             println!("cargo:rustc-link-search=native={zlib_dir}");
             if target_os == "windows" {
-                println!("cargo:rustc-link-lib=static=zlib");
+                // vcpkg names it `zlib.lib`, upstream CMake `zlibstatic.lib`;
+                // let CI report the actual name via ZLIB_LIB_NAME.
+                let zlib_name =
+                    std::env::var("ZLIB_LIB_NAME").unwrap_or_else(|_| "zlib".to_string());
+                println!("cargo:rustc-link-lib=static={zlib_name}");
             } else {
                 println!("cargo:rustc-link-lib=static=z");
             }
