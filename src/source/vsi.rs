@@ -240,6 +240,8 @@ impl Ets {
         // Each tile is read exactly once, in a single forward pass; ask the
         // kernel to read ahead and drop already-consumed pages so resident
         // memory stays bounded even for multi-GB streams.
+        // `advise` is Unix-only in memmap2; on Windows this is simply skipped.
+        #[cfg(unix)]
         let _ = mmap.advise(memmap2::Advice::Sequential);
         let bytes: &[u8] = &mmap;
         if bytes.len() < 48 || &bytes[0..3] != b"SIS" { return None; }
@@ -720,6 +722,8 @@ pub(crate) fn convert_vsi(
                 // pass shows steady progress instead of jumping only once it
                 // finishes.
                 if (n + 1) % 2048 == 0 {
+                    // `unchecked_advise` is Unix-only in memmap2; skipped on Windows.
+                    #[cfg(unix)]
                     unsafe { let _ = ets.mmap.unchecked_advise(memmap2::UncheckedAdvice::DontNeed); }
                     if let Some(p) = pb { p.inc(2048); }
                 }
