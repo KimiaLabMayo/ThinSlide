@@ -136,37 +136,22 @@ jobs:
       - name: Add NASM to PATH
         run: echo "C:\Program Files\NASM" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
-      - name: Install zlib via vcpkg
+      - name: Build zlib (MSVC static)
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          # Resolve the actual vcpkg root from the runner (do not hardcode C:\vcpkg).
-          $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
-          Write-Host "Using vcpkg root: $vcpkgRoot"
-          # Install into a known root we fully control, regardless of runner defaults.
-          vcpkg install zlib:x64-windows-static-md --x-install-root="$vcpkgRoot\installed"
-          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
-          "VCPKG_ROOT=$vcpkgRoot" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
-
-      - name: Locate static zlib
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $searchRoot = "$env:VCPKG_ROOT\installed"
-          Write-Host "Searching for zlib static library under $searchRoot"
-          Write-Host "All zlib*.lib found:"
-          Get-ChildItem -Path $searchRoot -Recurse -Filter 'zlib*.lib' -ErrorAction SilentlyContinue |
-            ForEach-Object { Write-Host "  $($_.FullName)" }
-          $lib = Get-ChildItem -Path $searchRoot -Recurse -Filter '*.lib' -ErrorAction SilentlyContinue |
-            Where-Object {
-              ($_.Name -eq 'zlib.lib' -or $_.Name -eq 'zlibstatic.lib') -and
-              $_.FullName -notmatch '\\debug\\'
-            } | Select-Object -First 1
-          if (-not $lib) { throw "static zlib library not found under $searchRoot" }
-          $name = [System.IO.Path]::GetFileNameWithoutExtension($lib.Name)
-          "ZLIB_LIB_DIR=$($lib.DirectoryName)" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
-          "ZLIB_LIB_NAME=$name"               | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
-          Write-Host "Using $($lib.FullName) (link name: $name)"
+          $zlibVer = "1.3.1"
+          Invoke-WebRequest "https://github.com/madler/zlib/releases/download/v$zlibVer/zlib-$zlibVer.tar.gz" -OutFile zlib.tar.gz
+          tar -xf zlib.tar.gz
+          cd "zlib-$zlibVer"
+          # Upstream CMake emits the static archive as `zlibstatic.lib` under lib/.
+          cmake -B build `
+            -DCMAKE_BUILD_TYPE=Release `
+            "-DCMAKE_INSTALL_PREFIX=C:\zlib-static"
+          cmake --build build --config Release --parallel
+          cmake --install build --config Release
+          "ZLIB_LIB_DIR=C:\zlib-static\lib"  | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
+          "ZLIB_LIB_NAME=zlibstatic"         | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
       - name: Build libtiff (MSVC static)
         shell: pwsh
@@ -180,7 +165,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_SHARED_LIBS=OFF `
             "-DCMAKE_INSTALL_PREFIX=C:\tiff-static" `
-            "-DCMAKE_PREFIX_PATH=$env:VCPKG_ROOT\installed\x64-windows-static-md" `
+            "-DCMAKE_PREFIX_PATH=C:\zlib-static" `
             -Dtiff-tools=OFF -Dtiff-tests=OFF -Dtiff-docs=OFF `
             -Djpeg=OFF -Dold-jpeg=OFF -Dlzma=OFF -Dzstd=OFF -Dwebp=OFF -Djbig=OFF
           cmake --build build --config Release --parallel
@@ -198,7 +183,7 @@ jobs:
         env:
           TIFF_LIB_DIR: C:\tiff-static\lib
           TIFF_STATIC: "1"
-          # ZLIB_LIB_DIR / ZLIB_LIB_NAME come from the "Locate static zlib" step.
+          # ZLIB_LIB_DIR / ZLIB_LIB_NAME come from the "Build zlib (MSVC static)" step.
           TURBOJPEG_SOURCE: vendor
           TURBOJPEG_STATIC: "1"
         run: cargo build --release --bin slean --bin slean-gui
