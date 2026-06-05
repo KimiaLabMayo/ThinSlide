@@ -137,21 +137,32 @@ jobs:
         run: echo "C:\Program Files\NASM" | Out-File -Append -FilePath $env:GITHUB_PATH -Encoding utf8
 
       - name: Install zlib via vcpkg
-        run: vcpkg install zlib:x64-windows-static-md
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # Resolve the actual vcpkg root from the runner (do not hardcode C:\vcpkg).
+          $vcpkgRoot = if ($env:VCPKG_INSTALLATION_ROOT) { $env:VCPKG_INSTALLATION_ROOT } else { "C:\vcpkg" }
+          Write-Host "Using vcpkg root: $vcpkgRoot"
+          # Install into a known root we fully control, regardless of runner defaults.
+          vcpkg install zlib:x64-windows-static-md --x-install-root="$vcpkgRoot\installed"
+          if ($LASTEXITCODE -ne 0) { throw "vcpkg install failed" }
+          "VCPKG_ROOT=$vcpkgRoot" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
 
       - name: Locate static zlib
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Write-Host "zlib*.lib found under C:\vcpkg\installed:"
-          Get-ChildItem -Path C:\vcpkg\installed -Recurse -Filter 'zlib*.lib' |
+          $searchRoot = "$env:VCPKG_ROOT\installed"
+          Write-Host "Searching for zlib static library under $searchRoot"
+          Write-Host "All zlib*.lib found:"
+          Get-ChildItem -Path $searchRoot -Recurse -Filter 'zlib*.lib' -ErrorAction SilentlyContinue |
             ForEach-Object { Write-Host "  $($_.FullName)" }
-          $lib = Get-ChildItem -Path C:\vcpkg\installed -Recurse -Filter '*.lib' |
+          $lib = Get-ChildItem -Path $searchRoot -Recurse -Filter '*.lib' -ErrorAction SilentlyContinue |
             Where-Object {
               ($_.Name -eq 'zlib.lib' -or $_.Name -eq 'zlibstatic.lib') -and
               $_.FullName -notmatch '\\debug\\'
             } | Select-Object -First 1
-          if (-not $lib) { throw "static zlib library not found under C:\vcpkg\installed" }
+          if (-not $lib) { throw "static zlib library not found under $searchRoot" }
           $name = [System.IO.Path]::GetFileNameWithoutExtension($lib.Name)
           "ZLIB_LIB_DIR=$($lib.DirectoryName)" | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
           "ZLIB_LIB_NAME=$name"               | Out-File -Append -FilePath $env:GITHUB_ENV -Encoding utf8
@@ -169,7 +180,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release `
             -DBUILD_SHARED_LIBS=OFF `
             "-DCMAKE_INSTALL_PREFIX=C:\tiff-static" `
-            "-DCMAKE_PREFIX_PATH=C:\vcpkg\installed\x64-windows-static-md" `
+            "-DCMAKE_PREFIX_PATH=$env:VCPKG_ROOT\installed\x64-windows-static-md" `
             -Dtiff-tools=OFF -Dtiff-tests=OFF -Dtiff-docs=OFF `
             -Djpeg=OFF -Dold-jpeg=OFF -Dlzma=OFF -Dzstd=OFF -Dwebp=OFF -Djbig=OFF
           cmake --build build --config Release --parallel
