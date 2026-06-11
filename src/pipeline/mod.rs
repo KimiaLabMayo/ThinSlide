@@ -345,6 +345,7 @@ pub fn run(args: Args) {
         std::collections::HashMap::new();
     let mut tiff_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut vsi_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut mrxs_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut last_dir_count   = 0usize;
     let mut total_file_count = 0usize;
     for entry in WalkDir::new(&args.input_dir).into_iter().filter_map(|e| e.ok()) {
@@ -372,6 +373,9 @@ pub fn run(args: Args) {
             }
             "vsi" => {
                 vsi_paths.push(entry.path().to_owned());
+            }
+            "mrxs" => {
+                mrxs_paths.push(entry.path().to_owned());
             }
             _ => {}
         }
@@ -487,6 +491,11 @@ pub fn run(args: Args) {
         convert_vsi_files(&vsi_paths, &args, &mp, &stats);
     }
 
+    if !mrxs_paths.is_empty() {
+        mrxs_paths.sort();
+        convert_mrxs_files(&mrxs_paths, &args, &mp, &stats);
+    }
+
     // Report after every format has been converted, not just DICOM.
     let ok      = stats.ok.load(Ordering::Relaxed);
     let fail    = stats.fail.load(Ordering::Relaxed);
@@ -533,6 +542,58 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
                 } else {
                     mp.println(format!("  {} (vsi)", stem)).ok();
                     let in_b  = crate::source::vsi::input_size(&src);
+                    let out_b = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+                    stats.ok.fetch_add(1, Ordering::Relaxed);
+                    stats.in_bytes.fetch_add(in_b, Ordering::Relaxed);
+                    stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
+                }
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                eprintln!("  [skip ] {}: {}", stem, e);
+                stats.fail.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        pb.finish_and_clear();
+    }
+}
+
+// Transcode each MIRAX (.mrxs) slide's level-0 placement into a pyramidal TIFF.
+fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress,
+                      stats: &ConversionStats) {
+    for path in paths {
+        let src = path.to_string_lossy().to_string();
+        let stem = sanitize_file_stem(
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
+        let out_path = if args.legacy {
+            format!("{}/{}.tiff", args.output_dir, stem)
+        } else {
+            format!("{}/{}.ome.tiff", args.output_dir, stem)
+        };
+        if Path::new(&out_path).exists() {
+            if args.verbose { eprintln!("  [skip ] exists: {}", out_path); }
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+
+        let pb = mp.add(ProgressBar::new(0));
+        pb.set_style(ProgressStyle::with_template(
+            "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
+        ).unwrap().progress_chars("=>-"));
+        pb.set_message(stem.clone());
+
+        let tmp_path = format!("{}.tmp", out_path);
+        match crate::source::mrxs::convert_mrxs(
+            &src, &tmp_path, args.legacy, args.quality, args.half, args.verbose, Some(&pb),
+        ) {
+            Ok(()) => {
+                if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
+                    let _ = std::fs::remove_file(&tmp_path);
+                    eprintln!("  [error] rename failed for {}: {}", stem, e);
+                    stats.fail.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    mp.println(format!("  {} (mrxs)", stem)).ok();
+                    let in_b  = crate::source::mrxs::input_size(&src);
                     let out_b = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
                     stats.ok.fetch_add(1, Ordering::Relaxed);
                     stats.in_bytes.fetch_add(in_b, Ordering::Relaxed);
