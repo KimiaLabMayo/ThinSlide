@@ -56,7 +56,7 @@ pub(crate) fn generate_dicom_ome_xml(metadata_list: &[DcmMetadata]) -> String {
         _       => "uint8",
     };
 
-    let (_size_c, channel_spp, interleaved) = if spp >= 3 {
+    let (size_c, channel_spp, interleaved) = if spp >= 3 {
         (spp, spp, "true")
     } else {
         (1u32, 1u32, "false")
@@ -86,7 +86,7 @@ pub(crate) fn generate_dicom_ome_xml(metadata_list: &[DcmMetadata]) -> String {
             SizeX="{width}"
             SizeY="{height}"
             SizeZ="1"
-            SizeC="1"
+            SizeC="{size_c}"
             SizeT="1"
             PhysicalSizeX="{mpp_x:.6}"
             PhysicalSizeXUnit="µm"
@@ -156,13 +156,16 @@ pub(crate) fn generate_tiff_ome_xml(
 ) -> String {
     let safe_name = xml_escape(name);
     let type_str  = "uint8";
-    let size_c    = 1u32;
+    // OME requires SizeC == sum of each Channel's SamplesPerPixel.
+    // A single RGB channel (spp=3) is one Channel with SamplesPerPixel=3, so SizeC=3.
+    let size_c      = spp;
+    let interleaved = if spp >= 3 { "true" } else { "false" };
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">
   <Image ID="Image:0" Name="{safe_name}">
-    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="{type_str}" SizeX="{width}" SizeY="{height}" SizeZ="1" SizeC="{size_c}" SizeT="1" PhysicalSizeX="{mpp_x:.6}" PhysicalSizeXUnit="µm" PhysicalSizeY="{mpp_y:.6}" PhysicalSizeYUnit="µm">
+    <Pixels ID="Pixels:0" DimensionOrder="XYZCT" Type="{type_str}" SizeX="{width}" SizeY="{height}" SizeZ="1" SizeC="{size_c}" SizeT="1" PhysicalSizeX="{mpp_x:.6}" PhysicalSizeXUnit="µm" PhysicalSizeY="{mpp_y:.6}" PhysicalSizeYUnit="µm" Interleaved="{interleaved}">
       <Channel ID="Channel:0:0" SamplesPerPixel="{spp}"/>
       <TiffData/>
     </Pixels>
