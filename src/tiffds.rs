@@ -1,4 +1,4 @@
-// TIFF/SVS downsampling logic for slean.
+// TIFF/SVS downsampling logic for thinslide.
 // Reads pyramidal TIFF and SVS files and writes downsampled OME-TIFF or BigTIFF.
 
 use std::ffi::CString;
@@ -141,7 +141,7 @@ fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u3
         p.icc_transform.as_deref(), p.fpt, &p.resize_opts, p.quality, p.spp)
 }
 
-// ─── Entry point for unified slean binary ─────────────────────────────────────
+// ─── Entry point for unified thinslide binary ─────────────────────────────────
 
 pub(crate) fn process_files(
     paths: &[std::path::PathBuf],

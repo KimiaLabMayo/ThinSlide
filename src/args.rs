@@ -3,7 +3,7 @@ use image::imageops::FilterType;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "slean", about = "Whole Slide Image Optimizer")]
+#[command(name = "thinslide", about = "Whole Slide Image Optimizer")]
 pub struct Args {
     /// Input directory containing DICOM files (must exist)
     #[arg(value_parser = parse_input_dir)]

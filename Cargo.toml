@@ -1,16 +1,16 @@
 [package]
-name = "slide-leaner"
+name = "thinslide"
 version = "0.1.0"
 edition = "2024"
 links = "tiff"
 
 [[bin]]
-name = "slean"
-path = "src/bin/slean.rs"
+name = "thinslide"
+path = "src/bin/thinslide.rs"
 
 [[bin]]
-name = "slean-gui"
-path = "src/bin/slean_gui.rs"
+name = "thinslide-gui"
+path = "src/bin/thinslide_gui.rs"
 
 [build-dependencies]
 pkg-config = "0.3"

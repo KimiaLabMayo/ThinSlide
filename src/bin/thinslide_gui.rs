@@ -1,7 +1,7 @@
 use clap::Parser;
 use eframe::egui;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use slide_leaner::{Args, run};
+use thinslide::{Args, run};
 use std::{io::Read, path::PathBuf, sync::{Arc, Mutex, mpsc}, thread};
 
 // ---------- VT100 terminal buffer -------------------------------------------
@@ -91,7 +91,7 @@ impl TermBuf {
 #[derive(PartialEq, Clone, Default, serde::Serialize, serde::Deserialize)]
 enum MppMode { #[default] Passthrough, Half, X20, X10 }
 
-const STORAGE_KEY: &str = "slean_settings";
+const STORAGE_KEY: &str = "thinslide_settings";
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Settings {
@@ -136,7 +136,7 @@ impl Default for App {
     fn default() -> Self {
         let mut term = TermBuf::default();
         term.feed(concat!(
-            "Slide Leaner — high-throughput WSI optimizer\n",
+            "ThinSlide — high-throughput WSI optimizer\n",
             "─────────────────────────────────────────────────────────\n",
             "\n",
             "Features:\n",
@@ -376,10 +376,10 @@ impl App {
         self.running = true;
         self.completion = None;
 
-        let slean = std::env::current_exe()
-            .unwrap_or_else(|_| PathBuf::from("slean-gui"));
+        let thinslide_gui = std::env::current_exe()
+            .unwrap_or_else(|_| PathBuf::from("thinslide-gui"));
 
-        let mut cmd = CommandBuilder::new(&slean);
+        let mut cmd = CommandBuilder::new(&thinslide_gui);
         cmd.arg(&self.input_dir);
         cmd.arg(&self.output_dir);
         if self.legacy { cmd.arg("--legacy"); }
@@ -419,7 +419,7 @@ impl App {
         let child = match pair.slave.spawn_command(cmd) {
             Ok(c) => c,
             Err(e) => {
-                self.term.feed(format!("Failed to start slean: {e}").as_bytes());
+                self.term.feed(format!("Failed to start thinslide-gui: {e}").as_bytes());
                 self.running = false;
                 return;
             }
@@ -467,9 +467,9 @@ fn main() -> eframe::Result<()> {
     }
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Slide Leaner")
+            .with_title("ThinSlide")
             .with_inner_size([680.0, 560.0]),
         ..Default::default()
     };
-    eframe::run_native("Slide Leaner", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
+    eframe::run_native("ThinSlide", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))
 }

@@ -4260,34 +4260,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
-name = "slide-leaner"
-version = "0.1.0"
-dependencies = [
- "clap",
- "dicom",
- "dicom-core",
- "dicom-dictionary-std",
- "dicom-object",
- "dicom-pixeldata",
- "eframe",
- "fast_image_resize",
- "image",
- "indicatif",
- "jpeg2k",
- "lcms2",
- "memmap2",
- "pkg-config",
- "portable-pty",
- "rayon",
- "rfd",
- "serde",
- "sysinfo",
- "tiff 0.11.3",
- "turbojpeg",
- "walkdir",
-]
-
-[[package]]
 name = "slotmap"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4538,6 +4510,34 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5d9cf598a6d7ce700a4e6a9199da127e6819a61e64b68609683cc9a01b5683a"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "thinslide"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "dicom",
+ "dicom-core",
+ "dicom-dictionary-std",
+ "dicom-object",
+ "dicom-pixeldata",
+ "eframe",
+ "fast_image_resize",
+ "image",
+ "indicatif",
+ "jpeg2k",
+ "lcms2",
+ "memmap2",
+ "pkg-config",
+ "portable-pty",
+ "rayon",
+ "rfd",
+ "serde",
+ "sysinfo",
+ "tiff 0.11.3",
+ "turbojpeg",
+ "walkdir",
 ]
 
 [[package]]

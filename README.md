@@ -1,7 +1,7 @@
-# SlideLeaner (slean)
+# ThinSlide
 **A high-speed WSI optimizer for DICOM/TIFF/SVS/OME-TIFF.**
 
-## Key Use Cases: Why use SlideLeaner?
+## Key Use Cases: Why use ThinSlide?
 
 ### 1. DICOM → TIFF conversion
 * **Problem**: Fragmented DICOM files are difficult to manage, move, or preview. Redundant JPEG tables and ICC profiles.
@@ -26,14 +26,14 @@ Download the latest pre-built binary from [**Releases**](../../releases/latest).
 
 | Platform | Binary |
 |---|---|
-| Linux x86_64 | `slean-linux-x86_64-musl` |
-| macOS arm64 | `slean-macos-arm64`, `slean-gui-macos-arm64` |
-| macOS x86_64 | `slean-macos-x86_64`, `slean-gui-macos-x86_64` |
-| Windows x86_64 | `slean-windows-x86_64.exe`, `slean-gui-windows-x86_64.exe` |
+| Linux x86_64 | `thinslide-linux-x86_64-musl` |
+| macOS arm64 | `thinslide-macos-arm64`, `thinslide-gui-macos-arm64` |
+| macOS x86_64 | `thinslide-macos-x86_64`, `thinslide-gui-macos-x86_64` |
+| Windows x86_64 | `thinslide-windows-x86_64.exe`, `thinslide-gui-windows-x86_64.exe` |
 
 **Linux / macOS — make executable after download:**
 ```sh
-chmod +x slean-linux-x86_64-musl
+chmod +x thinslide-linux-x86_64-musl
 ```
 
 ---
@@ -41,10 +41,10 @@ chmod +x slean-linux-x86_64-musl
 ## Usage
 
 ```
-slean <input_dir> <output_dir> [OPTIONS]
+thinslide <input_dir> <output_dir> [OPTIONS]
 ```
 
-`slean` processes all supported files under `input_dir` in one pass:
+`thinslide` processes all supported files under `input_dir` in one pass:
 
 | Source file type | Condition | Output |
 |---|---|---|
@@ -85,31 +85,31 @@ By default the output is OME-TIFF. Pass `--legacy` to select a format based on t
 
 ```sh
 # DICOM passthrough — OME-TIFF, all CPUs
-slean /data/dicoms /data/output
+thinslide /data/dicoms /data/output
 
 # DICOM passthrough — SVS / BigTIFF (format chosen by DICOM compression type)
-slean /data/dicoms /data/output --legacy
+thinslide /data/dicoms /data/output --legacy
 
 # Downsample DICOM and TIFF/SVS to 0.5 µm/px
-slean /data/slides /data/output --mpp 0.5
+thinslide /data/slides /data/output --mpp 0.5
 
 # Downsample to 1.0 µm/px, Lanczos3 filter, quality 90, 4 threads
-slean /data/slides /data/output --mpp 1.0 --filter lanczos3 --quality 90 -j 4
+thinslide /data/slides /data/output --mpp 1.0 --filter lanczos3 --quality 90 -j 4
 
 # Halve width and height (fastest for JPEG sources: DCT-domain 1/2 decode + no resize)
-slean /data/slides /data/output --half
+thinslide /data/slides /data/output --half
 
 # Bake ICC profile into pixels and write sRGB JPEG output without ICC tag
-slean /data/slides /data/output --icc-bake
+thinslide /data/slides /data/output --icc-bake
 
 # ICC bake combined with downsampling to 0.5 µm/px
-slean /data/slides /data/output --icc-bake --mpp 0.5
+thinslide /data/slides /data/output --icc-bake --mpp 0.5
 
 # Mixed directory: DICOM passthrough + TIFF/SVS/OME-TIFF downsampled to 2.0 µm/px
-slean /data/mixed /data/output --mpp 2.0
+thinslide /data/mixed /data/output --mpp 2.0
 
 # Downsample an OME-TIFF to 0.5 µm/px, preserving original OME-XML metadata
-slean /data/ome /data/output --mpp 0.5
+thinslide /data/ome /data/output --mpp 0.5
 ```
 
 ### Parallelism
@@ -136,10 +136,10 @@ TIFF/SVS files are always processed one file at a time (tile-level parallelism w
 
 ---
 
-## GUI (`slean-gui`)
+## GUI (`thinslide-gui`)
 
-`slean-gui` is a minimal desktop interface.
-It wraps `slean` and exposes the same options via a point-and-click window.
+`thinslide-gui` is a minimal desktop interface.
+It wraps `thinslide` and exposes the same options via a point-and-click window.
 Available for macOS and Windows from [Releases](../../releases/latest).
 
 ---
@@ -159,7 +159,7 @@ Available for macOS and Windows from [Releases](../../releases/latest).
 ### CLI only
 
 ```sh
-cargo build --release --bin slean
+cargo build --release --bin thinslide
 ```
 
 ### CLI + GUI
@@ -187,5 +187,5 @@ Both binaries are placed in `target/release/`.
 | `rayon` | Parallelism |
 | `walkdir` | Recursive directory traversal |
 | libtiff (FFI) | Writing TIFF/SVS files |
-| `eframe` / `egui` | GUI framework (`slean-gui`) |
-| `rfd` | Native folder picker dialog (`slean-gui`) |
+| `eframe` / `egui` | GUI framework (`thinslide-gui`) |
+| `rfd` | Native folder picker dialog (`thinslide-gui`) |
