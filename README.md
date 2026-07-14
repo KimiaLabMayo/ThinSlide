@@ -1,12 +1,12 @@
-# ThinSlide - Fast WSI converter for sustainable digital pathology
+# ThinSlide
 
-Whole-slide images are heavy: gigabyte-scale, fragmented across files, bloated with redundant data. Thinslide makes that weight optional — reshaping a WSI to fit its purpose.
+Optimize whole-slide images for storage, portability, and interoperability.
 
-Reads TIFF, SVS, DICOM, VSI, and MRXS. It does three things, on a shared zero-decode core so they stay fast:
+- **Repack** — WSIs are fragmented. Consolidate them into clean TIFF/OME-TIFF at near-copy speed.
+- **Slim** — WSIs are heavy. Reduce storage by 75–85% with fast downsampling.
+- **Color** — Colors are not portable. Bake ICC profiles into pixels for consistent visualization.
 
-- **Repack** — Consolidate fragmented DICOM/VSI/MRXS into a single clean TIFF/OME-TIFF. Zero-decode transcoding: near-copy speed, no quality loss.
-- **Slim** — Halve a slide with `--half`: a DCT-domain 1/2 decode with no resampling, so it stays on the same fast path as repack. Cuts size 75–85% while preserving diagnostic fidelity. Arbitrary target resolutions are available via `--mpp`.
-- **Color** — Bake ICC profiles into pixels with `--icc-bake` (SVS), for consistent color in any viewer or pipeline.
+Powered by a shared zero-decode pipeline.
 
 ## Format support
 
