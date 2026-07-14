@@ -21,6 +21,8 @@ If you'd rather not use the terminal, **`thinslide-gui`** is a simple desktop ap
 
 On macOS, also run `brew install libtiff little-cms2` once. No such step is needed on Windows.
 
+![ThinSlide GUI screenshot](assets/gui_screenshot.png)
+
 
 ## Command line
 
