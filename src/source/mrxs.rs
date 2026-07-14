@@ -1,5 +1,13 @@
 // MIRAX (3DHistech, .mrxs) reader and converter.
 //
+// Portions of the MIRAX parsing logic in this file are derived from
+// OpenSlide's openslide-vendor-mirax.c:
+//   Copyright (c) 2007-2013 Carnegie Mellon University
+//   Copyright (c) 2011 Google, Inc.
+//   Copyright (c) 2012 Pathomation
+// Licensed under the GNU Lesser General Public License, version 2.1.
+// See <https://github.com/openslide/openslide>.
+//
 // A .mrxs file is an empty marker; all data lives in a same-named directory:
 //   Slidedat.ini   — UTF-8(BOM) INI with all metadata (tile size, levels, files)
 //   Index.dat      — little-endian i32 binary index (linked-list data pages)

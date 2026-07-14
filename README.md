@@ -109,7 +109,17 @@ thinslide /data/slides /data/output --icc-bake --half
 
 > OME-TIFF inputs keep their original OME-XML metadata through downsampling.
 
+## Acknowledgments
+
+Thinslide's MIRAX (.mrxs) and CellSens (.vsi) readers were developed with
+reference to, and in part ported from, the following open-source projects:
+
+- [OpenSlide](https://openslide.org/) (LGPL-2.1) — MIRAX format parsing
+- [Bio-Formats](https://www.openmicroscopy.org/bio-formats/) (GPLv2) — CellSens VSI format parsing
+
 ## License
+
+Copyright (C) 2026 Wataru Uegami, MD, PhD
 
 Thinslide is licensed under the **GNU General Public License v2.0** — see [LICENSE](LICENSE).
 

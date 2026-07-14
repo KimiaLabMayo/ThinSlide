@@ -1,5 +1,13 @@
 // Experimental Olympus CellSens (.vsi / .ets) reader and converter.
 //
+// Portions of the CellSens parsing logic in this file are derived from
+// Bio-Formats' CellSensReader.java:
+//   Copyright (C) 2005-2017 Open Microscopy Environment
+//   (Board of Regents of the University of Wisconsin-Madison,
+//    Glencoe Software, Inc., University of Dundee)
+// Licensed under the GNU General Public License, version 2.
+// See <https://github.com/ome/bioformats>.
+//
 // A .vsi file is a TIFF-headed metadata container; the pixel data lives in
 // external tile-stream (.ets) files under a sibling "_<name>_" directory.
 // This module parses just enough metadata to locate the highest-resolution
