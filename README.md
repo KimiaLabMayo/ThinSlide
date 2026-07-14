@@ -1,4 +1,4 @@
-# ThinSlide
+# ThinSlide - Fast WSI converter for sustainable digital pathology
 
 Whole-slide images are heavy: gigabyte-scale, fragmented across files, bloated with redundant data. Thinslide makes that weight optional — reshaping a WSI to fit its purpose.
 
@@ -7,6 +7,18 @@ Reads TIFF, SVS, DICOM, VSI, and MRXS. It does three things, on a shared zero-de
 - **Repack** — Consolidate fragmented DICOM/VSI/MRXS into a single clean TIFF/OME-TIFF. Zero-decode transcoding: near-copy speed, no quality loss.
 - **Slim** — Halve a slide with `--half`: a DCT-domain 1/2 decode with no resampling, so it stays on the same fast path as repack. Cuts size 75–85% while preserving diagnostic fidelity. Arbitrary target resolutions are available via `--mpp`.
 - **Color** — Bake ICC profiles into pixels with `--icc-bake` (SVS), for consistent color in any viewer or pipeline.
+
+## Format support
+
+| Format | Repack | Downsample | Color |
+|---|:---:|:---:|:---:|
+| DICOM | ✓ | ✓ `--half` / `--mpp` | ✓ `--icc-bake` |
+| SVS / TIFF | ✓¹ | ✓ `--half` / `--mpp` | ✓ `--icc-bake` |
+| VSI (CellSens)² | ✓ | `--half` only | — |
+| MRXS (MIRAX)² | ✓ | `--half` only | — |
+
+¹ A bare SVS/TIFF input is already a valid file, so plain repack is skipped unless combined with `--half`, `--mpp`, or `--icc-bake`.
+² Experimental readers; VSI 16-bit fluorescence channels are skipped (8-bit brightfield only).
 
 > [!WARNING]
 > **Research use only.** Thinslide is not a medical device and is not intended for clinical or diagnostic use. 
@@ -30,7 +42,7 @@ On macOS, also run `brew install libtiff little-cms2` once. No such step is need
 
 #### Prebuilt binaries
 
-Prebuilt binaries are attached to every [release](https://github.com/OWNER/thinslide/releases/latest). Download the one for your platform, make it executable, and put it on your `PATH`:
+Prebuilt binaries are attached to every [release](https://github.com/uegamiw/thinslide/releases/latest). Download the one for your platform, make it executable, and put it on your `PATH`:
 
 | Platform | Asset | Includes GUI | Dependencies |
 |----------|-------|:---:|---|
@@ -71,7 +83,7 @@ cargo install thinslide
 Or build from source:
 
 ```sh
-git clone https://github.com/OWNER/thinslide
+git clone https://github.com/uegamiw/thinslide
 cd thinslide
 cargo install --path .         # or install it onto your PATH (~/.cargo/bin)
 ```
