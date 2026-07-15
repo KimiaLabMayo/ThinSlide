@@ -3,24 +3,26 @@
 **Optimize whole-slide images** — for storage, portability, and interoperability.
 
 - **Convert** — WSIs are fragmented. Consolidate them into clean TIFF/OME-TIFF. *(default)*
-- **Downsample** — WSIs are heavy. Normalize 40x scans to 20x and cut storage by ~75%. `--20x`
+- **Downsample** — WSIs are heavy. Normalize 40x scans to 20x and save storage by ~75%. `--20x`
 - **Standardize** — Colors are not portable. Bake ICC profiles into the pixels. `--icc-bake`
 
 ## Formats
 
 | Input | default | `--20x` | `--icc-bake` |
 |---|:---:|:---:|:---:|
-| **DICOM** | 🟢  | 🟡  | 🟡  |
-| **VSI** (CellSens)¹ | 🟢  | 🟡  | 🟡  |
-| **SVS / TIFF** | —² | 🟡  | 🟡  |
+| **DICOM** | 🔵  | 🟢  | 🟢 |
+| **VSI** (CellSens)¹ | 🔵  | 🟢  | 🟢  |
+| **SVS / TIFF** | —² | 🟢  | 🟢  |
 
-**🟢 repackaging** — compressed tiles are copied straight through, at near-copy speed. No image quality change.
-**🟡 re-encoding** — only where the pixels actually change.
+**🔵 repackaging** — compressed tiles are copied straight through, at near-copy speed. No image quality change.
+
+**🟢 re-encoding** — only where the pixels actually change.
 
 Output is OME-TIFF by default, or SVS-like BigTIFF with `--legacy`.
 
 ¹ Experimental reader. 16-bit fluorescence channels are skipped (8-bit brightfield only).
   `--mpp` is not supported for VSI yet.
+  
 ² Already a single valid slide file — nothing to convert. Skipped unless combined with
   `--20x` or `--icc-bake`.
 
