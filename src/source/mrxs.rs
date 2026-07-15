@@ -530,7 +530,7 @@ fn build_tile(
 // ── Output pyramid level ─────────────────────────────────────────────────────
 
 struct OutLevel {
-    downsample: u32,
+    downsample: f64,
     img_w:      u32,
     img_h:      u32,
     mpp_x:      f64,
@@ -541,9 +541,10 @@ struct OutLevel {
 }
 
 // Assign every source tile to the output tiles it overlaps, at the given
-// downsample factor. Returns None if the level is below MIN_PYRAMID_SIDE.
-fn build_level(src: &MiraxSource, downsample: u32) -> Option<OutLevel> {
-    let d = downsample as f64;
+// downsample factor (need not be a power of two, e.g. for --mpp). Returns
+// None if the level is below MIN_PYRAMID_SIDE.
+fn build_level(src: &MiraxSource, downsample: f64) -> Option<OutLevel> {
+    let d = downsample;
     let img_w = (src.img_w as f64 / d).round().max(1.0) as u32;
     let img_h = (src.img_h as f64 / d).round().max(1.0) as u32;
     let ntx = img_w.div_ceil(OUT_TILE);
@@ -584,11 +585,34 @@ pub(crate) fn convert_mrxs(
     legacy: bool,
     quality: u8,
     half: bool,
+    mpp: Option<f64>,
     verbose: bool,
     pb: Option<&ProgressBar>,
 ) -> Result<(), String> {
     let src = MiraxSource::open(mrxs_path, verbose)
         .ok_or_else(|| "not a valid MIRAX slide (missing Slidedat.ini / Index.dat)".to_string())?;
+
+    // Resolve the base (level 0 in the output) downsample factor: --mpp targets
+    // an arbitrary scale (source MPP / target MPP need not be a power of two),
+    // --half starts the pyramid at ×2, otherwise the base is full resolution.
+    let base_downsample: f64 = if let Some(target) = mpp {
+        if src.mpp_x <= 0.0 {
+            eprintln!("  [warn ] [mirax] source MPP unknown; ignoring --mpp");
+            1.0
+        } else if target <= src.mpp_x {
+            eprintln!(
+                "  [warn ] [mirax] requested MPP {:.4} µm/px ≤ source {:.4} µm/px (upscaling not supported); ignoring --mpp",
+                target, src.mpp_x
+            );
+            1.0
+        } else {
+            target / src.mpp_x
+        }
+    } else if half {
+        2.0
+    } else {
+        1.0
+    };
 
     // Memory-map every Data####.dat so tiles are read straight from the page
     // cache by parallel decoders.
@@ -596,20 +620,18 @@ pub(crate) fn convert_mrxs(
         fs::File::open(p).ok().and_then(|f| unsafe { memmap2::Mmap::map(&f).ok() })
     }).collect();
 
-    // Build the output pyramid: downsample by ×2 each level until the longer
-    // side drops below MIN_PYRAMID_SIDE. --half drops the full-resolution level
-    // by starting at ×2.
-    let start = if half { 2u32 } else { 1u32 };
+    // Build the output pyramid: starting from base_downsample, double each level
+    // until the longer side drops below MIN_PYRAMID_SIDE.
     let mut levels: Vec<OutLevel> = Vec::new();
-    let mut d = start;
+    let mut d = base_downsample;
     loop {
         let lv = build_level(&src, d).unwrap();
         let below = lv.img_w.max(lv.img_h) < MIN_PYRAMID_SIDE;
         let is_first = levels.is_empty();
         levels.push(lv);
         if below { break; }
-        d *= 2;
-        if !is_first && (src.img_w / d).max(src.img_h / d) == 0 { break; }
+        d *= 2.0;
+        if !is_first && (src.img_w as f64 / d).max(src.img_h as f64 / d) < 1.0 { break; }
     }
 
     if verbose {
@@ -651,7 +673,7 @@ pub(crate) fn convert_mrxs(
 
     for (lv_idx, lv) in levels.iter().enumerate() {
         if verbose {
-            vlog(pb, format!("  [mirax] lv{} 1/{}  {}x{}  {:.4} µm/px",
+            vlog(pb, format!("  [mirax] lv{} 1/{:.3}  {}x{}  {:.4} µm/px",
                 lv_idx, lv.downsample, lv.img_w, lv.img_h, lv.mpp_x));
         }
         let subfile = if lv_idx == 0 { 0u32 } else { FILETYPE_REDUCEDIMAGE };

@@ -584,7 +584,7 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
 
         let tmp_path = format!("{}.tmp", out_path);
         match crate::source::mrxs::convert_mrxs(
-            &src, &tmp_path, args.legacy, args.quality, args.half, args.verbose, Some(&pb),
+            &src, &tmp_path, args.legacy, args.quality, args.half, args.mpp, args.verbose, Some(&pb),
         ) {
             Ok(()) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
