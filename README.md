@@ -12,12 +12,12 @@ Powered by a shared zero-decode pipeline.
 
 | Format | Repack | Downsample | Color |
 |---|:---:|:---:|:---:|
-| DICOM | ✓ | ✓ `--half` / `--mpp` | ✓ `--icc-bake` |
-| SVS / TIFF | ✓¹ | ✓ `--half` / `--mpp` | ✓ `--icc-bake` |
-| VSI (CellSens)² | ✓ | `--half` only | — |
-| MRXS (MIRAX)² | ✓ | `--half` only | — |
+| DICOM | ✓ | ✓ `--20x` / `--mpp` | ✓ `--icc-bake` |
+| SVS / TIFF | ✓¹ | ✓ `--20x` / `--mpp` | ✓ `--icc-bake` |
+| VSI (CellSens)² | ✓ | `--20x` only | — |
+| MRXS (MIRAX)² | ✓ | `--20x` only | — |
 
-¹ A bare SVS/TIFF input is already a valid file, so plain repack is skipped unless combined with `--half`, `--mpp`, or `--icc-bake`.
+¹ A bare SVS/TIFF input is already a valid file, so plain repack is skipped unless combined with `--20x`, `--mpp`, or `--icc-bake`.
 ² Experimental readers; VSI 16-bit fluorescence channels are skipped (8-bit brightfield only).
 
 > [!WARNING]
@@ -29,7 +29,7 @@ If you'd rather not use the terminal, **`thinslide-gui`** is a simple desktop ap
 
 1. Download `thinslide-gui` for [macOS or Windows](../../releases/latest).
 2. Open it, then choose a folder of slides and a destination folder.
-3. Pick what you want — repack, halve the size, or fix color — and click **Run**.
+3. Pick what you want — repack, downsample to 20x, or fix color — and click **Run**.
 
 On macOS, also run `brew install libtiff little-cms2` once. No such step is needed on Windows.
 
@@ -105,20 +105,22 @@ thinslide /data/dicoms /data/output
 # Repack to SVS/BigTIFF instead (output format follows DICOM compression)
 thinslide /data/dicoms /data/output --legacy
 
-# Halve dimensions — the fast path (DCT-domain 1/2 decode, no resample)
-thinslide /data/slides /data/output --half
+# Downsample to 20x scan magnification — the fast path (DCT-domain decode,
+# no resample). Auto-detected from source MPP: 80x/40x source → quarter/half
+# decode, 20x source → copy through, 10x source → skip (can't upscale).
+thinslide /data/slides /data/output --20x
 
 # Bake ICC profile into pixels, output sRGB JPEG (no ICC tag)
 thinslide /data/slides /data/output --icc-bake
 
-# Downsample to an arbitrary resolution instead of halving
+# Downsample to an arbitrary resolution instead of --20x
 thinslide /data/slides /data/output --mpp 0.5
 
 # ...tuning the filter, JPEG quality, and thread count
 thinslide /data/slides /data/output --mpp 1.0 --filter lanczos3 --quality 90 -j 4
 
-# Combine: bake color and halve in one pass
-thinslide /data/slides /data/output --icc-bake --half
+# Combine: bake color and downsample to 20x in one pass
+thinslide /data/slides /data/output --icc-bake --20x
 ```
 
 > OME-TIFF inputs keep their original OME-XML metadata through downsampling.

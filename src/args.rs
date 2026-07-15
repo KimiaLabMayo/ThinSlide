@@ -25,9 +25,11 @@ pub struct Args {
     #[arg(long)]
     pub use_parent_name: bool,
 
-    /// Halve both width and height (1/4 area); mutually exclusive with --mpp
-    #[arg(long, conflicts_with = "mpp")]
-    pub half: bool,
+    /// Downsample to 20x scan magnification (~0.5 µm/px), auto-detected from
+    /// source MPP (80x→quarter, 40x→half, 20x→copy through, 10x→skip);
+    /// mutually exclusive with --mpp
+    #[arg(long = "20x", conflicts_with = "mpp")]
+    pub mag_20x: bool,
 
     /// Apply ICC color profile and convert to sRGB
     #[arg(long)]
@@ -46,8 +48,8 @@ pub struct Args {
     pub quality: u8,
 
     /// Resampling filter for --mpp [nearest, triangle, catmullrom, gaussian, lanczos3].
-    /// Ignored with --half: decode-side halving (DCT 1/2 / DWT level-1) produces the
-    /// exact target size, so no pixel-domain resize step is performed.
+    /// Ignored with --20x: decode-side downsampling (DCT 1/2 or 1/4 / DWT level-1 or
+    /// level-2) produces the exact target size, so no pixel-domain resize step is performed.
     #[arg(long, default_value = "nearest", value_parser = parse_filter)]
     pub filter: FilterType,
 

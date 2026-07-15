@@ -64,7 +64,7 @@ struct EncodeParams {
     src_jp2k_is_ycbcr: bool,
     src_photometric:   u32,
     n_reduce:          u32,
-    half:              bool,
+    decode_shift:      u32,
     jpeg_tables:       Option<Arc<Vec<u8>>>,
     icc_transform:     Option<Arc<crate::IccTransform>>,
 }
@@ -92,11 +92,16 @@ fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u3
                 v
             } else { data.clone() };
 
-            if p.half {
+            let scaling = match p.decode_shift {
+                1 => Some(turbojpeg::ScalingFactor::ONE_HALF),
+                2 => Some(turbojpeg::ScalingFactor::ONE_QUARTER),
+                _ => None,
+            };
+            if let Some(sf) = scaling {
                 let mut dec = turbojpeg::Decompressor::new().ok()?;
-                dec.set_scaling_factor(turbojpeg::ScalingFactor::ONE_HALF).ok()?;
+                dec.set_scaling_factor(sf).ok()?;
                 let header = dec.read_header(&combined).ok()?;
-                let scaled = header.scaled(turbojpeg::ScalingFactor::ONE_HALF);
+                let scaled = header.scaled(sf);
                 let (w, h) = (scaled.width, scaled.height);
                 let pitch = w * ch;
                 let mut pixels = vec![0u8; h * pitch];
@@ -612,7 +617,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         eprintln!("  [error] Cannot open: {src_path}");
         return;
     };
-    let (mut src_levels, icc_profile, ome_xml, _meta) = src.into_parts();
+    let (src_levels, icc_profile, ome_xml, _meta) = src.into_parts();
 
     if src_levels.is_empty() {
         eprintln!("  [warn] No tiled pyramid found in: {src_path}");
@@ -631,8 +636,33 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return;
     }
 
-    // --icc-bake without --mpp/--half: pure 1:1 ICC bake
-    if args.icc_bake && args.mpp.is_none() && !args.half {
+    // --20x: classify the source magnification bucket; skip when the MPP is
+    // unknown or the source is coarser than 20x (upscaling not supported).
+    let mag_factor: u32 = if args.mag_20x {
+        match crate::factor_to_20x(src_levels[0].mpp_x) {
+            Some(f) => f,
+            None => {
+                eprintln!("  [skip ] {src_path}: source MPP unknown or ≥0.7 µm/px (--20x cannot upscale)");
+                return;
+            }
+        }
+    } else {
+        1
+    };
+
+    // --20x at native 20x, no color conversion requested: copy through as-is.
+    if args.mag_20x && mag_factor == 1 && !args.icc_bake {
+        let src_name = Path::new(src_path).file_name()
+            .unwrap_or_default().to_string_lossy().to_string();
+        let dst = std::path::PathBuf::from(out_dir).join(&src_name);
+        if let Err(e) = std::fs::copy(src_path, &dst) {
+            eprintln!("  [error] Copy failed for {src_name}: {e}");
+        }
+        return;
+    }
+
+    // Pure 1:1 ICC bake: plain --icc-bake, or --20x already at native 20x.
+    if args.icc_bake && args.mpp.is_none() && (!args.mag_20x || mag_factor == 1) {
         let icc = icc_profile.as_deref().unwrap();
         if let Some(xform) = crate::build_icc_transform(icc) {
             if args.verbose {
@@ -645,22 +675,6 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return;
     }
 
-    let mpp_unknown = src_levels[0].mpp_x <= 0.0;
-    if mpp_unknown && !args.half {
-        eprintln!("  [error] Cannot determine resolution for {src_path}: \
-            no XRESOLUTION tag and no 'MPP = <value>' in ImageDescription. Skipping.");
-        return;
-    }
-    if args.half && mpp_unknown {
-        let bw = src_levels[0].img_w as f64;
-        let bh = src_levels[0].img_h as f64;
-        src_levels[0].mpp_x = 1.0;
-        src_levels[0].mpp_y = 1.0;
-        for lv in src_levels.iter_mut().skip(1) {
-            if lv.img_w > 0 { lv.mpp_x = bw / lv.img_w as f64; }
-            if lv.img_h > 0 { lv.mpp_y = bh / lv.img_h as f64; }
-        }
-    }
     let base = &src_levels[0];
     if args.verbose {
         vlog(Some(pb), format!("[src] {}  {}x{}  {:.4} µm/px  {} levels",
@@ -672,8 +686,13 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         vlog(Some(pb), &icc_msg);
     }
 
-    if !args.half {
+    if !args.mag_20x {
         if let Some(t) = args.mpp {
+            if base.mpp_x <= 0.0 {
+                eprintln!("  [error] Cannot determine resolution for {src_path}: \
+                    no XRESOLUTION tag and no 'MPP = <value>' in ImageDescription. Skipping.");
+                return;
+            }
             if t <= base.mpp_x {
                 eprintln!(
                     "  [warn ] requested MPP {:.4} µm/px ≤ source {:.4} µm/px (upscaling not supported); {}",
@@ -693,7 +712,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         }
     }
 
-    let target_mpp = if args.half { base.mpp_x * 2.0 } else { args.mpp.unwrap() };
+    let decode_shift: u32 = if args.mag_20x { mag_factor.trailing_zeros() } else { 0 };
+    let target_mpp = if args.mag_20x { base.mpp_x * mag_factor as f64 } else { args.mpp.unwrap() };
     let jp2k_svs_skip: Option<usize> = if !args.icc_bake && is_jp2k(base.compression as u32) {
         let skip = src_levels.iter()
             .take_while(|lv| lv.mpp_x < target_mpp * 0.9)
@@ -722,13 +742,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return;
     }
 
-    let mut output_levels = compute_output_levels(&src_levels, target_mpp, args.verbose, args.icc_bake, args.half);
-    if mpp_unknown {
-        for lv in output_levels.iter_mut() {
-            lv.actual_mpp_x = 0.0;
-            lv.actual_mpp_y = 0.0;
-        }
-    }
+    let output_levels = compute_output_levels(&src_levels, target_mpp, args.verbose, args.icc_bake, decode_shift);
     if output_levels.is_empty() {
         eprintln!("  [warn] No output levels produced for {src_path}");
         return;
@@ -897,8 +911,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             src_is_jp2k && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
 
         let n_reduce: u32 = if src_is_jp2k && !lv_out.passthrough {
-            if args.half {
-                1  // out_tile was derived from ceil(src/2), so DWT level-1 is exact
+            if decode_shift > 0 {
+                decode_shift  // out_tile was derived from ceil(src/2^decode_shift), exact
             } else {
                 let nat_otw = (lv_out.out_tile_w / 2).max(1);
                 let nat_oth = (lv_out.out_tile_h / 2).max(1);
@@ -968,7 +982,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                 src_jp2k_is_ycbcr,
                 src_photometric:   src_lv.photometric as u32,
                 n_reduce,
-                half:              args.half,
+                decode_shift,
                 jpeg_tables:       jpeg_tables_arc.clone(),
                 icc_transform:     icc_transform_arc.clone(),
             });
@@ -1077,7 +1091,7 @@ fn compute_output_levels(
     target_mpp: f64,
     verbose: bool,
     icc_bake: bool,
-    half: bool,
+    decode_shift: u32,
 ) -> Vec<OutputLevel> {
     let base_mpp = src_levels[0].mpp_x;
     let mut out  = Vec::new();
@@ -1103,11 +1117,12 @@ fn compute_output_levels(
         let (out_img_w, out_img_h, out_tile_w, out_tile_h, actual_mpp_x, actual_mpp_y) =
             if passthrough {
                 (best.img_w, best.img_h, best.tile_w, best.tile_h, best.mpp_x, best.mpp_y)
-            } else if half && is_jp2k(best.compression as u32) {
-                // DWT level-1 gives ceil(tw/2) per quad; use that directly
+            } else if decode_shift > 0 && is_jp2k(best.compression as u32) {
+                // DWT level-N gives ceil(tw/2^N) per quad; use that directly
                 // so the assembled canvas matches out_tile exactly — no correction resize needed.
-                let nat_otw = ((best.tile_w + 1) / 2).max(1);  // ceil(tw/2)
-                let nat_oth = ((best.tile_h + 1) / 2).max(1);
+                let div = 1u32 << decode_shift;
+                let nat_otw = ((best.tile_w + div - 1) / div).max(1);  // ceil(tw/div)
+                let nat_oth = ((best.tile_h + div - 1) / div).max(1);
                 let sx  = if best.tile_w > 0 { nat_otw as f64 / best.tile_w as f64 } else { 1.0 };
                 let sy  = if best.tile_h > 0 { nat_oth as f64 / best.tile_h as f64 } else { 1.0 };
                 let oiw = (best.img_w as f64 * sx).round() as u32;

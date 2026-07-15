@@ -554,7 +554,7 @@ pub(crate) fn convert_vsi(
     out_path: &str,
     legacy: bool,
     quality: u8,
-    half: bool,
+    mag_20x: bool,
     verbose: bool,
     pb: Option<&ProgressBar>,
 ) -> Result<(), String> {
@@ -603,20 +603,28 @@ pub(crate) fn convert_vsi(
     let spp = ets.size_c as usize;
     let mut levels = build_levels(ets, meta);
     // CellSens stores a downsampling level for every 1/2 step (res 0,1,2,...),
-    // which is wasteful: 1/4 steps suffice in practice. Keep only every other
-    // level so the output pyramid steps by 1/4, dropping the rest verbatim
-    // (JPEG tiles still pass through losslessly — no resize):
-    //   - default/passthrough: res 0, 2, 4, ...  → 1, 1/4, 1/16, ...
-    //   - --half:              res 1, 3, 5, ...  → 1/2, 1/8, 1/32, ...
-    // --half also drops the full-resolution level by starting at res=1. A
-    // single-resolution source can't be halved, so leave it untouched.
-    if half && levels.len() < 2 {
-        if verbose {
-            vlog(pb, "  [vsi  ] --half ignored: source has no sub-resolution level".to_string());
+    // which is wasteful: 1/4 steps suffice in practice. Keep only every 4th-scale
+    // step, starting at a resolution index derived from the source's magnification
+    // bucket (JPEG tiles still pass through losslessly — no resize):
+    //   - default/passthrough:  start_res=0 → res 0, 2, 4, ...  → 1, 1/4, 1/16, ...
+    //   - --20x @ 40x source:   start_res=1 → res 1, 3, 5, ...  → 1/2, 1/8, 1/32, ...
+    //   - --20x @ 80x source:   start_res=2 → res 2, 4, 6, ...  → 1/4, 1/16, 1/64, ...
+    // A source without enough sub-resolution levels to reach start_res is left
+    // untouched (full default pyramid).
+    let start_res: u32 = if mag_20x {
+        match crate::factor_to_20x(levels[0].mpp_x) {
+            Some(f) => f.trailing_zeros(),
+            None => return Err("source MPP unknown or ≥0.7 µm/px (--20x cannot upscale)".to_string()),
         }
     } else {
-        let parity = if half { 1 } else { 0 };
-        levels.retain(|lv| lv.res % 2 == parity);
+        0
+    };
+    if start_res > 0 && (levels.len() as u32) <= start_res {
+        if verbose {
+            vlog(pb, format!("  [vsi  ] --20x ignored: source has no level at 1/{} scale", 1u32 << start_res));
+        }
+    } else {
+        levels.retain(|lv| lv.res >= start_res && (lv.res - start_res) % 2 == 0);
     }
     if verbose {
         let mode = if ets.comp_type == COMP_JPEG { "pass" } else { "transcode" };

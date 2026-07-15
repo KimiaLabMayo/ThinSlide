@@ -127,9 +127,9 @@ impl ConversionLogger {
         self.write_line(&format!("cpu:    {}  logical={}  physical={}", cpu_brand, logical, physical));
         self.write_line(&format!("ram:    {} MB", total_ram_mb));
         self.write_line(&format!(
-            "options: legacy={} verbose={} half={} icc_bake={} use_parent_name={} \
+            "options: legacy={} verbose={} mag_20x={} icc_bake={} use_parent_name={} \
              quality={} jobs={:?} mpp={:?} filter={}",
-            args.legacy, args.verbose, args.half, args.icc_bake,
+            args.legacy, args.verbose, args.mag_20x, args.icc_bake,
             args.use_parent_name, args.quality, args.jobs, args.mpp, filter_name
         ));
         self.write_line("---");

@@ -89,7 +89,7 @@ impl TermBuf {
 // ---------- app state -------------------------------------------------------
 
 #[derive(PartialEq, Clone, Default, serde::Serialize, serde::Deserialize)]
-enum MppMode { #[default] Passthrough, Half, X20, X10 }
+enum MppMode { #[default] Passthrough, X20, X10 }
 
 const STORAGE_KEY: &str = "thinslide_settings";
 
@@ -141,7 +141,7 @@ impl Default for App {
             "\n",
             "Features:\n",
             "  • DICOM → TIFF lossless conversion  (zero quality loss)\n",
-            "  • Downsampling  (half / 20x / 10x)\n",
+            "  • Downsampling  (20x / 10x)\n",
             "  • ICC profile baking  (converts to sRGB, removes embedded profile)\n",
             "\n",
             "Supported input formats:  DICOM, SVS, TIFF, OME-TIFF\n",
@@ -291,12 +291,11 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label("Downsampling:");
                 ui.radio_value(&mut self.mpp_mode, MppMode::Passthrough, "None");
-                ui.radio_value(&mut self.mpp_mode, MppMode::Half, "Half in each dimension");
-                ui.radio_value(&mut self.mpp_mode, MppMode::X20, "20x (0.5 mpp)");
+                ui.radio_value(&mut self.mpp_mode, MppMode::X20, "20x (adaptive, from source MPP)");
                 ui.radio_value(&mut self.mpp_mode, MppMode::X10, "10x (1.0 mpp)");
             });
 
-            if matches!(self.mpp_mode, MppMode::Half | MppMode::X20 | MppMode::X10) {
+            if matches!(self.mpp_mode, MppMode::X20 | MppMode::X10) {
                 ui.horizontal(|ui| {
                     ui.label("JPEG quality:");
                     ui.add(egui::Slider::new(&mut self.quality, 30_u8..=100_u8));
@@ -384,12 +383,8 @@ impl App {
         cmd.arg(&self.output_dir);
         if self.legacy { cmd.arg("--legacy"); }
         match &self.mpp_mode {
-            MppMode::Half => {
-                cmd.arg("--half");
-                cmd.arg("--quality"); cmd.arg(self.quality.to_string());
-            }
             MppMode::X20 => {
-                cmd.arg("--mpp"); cmd.arg("0.5");
+                cmd.arg("--20x");
                 cmd.arg("--quality"); cmd.arg(self.quality.to_string());
             }
             MppMode::X10 => {

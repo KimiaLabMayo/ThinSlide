@@ -46,6 +46,21 @@ pub fn nearest_16(v: f64) -> u32 {
     ((v / 16.0).round() as u32).max(1) * 16
 }
 
+/// Classify a source MPP (µm/px) into a nominal scan-magnification bucket and
+/// return the power-of-two downsample factor needed to reach the 20x target
+/// (~0.5 µm/px):
+///   mpp <  0.2            → 80x → factor 4
+///   0.2 <= mpp <  0.3      → 40x → factor 2
+///   0.3 <= mpp <  0.7      → 20x → factor 1 (already at target)
+///   mpp >= 0.7, or unknown → None (upscaling not supported / resolution unknown)
+pub fn factor_to_20x(mpp: f64) -> Option<u32> {
+    if mpp <= 0.0     { None }
+    else if mpp < 0.2 { Some(4) }
+    else if mpp < 0.3 { Some(2) }
+    else if mpp < 0.7 { Some(1) }
+    else              { None }
+}
+
 // ─── JPEG subsampling detection ──────────────────────────────────────────────
 
 /// Parse a JPEG byte stream and return the YCbCr chroma subsampling factors

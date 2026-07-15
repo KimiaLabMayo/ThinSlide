@@ -584,7 +584,7 @@ pub(crate) fn convert_mrxs(
     out_path: &str,
     legacy: bool,
     quality: u8,
-    half: bool,
+    mag_20x: bool,
     mpp: Option<f64>,
     verbose: bool,
     pb: Option<&ProgressBar>,
@@ -593,8 +593,9 @@ pub(crate) fn convert_mrxs(
         .ok_or_else(|| "not a valid MIRAX slide (missing Slidedat.ini / Index.dat)".to_string())?;
 
     // Resolve the base (level 0 in the output) downsample factor: --mpp targets
-    // an arbitrary scale (source MPP / target MPP need not be a power of two),
-    // --half starts the pyramid at ×2, otherwise the base is full resolution.
+    // an arbitrary scale (source MPP / target MPP need not be a power of two);
+    // --20x picks a power-of-two factor from the source's magnification bucket;
+    // otherwise the base is full resolution.
     let base_downsample: f64 = if let Some(target) = mpp {
         if src.mpp_x <= 0.0 {
             eprintln!("  [warn ] [mirax] source MPP unknown; ignoring --mpp");
@@ -608,8 +609,10 @@ pub(crate) fn convert_mrxs(
         } else {
             target / src.mpp_x
         }
-    } else if half {
-        2.0
+    } else if mag_20x {
+        crate::factor_to_20x(src.mpp_x)
+            .ok_or_else(|| "source MPP unknown or ≥0.7 µm/px (--20x cannot upscale)".to_string())?
+            as f64
     } else {
         1.0
     };

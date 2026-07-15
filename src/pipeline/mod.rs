@@ -69,8 +69,23 @@ fn convert_one_series(
     let src_mpp_opt = src.slide_levels[0].mpp_x.filter(|&v| v > 0.0);
     let src_mpp     = src_mpp_opt.unwrap_or(0.0);
 
-    let effective_mpp: Option<f64> = if args.half {
-        Some(src_mpp * 2.0)
+    let mut decode_shift: u32 = 0;
+    let effective_mpp: Option<f64> = if args.mag_20x {
+        match src_mpp_opt.and_then(crate::factor_to_20x) {
+            None => {
+                stats.skipped.fetch_add(1, Ordering::Relaxed);
+                logger.log_skip(series_idx, &series_id);
+                if args.verbose {
+                    eprintln!("  [skip ] {}  source MPP unknown or ≥0.7 µm/px (--20x cannot upscale)", series_id);
+                }
+                return;
+            }
+            Some(1) => None,
+            Some(f) => {
+                decode_shift = f.trailing_zeros();
+                Some(src_mpp * f as f64)
+            }
+        }
     } else {
         if src_mpp_opt.is_none() {
             if args.verbose {
@@ -205,7 +220,7 @@ fn convert_one_series(
             !args.legacy,
             Some(&pb),
             args.verbose,
-            args.half,
+            decode_shift,
             args.icc_bake,
         );
     } else if args.legacy {
@@ -304,8 +319,8 @@ pub fn run(args: Args) {
             .build_global();
     }
 
-    if args.half && !matches!(args.filter, image::imageops::FilterType::Nearest) {
-        eprintln!("[warn] --filter is ignored with --half: decode-side halving skips the resize step");
+    if args.mag_20x && !matches!(args.filter, image::imageops::FilterType::Nearest) {
+        eprintln!("[warn] --filter is ignored with --20x: decode-side downsampling skips the resize step");
     }
 
     if args.verbose {
@@ -445,7 +460,7 @@ pub fn run(args: Args) {
 
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            if args_ref.mpp.is_some() || args_ref.half {
+            if args_ref.mpp.is_some() || args_ref.mag_20x {
                 convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
             } else if n_concurrent <= 1 {
                 convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
@@ -477,11 +492,11 @@ pub fn run(args: Args) {
     meta_pb.finish_and_clear();
 
     if !tiff_paths.is_empty() {
-        if args.mpp.is_some() || args.half || args.icc_bake {
+        if args.mpp.is_some() || args.mag_20x || args.icc_bake {
             tiff_paths.sort();
             tiffds::process_files(&tiff_paths, &args, &mp, &stats);
         } else {
-            eprintln!("  {} TIFF/SVS file(s) found; specify --mpp, --half, or --icc-bake to process them.",
+            eprintln!("  {} TIFF/SVS file(s) found; specify --mpp, --20x, or --icc-bake to process them.",
                 tiff_paths.len());
         }
     }
@@ -532,7 +547,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
 
         let tmp_path = format!("{}.tmp", out_path);
         match crate::source::vsi::convert_vsi(
-            &src, &tmp_path, args.legacy, args.quality, args.half, args.verbose, Some(&pb),
+            &src, &tmp_path, args.legacy, args.quality, args.mag_20x, args.verbose, Some(&pb),
         ) {
             Ok(()) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
@@ -584,7 +599,7 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
 
         let tmp_path = format!("{}.tmp", out_path);
         match crate::source::mrxs::convert_mrxs(
-            &src, &tmp_path, args.legacy, args.quality, args.half, args.mpp, args.verbose, Some(&pb),
+            &src, &tmp_path, args.legacy, args.quality, args.mag_20x, args.mpp, args.verbose, Some(&pb),
         ) {
             Ok(()) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {

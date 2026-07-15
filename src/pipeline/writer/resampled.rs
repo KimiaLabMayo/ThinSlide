@@ -51,7 +51,7 @@ struct LibEncodeParams {
     jp2k_has_ict_rct: bool,
     color_space:      ColorSpace,
     n_reduce:         u32,
-    half:             bool,
+    decode_shift:     u32,
     icc_transform:    Option<Arc<IccTransform>>,
 }
 
@@ -66,11 +66,16 @@ fn encode_one_tile_lib(
         let data = quads[qi].as_ref()?;
         if p.is_jpeg_src {
             let fmt = if p.spp == 1 { turbojpeg::PixelFormat::GRAY } else { turbojpeg::PixelFormat::RGB };
-            if p.half {
+            let scaling = match p.decode_shift {
+                1 => Some(turbojpeg::ScalingFactor::ONE_HALF),
+                2 => Some(turbojpeg::ScalingFactor::ONE_QUARTER),
+                _ => None,
+            };
+            if let Some(sf) = scaling {
                 let mut dec = turbojpeg::Decompressor::new().ok()?;
-                dec.set_scaling_factor(turbojpeg::ScalingFactor::ONE_HALF).ok()?;
+                dec.set_scaling_factor(sf).ok()?;
                 let header = dec.read_header(data).ok()?;
-                let scaled = header.scaled(turbojpeg::ScalingFactor::ONE_HALF);
+                let scaled = header.scaled(sf);
                 let (w, h) = (scaled.width, scaled.height);
                 let pitch = w * ch;
                 let mut pixels = vec![0u8; h * pitch];
@@ -123,7 +128,9 @@ pub(crate) fn write_resampled_tiff(
     ome: bool,
     pb: Option<&ProgressBar>,
     verbose: bool,
-    half: bool,
+    // 0 = generic --mpp resampling; 1/2 = --20x DCT-domain half/quarter decode
+    // (turbojpeg ONE_HALF/ONE_QUARTER, JP2K DWT level-1/level-2).
+    decode_shift: u32,
     icc_bake: bool,
 ) {
 
@@ -159,36 +166,26 @@ pub(crate) fn write_resampled_tiff(
     }
 
     let active_levels: Vec<LevelInfo> = groups.iter().enumerate().filter_map(|(i, _)| {
-        // When half=true and MPP is unknown (target_mpp == 0.0), fall back to
-        // a normalized 1:2 ratio so scale math produces 0.5× without dividing by zero.
-        let half_unknown = half && target_mpp <= 0.0;
-
         // Target MPP for this output level: scale target_mpp by the ratio of
         // this group's MPP to the base level's MPP.
         let group_mpp_x = groups[i][0].mpp_x.filter(|&v| v > 0.0).unwrap_or(src_mpp_x);
         let group_mpp_y = groups[i][0].mpp_y.filter(|&v| v > 0.0).unwrap_or(src_mpp_y);
-        let target_lv_mpp_x = if half_unknown { 2.0 } else { target_mpp * (group_mpp_x / src_mpp_x) };
-        let target_lv_mpp_y = if half_unknown { 2.0 } else { target_mpp * (group_mpp_y / src_mpp_y) };
+        let target_lv_mpp_x = target_mpp * (group_mpp_x / src_mpp_x);
+        let target_lv_mpp_y = target_mpp * (group_mpp_y / src_mpp_y);
 
-        // When MPP is unknown, pick source group by index (no MPP to compare).
-        // Otherwise find the input group whose MPP is closest to target_lv_mpp_x.
-        let chosen = if half_unknown {
-            &groups[i]
-        } else {
-            groups.iter()
-                .min_by(|a, b| {
-                    let ma = a[0].mpp_x.unwrap_or(src_mpp_x);
-                    let mb = b[0].mpp_x.unwrap_or(src_mpp_x);
-                    (ma - target_lv_mpp_x).abs()
-                        .partial_cmp(&(mb - target_lv_mpp_x).abs()).unwrap()
-                })
-                .unwrap()
-        };
+        // Find the input group whose MPP is closest to target_lv_mpp_x.
+        let chosen = groups.iter()
+            .min_by(|a, b| {
+                let ma = a[0].mpp_x.unwrap_or(src_mpp_x);
+                let mb = b[0].mpp_x.unwrap_or(src_mpp_x);
+                (ma - target_lv_mpp_x).abs()
+                    .partial_cmp(&(mb - target_lv_mpp_x).abs()).unwrap()
+            })
+            .unwrap();
 
         let chosen_meta  = chosen[0];
-        // Use 1.0 as normalized dummy for scale math when MPP is unknown.
-        let chosen_mpp_x = if half_unknown { 1.0 } else { chosen_meta.mpp_x.unwrap_or(src_mpp_x) };
-        let chosen_mpp_y = if half_unknown { 1.0 } else { chosen_meta.mpp_y.unwrap_or(src_mpp_y) };
+        let chosen_mpp_x = chosen_meta.mpp_x.unwrap_or(src_mpp_x);
+        let chosen_mpp_y = chosen_meta.mpp_y.unwrap_or(src_mpp_y);
         let chosen_w     = chosen_meta.px_columns.unwrap_or(0);
         let chosen_h     = chosen_meta.px_rows.unwrap_or(0);
         let (chosen_tw, chosen_th) = chosen_meta.tile_size.unwrap_or((chosen_w, chosen_h));
@@ -219,27 +216,25 @@ pub(crate) fn write_resampled_tiff(
                 // No scaling: output dimensions equal the source dimensions.
                 (chosen_w, chosen_h, chosen_tw, chosen_th, chosen_mpp_x, chosen_mpp_y)
             } else {
-                // For --half + JP2K: DWT level-1 yields ceil(tw/2) per quad; use that directly
-                // so the assembled canvas matches out_tile exactly — no correction resize needed.
-                let is_jp2k_half = half && matches!(
+                // For --20x + JP2K: DWT level-N yields ceil(tw/2^N) per quad; use that
+                // directly so the assembled canvas matches out_tile exactly — no
+                // correction resize needed.
+                let is_jp2k_pow2 = decode_shift > 0 && matches!(
                     map_transfer_syntax_to_compression(&chosen_meta.transfer_syntax_uid),
                     CompressionType::Jpeg2000Lossless | CompressionType::Jpeg2000
                     | CompressionType::Jpeg2000Part2MulticomponentLossless
                     | CompressionType::Jpeg2000Part2Multicomponent
                 );
-                if is_jp2k_half {
-                    let nat_otw = ((chosen_tw + 1) / 2).max(1);  // ceil(tw/2)
-                    let nat_oth = ((chosen_th + 1) / 2).max(1);
+                if is_jp2k_pow2 {
+                    let div = 1u32 << decode_shift;
+                    let nat_otw = ((chosen_tw + div - 1) / div).max(1);  // ceil(tw/div)
+                    let nat_oth = ((chosen_th + div - 1) / div).max(1);
                     let scale_x = if chosen_tw > 0 { nat_otw as f64 / chosen_tw as f64 } else { 1.0 };
                     let scale_y = if chosen_th > 0 { nat_oth as f64 / chosen_th as f64 } else { 1.0 };
                     let oiw = (chosen_w as f64 * scale_x).round() as u32;
                     let oih = (chosen_h as f64 * scale_y).round() as u32;
-                    let amx = if half_unknown { 0.0 }
-                              else if nat_otw > 0 { chosen_mpp_x * chosen_tw as f64 / nat_otw as f64 }
-                              else { chosen_mpp_x };
-                    let amy = if half_unknown { 0.0 }
-                              else if nat_oth > 0 { chosen_mpp_y * chosen_th as f64 / nat_oth as f64 }
-                              else { chosen_mpp_y };
+                    let amx = if nat_otw > 0 { chosen_mpp_x * chosen_tw as f64 / nat_otw as f64 } else { chosen_mpp_x };
+                    let amy = if nat_oth > 0 { chosen_mpp_y * chosen_th as f64 / nat_oth as f64 } else { chosen_mpp_y };
                     (oiw, oih, nat_otw * 2, nat_oth * 2, amx, amy)
                 } else {
                     // Output tile covers a 2×2 block of source tiles (one source tile maps to
@@ -257,13 +252,8 @@ pub(crate) fn write_resampled_tiff(
                     let scale_y = if chosen_th > 0 { nat_oth as f64 / chosen_th as f64 } else { 1.0 };
                     let oiw = (chosen_w as f64 * scale_x).round() as u32;
                     let oih = (chosen_h as f64 * scale_y).round() as u32;
-                    // When MPP is unknown, leave actual_mpp as 0.0 (written as no resolution tag).
-                    let amx = if half_unknown { 0.0 }
-                              else if nat_otw > 0 { chosen_mpp_x * chosen_tw as f64 / nat_otw as f64 }
-                              else { chosen_mpp_x };
-                    let amy = if half_unknown { 0.0 }
-                              else if nat_oth > 0 { chosen_mpp_y * chosen_th as f64 / nat_oth as f64 }
-                              else { chosen_mpp_y };
+                    let amx = if nat_otw > 0 { chosen_mpp_x * chosen_tw as f64 / nat_otw as f64 } else { chosen_mpp_x };
+                    let amy = if nat_oth > 0 { chosen_mpp_y * chosen_th as f64 / nat_oth as f64 } else { chosen_mpp_y };
                     (oiw, oih, otw, oth, amx, amy)
                 }
             };
@@ -389,7 +379,7 @@ pub(crate) fn write_resampled_tiff(
     let fir_pixel_type = if spp == 1 { fir::PixelType::U8 } else { fir::PixelType::U8x3 };
     let resize_opts = fir::ResizeOptions::new().resize_alg(fir_alg);
 
-    let write_level_tiles = |tiff: *mut TIFF, lv: &LevelInfo, half: bool| {
+    let write_level_tiles = |tiff: *mut TIFF, lv: &LevelInfo, decode_shift: u32| {
         let chunk_size = (rayon::current_num_threads() * 4).max(1);
 
         // Source image dimensions for grid computation (shared across group files).
@@ -409,10 +399,11 @@ pub(crate) fn write_resampled_tiff(
         );
 
         // n_reduce for JP2K DWT: choose the number of resolution reduction levels.
-        // For --half the out_tile was computed from ceil(src/2), so n_reduce=1 is exact.
-        // For --mpp, derive n_reduce from the scale ratio so DWT does most of the work.
-        let n_reduce: u32 = if is_jp2k_src && half {
-            1
+        // For --20x the out_tile was computed from ceil(src/2^decode_shift), so
+        // n_reduce=decode_shift is exact. For --mpp, derive n_reduce from the
+        // scale ratio so DWT does most of the work.
+        let n_reduce: u32 = if is_jp2k_src && decode_shift > 0 {
+            decode_shift
         } else {
             let nat_otw = (lv.out_tile_w / 2).max(1);
             let nat_oth = (lv.out_tile_h / 2).max(1);
@@ -486,7 +477,7 @@ pub(crate) fn write_resampled_tiff(
             jp2k_has_ict_rct,
             color_space,
             n_reduce,
-            half,
+            decode_shift,
             icc_transform:    icc_transform.clone(),
         });
         let (raw_tx, raw_rx) = mpsc::sync_channel::<LibRawChunk>(2);
@@ -660,7 +651,7 @@ pub(crate) fn write_resampled_tiff(
                 }
             }
 
-            write_level_tiles(tiff, lv, half);
+            write_level_tiles(tiff, lv, decode_shift);
         }
 
         unsafe { TIFFWriteDirectory(tiff); }
