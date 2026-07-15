@@ -291,8 +291,8 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label("Downsampling:");
                 ui.radio_value(&mut self.mpp_mode, MppMode::Passthrough, "None");
-                ui.radio_value(&mut self.mpp_mode, MppMode::X20, "20x (adaptive, from source MPP)");
-                ui.radio_value(&mut self.mpp_mode, MppMode::X10, "10x (1.0 mpp)");
+                ui.radio_value(&mut self.mpp_mode, MppMode::X20, "20x");
+                ui.radio_value(&mut self.mpp_mode, MppMode::X10, "10x");
             });
 
             if matches!(self.mpp_mode, MppMode::X20 | MppMode::X10) {
@@ -303,7 +303,7 @@ impl eframe::App for App {
             }
 
             ui.checkbox(&mut self.use_parent_name, "Use parent name as filename (DICOM only)");
-            ui.checkbox(&mut self.icc_bake, "Convert to sRGB color space and remove ICC profile (slow)");
+            ui.checkbox(&mut self.icc_bake, "Convert to sRGB color space and remove ICC profile");
 
             ui.horizontal(|ui| {
                 ui.label("Jobs:");
