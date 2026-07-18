@@ -5,7 +5,8 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "thinslide", about = "Whole Slide Image Optimizer")]
 pub struct Args {
-    /// Input directory containing DICOM files (must exist)
+    /// Input directory containing DICOM/VSI/MRXS files, or a direct path to a
+    /// single TIFF/SVS file (must exist)
     #[arg(value_parser = parse_input_dir)]
     pub input_dir: String,
 
@@ -73,8 +74,14 @@ fn parse_jobs(s: &str) -> Result<usize, String> {
 fn parse_input_dir(s: &str) -> Result<String, String> {
     let p = Path::new(s);
     if !p.exists() { return Err(format!("'{}' does not exist", s)); }
-    if !p.is_dir() { return Err(format!("'{}' is not a directory", s)); }
-    Ok(s.to_string())
+    if p.is_dir() { return Ok(s.to_string()); }
+    // DICOM/VSI/MRXS are split across multiple files and need a directory, but a
+    // single TIFF/SVS file may be passed directly.
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    if matches!(ext.as_str(), "tiff" | "svs") {
+        return Ok(s.to_string());
+    }
+    Err(format!("'{}' is not a directory (only a .tiff/.svs file may be passed directly)", s))
 }
 
 fn parse_output_dir(s: &str) -> Result<String, String> {
