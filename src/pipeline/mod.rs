@@ -366,8 +366,8 @@ pub fn run(args: Args) {
     let mut mrxs_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut last_dir_count   = 0usize;
     let mut total_file_count = 0usize;
-    for entry in WalkDir::new(&args.input_dir).into_iter().filter_map(|e| e.ok()) {
-        if !entry.file_type().is_file() { continue; }
+    for entry in WalkDir::new(&args.input_dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
+        if !entry.path().is_file() { continue; }
         let ext = entry.path().extension()
             .and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
         match ext.as_str() {
