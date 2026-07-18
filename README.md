@@ -108,6 +108,14 @@ Always resamples in full, so it is slower than `--20x`. Use `--filter` to pick t
 thinslide /data/slides /data/output --mpp 0.5 --filter lanczos3
 ```
 
+**`--half`** — halve both dimensions unconditionally, without reading source MPP.
+Useful when the source has no resolution metadata (so `--20x` would have to skip it).
+Mutually exclusive with `--20x` and `--mpp`.
+
+```sh
+thinslide /data/slides /data/output --half
+```
+
 ## Acknowledgments
 
 ThinSlide's CellSens (.vsi) and MIRAX (.mrxs) readers were developed with reference to,

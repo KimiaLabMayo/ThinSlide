@@ -70,7 +70,10 @@ fn convert_one_series(
     let src_mpp     = src_mpp_opt.unwrap_or(0.0);
 
     let mut decode_shift: u32 = 0;
-    let effective_mpp: Option<f64> = if args.mag_20x {
+    let effective_mpp: Option<f64> = if args.half {
+        decode_shift = 1;
+        Some(src_mpp * 2.0)
+    } else if args.mag_20x {
         match src_mpp_opt.and_then(crate::factor_to_20x) {
             None => {
                 stats.skipped.fetch_add(1, Ordering::Relaxed);
@@ -319,8 +322,8 @@ pub fn run(args: Args) {
             .build_global();
     }
 
-    if args.mag_20x && !matches!(args.filter, image::imageops::FilterType::Nearest) {
-        eprintln!("[warn] --filter is ignored with --20x: decode-side downsampling skips the resize step");
+    if (args.mag_20x || args.half) && !matches!(args.filter, image::imageops::FilterType::Nearest) {
+        eprintln!("[warn] --filter is ignored with --20x/--half: decode-side downsampling skips the resize step");
     }
 
     if args.verbose {
@@ -460,7 +463,7 @@ pub fn run(args: Args) {
 
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            if args_ref.mpp.is_some() || args_ref.mag_20x {
+            if args_ref.mpp.is_some() || args_ref.mag_20x || args_ref.half {
                 convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
             } else if n_concurrent <= 1 {
                 convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
@@ -492,11 +495,11 @@ pub fn run(args: Args) {
     meta_pb.finish_and_clear();
 
     if !tiff_paths.is_empty() {
-        if args.mpp.is_some() || args.mag_20x || args.icc_bake {
+        if args.mpp.is_some() || args.mag_20x || args.half || args.icc_bake {
             tiff_paths.sort();
             tiffds::process_files(&tiff_paths, &args, &mp, &stats);
         } else {
-            eprintln!("  {} TIFF/SVS file(s) found; specify --mpp, --20x, or --icc-bake to process them.",
+            eprintln!("  {} TIFF/SVS file(s) found; specify --mpp, --20x, --half, or --icc-bake to process them.",
                 tiff_paths.len());
         }
     }
@@ -547,7 +550,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
 
         let tmp_path = format!("{}.tmp", out_path);
         match crate::source::vsi::convert_vsi(
-            &src, &tmp_path, args.legacy, args.quality, args.mag_20x, args.verbose, Some(&pb),
+            &src, &tmp_path, args.legacy, args.quality, args.mag_20x, args.half, args.verbose, Some(&pb),
         ) {
             Ok(()) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
@@ -599,7 +602,7 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
 
         let tmp_path = format!("{}.tmp", out_path);
         match crate::source::mrxs::convert_mrxs(
-            &src, &tmp_path, args.legacy, args.quality, args.mag_20x, args.mpp, args.verbose, Some(&pb),
+            &src, &tmp_path, args.legacy, args.quality, args.mag_20x, args.half, args.mpp, args.verbose, Some(&pb),
         ) {
             Ok(()) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
