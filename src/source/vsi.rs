@@ -556,6 +556,7 @@ pub(crate) fn convert_vsi(
     quality: u8,
     mag_20x: bool,
     half: bool,
+    quarter: bool,
     verbose: bool,
     pb: Option<&ProgressBar>,
 ) -> Result<(), String> {
@@ -609,11 +610,14 @@ pub(crate) fn convert_vsi(
     // bucket (JPEG tiles still pass through losslessly — no resize):
     //   - default/passthrough:  start_res=0 → res 0, 2, 4, ...  → 1, 1/4, 1/16, ...
     //   - --half:               start_res=1 → res 1, 3, 5, ...  → 1/2, 1/8, 1/32, ... (unconditional)
+    //   - --quarter:            start_res=2 → res 2, 4, 6, ...  → 1/4, 1/16, 1/64, ... (unconditional)
     //   - --20x @ 40x source:   start_res=1 → res 1, 3, 5, ...  → 1/2, 1/8, 1/32, ...
     //   - --20x @ 80x source:   start_res=2 → res 2, 4, 6, ...  → 1/4, 1/16, 1/64, ...
     // A source without enough sub-resolution levels to reach start_res is left
     // untouched (full default pyramid).
-    let start_res: u32 = if half {
+    let start_res: u32 = if quarter {
+        2
+    } else if half {
         1
     } else if mag_20x {
         match crate::factor_to_20x(levels[0].mpp_x) {
@@ -625,7 +629,7 @@ pub(crate) fn convert_vsi(
     };
     if start_res > 0 && (levels.len() as u32) <= start_res {
         if verbose {
-            let flag = if half { "--half" } else { "--20x" };
+            let flag = if quarter { "--quarter" } else if half { "--half" } else { "--20x" };
             vlog(pb, format!("  [vsi  ] {flag} ignored: source has no level at 1/{} scale", 1u32 << start_res));
         }
     } else {

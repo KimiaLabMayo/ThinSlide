@@ -28,15 +28,23 @@ pub struct Args {
 
     /// Downsample to 20x scan magnification (~0.5 µm/px), auto-detected from
     /// source MPP (80x→quarter, 40x→half, 20x→copy through, 10x→skip);
-    /// mutually exclusive with --mpp and --half
-    #[arg(long = "20x", conflicts_with_all = ["mpp", "half"])]
+    /// mutually exclusive with --mpp, --half and --quarter
+    #[arg(long = "20x", conflicts_with_all = ["mpp", "half", "quarter"])]
     pub mag_20x: bool,
 
     /// Halve both width and height (1/4 area) unconditionally, regardless of
     /// source MPP; works even when the source resolution is unknown.
-    /// Mutually exclusive with --mpp and --20x
-    #[arg(long, conflicts_with_all = ["mpp", "mag_20x"])]
+    /// Mutually exclusive with --mpp, --20x and --quarter
+    #[arg(long, conflicts_with_all = ["mpp", "mag_20x", "quarter"])]
     pub half: bool,
+
+    /// Quarter both width and height (1/16 area) unconditionally, regardless
+    /// of source MPP; works even when the source resolution is unknown.
+    /// Sources usually already carry a precomputed 1/4-scale pyramid level
+    /// (unlike 1/2), so this is typically faster than --half.
+    /// Mutually exclusive with --mpp, --20x and --half
+    #[arg(long, conflicts_with_all = ["mpp", "mag_20x", "half"])]
+    pub quarter: bool,
 
     /// Apply ICC color profile and convert to sRGB
     #[arg(long)]
@@ -55,8 +63,8 @@ pub struct Args {
     pub quality: u8,
 
     /// Resampling filter for --mpp [nearest, triangle, catmullrom, gaussian, lanczos3].
-    /// Ignored with --20x/--half: decode-side downsampling (DCT 1/2 or 1/4 / DWT level-1 or
-    /// level-2) produces the exact target size, so no pixel-domain resize step is performed.
+    /// Ignored with --20x/--half/--quarter: decode-side downsampling (DCT 1/2 or 1/4 / DWT
+    /// level-1 or level-2) produces the exact target size, so no pixel-domain resize step is performed.
     #[arg(long, default_value = "nearest", value_parser = parse_filter)]
     pub filter: FilterType,
 

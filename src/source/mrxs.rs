@@ -586,6 +586,7 @@ pub(crate) fn convert_mrxs(
     quality: u8,
     mag_20x: bool,
     half: bool,
+    quarter: bool,
     mpp: Option<f64>,
     verbose: bool,
     pb: Option<&ProgressBar>,
@@ -595,9 +596,9 @@ pub(crate) fn convert_mrxs(
 
     // Resolve the base (level 0 in the output) downsample factor: --mpp targets
     // an arbitrary scale (source MPP / target MPP need not be a power of two);
-    // --half halves unconditionally, regardless of source MPP; --20x picks a
-    // power-of-two factor from the source's magnification bucket; otherwise
-    // the base is full resolution.
+    // --half halves / --quarter quarters unconditionally, regardless of source
+    // MPP; --20x picks a power-of-two factor from the source's magnification
+    // bucket; otherwise the base is full resolution.
     let base_downsample: f64 = if let Some(target) = mpp {
         if src.mpp_x <= 0.0 {
             eprintln!("  [warn ] [mirax] source MPP unknown; ignoring --mpp");
@@ -611,6 +612,8 @@ pub(crate) fn convert_mrxs(
         } else {
             target / src.mpp_x
         }
+    } else if quarter {
+        4.0
     } else if half {
         2.0
     } else if mag_20x {

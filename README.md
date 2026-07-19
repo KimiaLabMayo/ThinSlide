@@ -110,10 +110,19 @@ thinslide /data/slides /data/output --mpp 0.5 --filter lanczos3
 
 **`--half`** — halve both dimensions unconditionally, without reading source MPP.
 Useful when the source has no resolution metadata (so `--20x` would have to skip it).
-Mutually exclusive with `--20x` and `--mpp`.
+Mutually exclusive with `--20x`, `--mpp` and `--quarter`.
 
 ```sh
 thinslide /data/slides /data/output --half
+```
+
+**`--quarter`** — quarter both dimensions unconditionally, without reading source MPP.
+Same idea as `--half`, but a 1/4-scale level is usually already precomputed in the
+source pyramid (unlike 1/2), so this is typically faster. Mutually exclusive with
+`--20x`, `--mpp` and `--half`.
+
+```sh
+thinslide /data/slides /data/output --quarter
 ```
 
 ## Acknowledgments
