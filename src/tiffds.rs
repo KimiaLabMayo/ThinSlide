@@ -1144,9 +1144,11 @@ fn compute_output_levels(
         let (out_img_w, out_img_h, out_tile_w, out_tile_h, actual_mpp_x, actual_mpp_y) =
             if passthrough {
                 (best.img_w, best.img_h, best.tile_w, best.tile_h, best.mpp_x, best.mpp_y)
-            } else if decode_shift > 0 && is_jp2k(best.compression as u32) {
-                // DWT level-N gives ceil(tw/2^N) per quad; use that directly
-                // so the assembled canvas matches out_tile exactly — no correction resize needed.
+            } else if decode_shift > 0 && (is_jp2k(best.compression as u32)
+                || best.compression as u32 == COMPRESSION_JPEG) {
+                // JP2K DWT level-N and JPEG (turbojpeg) scaled decode both give
+                // exactly ceil(tw/2^N) per quad; use that directly so the assembled
+                // canvas matches out_tile exactly — no correction resize needed.
                 let div = 1u32 << decode_shift;
                 let nat_otw = ((best.tile_w + div - 1) / div).max(1);  // ceil(tw/div)
                 let nat_oth = ((best.tile_h + div - 1) / div).max(1);

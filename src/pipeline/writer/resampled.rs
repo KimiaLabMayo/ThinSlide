@@ -216,16 +216,18 @@ pub(crate) fn write_resampled_tiff(
                 // No scaling: output dimensions equal the source dimensions.
                 (chosen_w, chosen_h, chosen_tw, chosen_th, chosen_mpp_x, chosen_mpp_y)
             } else {
-                // For --20x + JP2K: DWT level-N yields ceil(tw/2^N) per quad; use that
+                // For --half/--quarter/--20x: JP2K DWT level-N and JPEG (turbojpeg)
+                // scaled decode both yield exactly ceil(tw/2^N) per quad; use that
                 // directly so the assembled canvas matches out_tile exactly — no
                 // correction resize needed.
-                let is_jp2k_pow2 = decode_shift > 0 && matches!(
+                let exact_pow2_decode = decode_shift > 0 && matches!(
                     map_transfer_syntax_to_compression(&chosen_meta.transfer_syntax_uid),
                     CompressionType::Jpeg2000Lossless | CompressionType::Jpeg2000
                     | CompressionType::Jpeg2000Part2MulticomponentLossless
                     | CompressionType::Jpeg2000Part2Multicomponent
+                    | CompressionType::JpegBaseline | CompressionType::JpegExtended
                 );
-                if is_jp2k_pow2 {
+                if exact_pow2_decode {
                     let div = 1u32 << decode_shift;
                     let nat_otw = ((chosen_tw + div - 1) / div).max(1);  // ceil(tw/div)
                     let nat_oth = ((chosen_th + div - 1) / div).max(1);
