@@ -1,10 +1,14 @@
 [package]
 name = "thinslide"
-version = "0.1.0"
+version = "0.3.1"
 edition = "2024"
 authors = ["Wataru Uegami, MD, PhD"]
-license = "GPL-2.0-only"
+license = "GPL-2.0-or-later"
 links = "tiff"
+
+description = "Fast whole-slide image optimizer. Repack, Downsample, Color-correct"
+repository = "https://github.com/KimiaLabMayo/ThinSlide"
+readme = "README.md"
 
 [[bin]]
 name = "thinslide"

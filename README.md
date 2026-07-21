@@ -136,8 +136,8 @@ and in part ported from, the following open-source projects:
 ## License
 
 Copyright (C) 2026 Wataru Uegami, MD, PhD
+thinslide is licensed under the GNU General Public License v2.0 or later (GPL-2.0-or-later).
 
-ThinSlide is licensed under the **GNU General Public License v2.0** — see [LICENSE](LICENSE).
 
 ## Disclaimer
 
