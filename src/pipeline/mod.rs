@@ -136,9 +136,9 @@ fn convert_one_series(
             series_idx, series_id, comp, src_mpp, src.slide_levels.len(), mode);
     }
 
-    // When --legacy is set, the source is JP2K, and a matching level exists,
+    // When --openslide is set, the source is JP2K, and a matching level exists,
     // passthrough as SVS without decoding.
-    let jp2k_svs_skip: Option<usize> = if !args.legacy || args.icc_bake { None } else {
+    let jp2k_svs_skip: Option<usize> = if !args.openslide || args.icc_bake { None } else {
         effective_mpp.and_then(|target| {
             if !is_jpeg2000(&comp) { return None; }
             let skip = src.slide_levels.iter()
@@ -166,14 +166,14 @@ fn convert_one_series(
     let output_path = if jp2k_svs_skip.is_some() {
         format!("{}/{}.svs", args.output_dir, file_stem)
     } else if effective_mpp.is_some() {
-        if args.legacy {
+        if args.openslide {
             format!("{}/{}.tiff", args.output_dir, file_stem)
         } else {
             format!("{}/{}.ome.tiff", args.output_dir, file_stem)
         }
-    } else if args.legacy && is_jpeg2000(&comp) {
+    } else if args.openslide && is_jpeg2000(&comp) {
         format!("{}/{}.svs", args.output_dir, file_stem)
-    } else if args.legacy {
+    } else if args.openslide {
         format!("{}/{}.tiff", args.output_dir, file_stem)
     } else {
         format!("{}/{}.ome.tiff", args.output_dir, file_stem)
@@ -223,13 +223,13 @@ fn convert_one_series(
         writer::write_resampled_tiff(
             &src.slide_levels, &tmp_path,
             target_mpp, args.quality, args.filter,
-            !args.legacy,
+            !args.openslide,
             Some(&pb),
             args.verbose,
             decode_shift,
             args.icc_bake,
         );
-    } else if args.legacy {
+    } else if args.openslide {
         if is_jpeg2000(&comp) {
             writer::write_svs(
                 &src.slide_levels,
@@ -534,7 +534,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
         let src = path.to_string_lossy().to_string();
         let stem = sanitize_file_stem(
             path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
-        let out_path = if args.legacy {
+        let out_path = if args.openslide {
             format!("{}/{}.tiff", args.output_dir, stem)
         } else {
             format!("{}/{}.ome.tiff", args.output_dir, stem)
@@ -553,7 +553,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
 
         let tmp_path = format!("{}.tmp", out_path);
         match crate::source::vsi::convert_vsi(
-            &src, &tmp_path, args.legacy, args.quality, args.mag_20x(), args.half(), args.quarter(), args.verbose, Some(&pb),
+            &src, &tmp_path, args.openslide, args.quality, args.mag_20x(), args.half(), args.quarter(), args.verbose, Some(&pb),
         ) {
             Ok(()) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
@@ -586,7 +586,7 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
         let src = path.to_string_lossy().to_string();
         let stem = sanitize_file_stem(
             path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
-        let out_path = if args.legacy {
+        let out_path = if args.openslide {
             format!("{}/{}.tiff", args.output_dir, stem)
         } else {
             format!("{}/{}.ome.tiff", args.output_dir, stem)
@@ -605,7 +605,7 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
 
         let tmp_path = format!("{}.tmp", out_path);
         match crate::source::mrxs::convert_mrxs(
-            &src, &tmp_path, args.legacy, args.quality, args.mag_20x(), args.half(), args.quarter(), args.mpp(), args.verbose, Some(&pb),
+            &src, &tmp_path, args.openslide, args.quality, args.mag_20x(), args.half(), args.quarter(), args.mpp(), args.verbose, Some(&pb),
         ) {
             Ok(()) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {

@@ -1,6 +1,6 @@
 // WSI dicom to tiff/svs converter
 // Convert the whole slide image dicom files to a single pyramidal OME-TIFF (default) or
-// legacy format (SVS / generic BigTIFF) when --legacy is passed.
+// OpenSlide-compatible format (SVS / generic BigTIFF) when --openslide is passed.
 
 #[allow(non_upper_case_globals)]
 #[allow(non_camel_case_types)]

@@ -11,20 +11,20 @@
 | Input | default | `--scale 20x` | `--icc-bake` |
 |---|:---:|:---:|:---:|
 | **DICOM** | 🔵  | 🟢  | 🟢 |
-| **VSI** (CellSens)¹ | 🔵  | 🟢  | 🟢  |
 | **SVS / TIFF** | —² | 🟢  | 🟢  |
+| **VSI** (CellSens)¹ | 🔵  | 🟢  | 🟢  |
 
 **🔵 repackaging** — compressed tiles are copied straight through, at near-copy speed. No image quality change.
 
 **🟢 re-encoding** — only where the pixels actually change.
 
-Output is OME-TIFF by default, or SVS-like BigTIFF with `--legacy`.
+Output is OME-TIFF by default, or SVS-like BigTIFF with `--openslide` (matches the
+source's original compression, and is readable by [OpenSlide](https://openslide.org/)).
 
-¹ Experimental reader. 16-bit fluorescence channels are skipped (8-bit brightfield only).
+¹ Experimental reader. 8-bit brightfield only.
   `--scale <number>` is not supported for VSI yet.
   
-² Already a single valid slide file — nothing to convert. Skipped unless combined with
-  `--scale` or `--icc-bake`.
+² Skipped unless combined with `--scale` or `--icc-bake`.
 
 ## Desktop app (no command line)
 
@@ -50,8 +50,8 @@ Input and output are directories — ThinSlide processes every slide it finds, m
 # Convert a folder of DICOM slides into OME-TIFF (uses all CPUs)
 thinslide /data/dicoms /data/output
 
-# Same, but write SVS-like BigTIFF instead
-thinslide /data/dicoms /data/output --legacy
+# Same, but write SVS-like BigTIFF instead, OpenSlide-compatible
+thinslide /data/dicoms /data/output --openslide
 
 # Normalize everything to 20x
 thinslide /data/slides /data/output --scale 20x

@@ -14,9 +14,9 @@ pub struct Args {
     #[arg(value_parser = parse_output_dir)]
     pub output_dir: String,
 
-    /// Use legacy format (SVS / generic BigTIFF instead of OME-TIFF)
+    /// Use OpenSlide-compatible format (SVS / generic BigTIFF instead of OME-TIFF)
     #[arg(long)]
-    pub legacy: bool,
+    pub openslide: bool,
 
     /// Enable verbose output
     #[arg(short = 'v', long)]

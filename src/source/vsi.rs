@@ -552,7 +552,7 @@ fn build_levels(ets: &Ets, pyr: &VsiPyramid) -> Vec<VsiLevel> {
 pub(crate) fn convert_vsi(
     vsi_path: &str,
     out_path: &str,
-    legacy: bool,
+    openslide: bool,
     quality: u8,
     mag_20x: bool,
     half: bool,
@@ -651,7 +651,7 @@ pub(crate) fn convert_vsi(
     }).sum();
     if let Some(p) = pb { p.set_length(total_tiles); }
 
-    let ome = !legacy;
+    let ome = !openslide;
     let out_photometric = if spp == 1 { PHOTOMETRIC_MINISBLACK } else { PHOTOMETRIC_YCBCR };
 
     let image_desc_c: Option<CString> = if ome {

@@ -582,7 +582,7 @@ fn build_level(src: &MiraxSource, downsample: f64) -> Option<OutLevel> {
 pub(crate) fn convert_mrxs(
     mrxs_path: &str,
     out_path: &str,
-    legacy: bool,
+    openslide: bool,
     quality: u8,
     mag_20x: bool,
     half: bool,
@@ -662,7 +662,7 @@ pub(crate) fn convert_mrxs(
     let dst = unsafe { TIFFOpen(out_c.as_ptr(), w8_mode.as_ptr()) };
     if dst.is_null() { return Err(format!("cannot create {out_path}")); }
 
-    let ome = !legacy;
+    let ome = !openslide;
     let n_subifds = levels.len().saturating_sub(1);
     if ome && n_subifds > 0 {
         let zeros: Vec<u64> = vec![0u64; n_subifds];

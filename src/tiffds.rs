@@ -332,7 +332,7 @@ fn process_file_icc_bake_only(
     ome_xml:    Option<&str>,
     pb:         &ProgressBar,
 ) {
-    let out_path = if args.legacy {
+    let out_path = if args.openslide {
         format!("{out_dir}/{out_stem}.tiff")
     } else {
         format!("{out_dir}/{out_stem}.ome.tiff")
@@ -342,7 +342,7 @@ fn process_file_icc_bake_only(
     let total_tiles: u64 = src_levels.iter().map(|lv| lv.n_tiles as u64).sum();
     pb.set_length(total_tiles);
 
-    let ome   = !args.legacy;
+    let ome   = !args.openslide;
     let base  = &src_levels[0];
     let out_spp: u32 = if base.spp >= 3 { 3 } else { 1 };
     let out_photometric = if out_spp == 1 { PHOTOMETRIC_MINISBLACK } else { PHOTOMETRIC_YCBCR };
@@ -749,7 +749,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
 
     let out_path = if jp2k_svs_skip.is_some() {
         format!("{out_dir}/{out_stem}.svs")
-    } else if args.legacy {
+    } else if args.openslide {
         format!("{out_dir}/{out_stem}.tiff")
     } else {
         format!("{out_dir}/{out_stem}.ome.tiff")
@@ -788,7 +788,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         .sum();
     pb.set_length(total_tiles);
 
-    let ome = !args.legacy;
+    let ome = !args.openslide;
 
     let base_lv = &output_levels[0];
     let image_desc_c: Option<CString> = if ome {

@@ -97,7 +97,7 @@ const STORAGE_KEY: &str = "thinslide_settings";
 struct Settings {
     input_dir:       String,
     output_dir:      String,
-    legacy:          bool,
+    openslide:       bool,
     mpp_mode:        MppMode,
     quality:         u8,
     use_parent_name: bool,
@@ -109,7 +109,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             input_dir: String::new(), output_dir: String::new(),
-            legacy: false, mpp_mode: MppMode::default(),
+            openslide: false, mpp_mode: MppMode::default(),
             quality: 87, use_parent_name: false, icc_bake: false,
             jobs: String::new(),
         }
@@ -119,7 +119,7 @@ impl Default for Settings {
 struct App {
     input_dir:       String,
     output_dir:      String,
-    legacy:          bool,
+    openslide:       bool,
     mpp_mode:        MppMode,
     quality:         u8,
     use_parent_name: bool,
@@ -152,7 +152,7 @@ impl Default for App {
         Self {
             input_dir:       String::new(),
             output_dir:      String::new(),
-            legacy:          false,
+            openslide:       false,
             mpp_mode:        MppMode::Passthrough,
             quality:         87,
             use_parent_name: false,
@@ -177,7 +177,7 @@ impl App {
         let mut app = App::default();
         app.input_dir       = s.input_dir;
         app.output_dir      = s.output_dir;
-        app.legacy          = s.legacy;
+        app.openslide       = s.openslide;
         app.mpp_mode        = s.mpp_mode;
         app.quality         = s.quality;
         app.use_parent_name = s.use_parent_name;
@@ -192,7 +192,7 @@ impl eframe::App for App {
         eframe::set_value(storage, STORAGE_KEY, &Settings {
             input_dir:       self.input_dir.clone(),
             output_dir:      self.output_dir.clone(),
-            legacy:          self.legacy,
+            openslide:       self.openslide,
             mpp_mode:        self.mpp_mode.clone(),
             quality:         self.quality,
             use_parent_name: self.use_parent_name,
@@ -284,8 +284,8 @@ impl eframe::App for App {
 
             ui.horizontal(|ui| {
                 ui.label("Output format:");
-                ui.radio_value(&mut self.legacy, false, "OME-TIFF");
-                ui.radio_value(&mut self.legacy, true, "generic tiff/svs, openslide-compatible");
+                ui.radio_value(&mut self.openslide, false, "OME-TIFF");
+                ui.radio_value(&mut self.openslide, true, "generic tiff/svs, openslide-compatible");
             });
 
             ui.horizontal(|ui| {
@@ -381,7 +381,7 @@ impl App {
         let mut cmd = CommandBuilder::new(&thinslide_gui);
         cmd.arg(&self.input_dir);
         cmd.arg(&self.output_dir);
-        if self.legacy { cmd.arg("--legacy"); }
+        if self.openslide { cmd.arg("--openslide"); }
         match &self.mpp_mode {
             MppMode::X20 => {
                 cmd.arg("--scale"); cmd.arg("20x");
