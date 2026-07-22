@@ -636,19 +636,19 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return;
     }
 
-    // --half / --quarter / --20x: classify the source magnification bucket;
-    // skip (--20x only) when the MPP is unknown or the source is coarser than
-    // 20x (upscaling not supported). --half/--quarter always halve/quarter,
+    // --scale half / quarter / 20x: classify the source magnification bucket;
+    // skip (20x only) when the MPP is unknown or the source is coarser than
+    // 20x (upscaling not supported). half/quarter always halve/quarter,
     // regardless of source MPP.
-    let mag_factor: u32 = if args.quarter {
+    let mag_factor: u32 = if args.quarter() {
         4
-    } else if args.half {
+    } else if args.half() {
         2
-    } else if args.mag_20x {
+    } else if args.mag_20x() {
         match crate::factor_to_20x(src_levels[0].mpp_x) {
             Some(f) => f,
             None => {
-                eprintln!("  [skip ] {src_path}: source MPP unknown or ≥0.7 µm/px (--20x cannot upscale)");
+                eprintln!("  [skip ] {src_path}: source MPP unknown or ≥0.7 µm/px (--scale 20x cannot upscale)");
                 return;
             }
         }
@@ -656,8 +656,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         1
     };
 
-    // --20x at native 20x, no color conversion requested: copy through as-is.
-    if args.mag_20x && mag_factor == 1 && !args.icc_bake {
+    // --scale 20x at native 20x, no color conversion requested: copy through as-is.
+    if args.mag_20x() && mag_factor == 1 && !args.icc_bake {
         let src_name = Path::new(src_path).file_name()
             .unwrap_or_default().to_string_lossy().to_string();
         let dst = std::path::PathBuf::from(out_dir).join(&src_name);
@@ -667,8 +667,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return;
     }
 
-    // Pure 1:1 ICC bake: plain --icc-bake, or --20x already at native 20x.
-    if args.icc_bake && args.mpp.is_none() && !args.half && !args.quarter && (!args.mag_20x || mag_factor == 1) {
+    // Pure 1:1 ICC bake: plain --icc-bake, or --scale 20x already at native 20x.
+    if args.icc_bake && args.mpp().is_none() && !args.half() && !args.quarter() && (!args.mag_20x() || mag_factor == 1) {
         let icc = icc_profile.as_deref().unwrap();
         if let Some(xform) = crate::build_icc_transform(icc) {
             if args.verbose {
@@ -681,11 +681,11 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return;
     }
 
-    // --half/--quarter with unknown source MPP: derive a synthetic 1.0 µm/px
+    // --scale half/quarter with unknown source MPP: derive a synthetic 1.0 µm/px
     // base so downstream MPP-based level selection still works, but remember
     // to blank the resolution tags on output (see mpp_unknown below).
     let mpp_unknown = src_levels[0].mpp_x <= 0.0;
-    if (args.half || args.quarter) && mpp_unknown {
+    if (args.half() || args.quarter()) && mpp_unknown {
         let bw = src_levels[0].img_w as f64;
         let bh = src_levels[0].img_h as f64;
         src_levels[0].mpp_x = 1.0;
@@ -707,8 +707,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         vlog(Some(pb), &icc_msg);
     }
 
-    if !args.mag_20x && !args.half && !args.quarter {
-        if let Some(t) = args.mpp {
+    if !args.mag_20x() && !args.half() && !args.quarter() {
+        if let Some(t) = args.mpp() {
             if base.mpp_x <= 0.0 {
                 eprintln!("  [error] Cannot determine resolution for {src_path}: \
                     no XRESOLUTION tag and no 'MPP = <value>' in ImageDescription. Skipping.");
@@ -733,8 +733,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         }
     }
 
-    let decode_shift: u32 = if args.mag_20x || args.half || args.quarter { mag_factor.trailing_zeros() } else { 0 };
-    let target_mpp = if args.mag_20x || args.half || args.quarter { base.mpp_x * mag_factor as f64 } else { args.mpp.unwrap() };
+    let decode_shift: u32 = if args.mag_20x() || args.half() || args.quarter() { mag_factor.trailing_zeros() } else { 0 };
+    let target_mpp = if args.mag_20x() || args.half() || args.quarter() { base.mpp_x * mag_factor as f64 } else { args.mpp().unwrap() };
     let jp2k_svs_skip: Option<usize> = if !args.icc_bake && is_jp2k(base.compression as u32) {
         let skip = src_levels.iter()
             .take_while(|lv| lv.mpp_x < target_mpp * 0.9)

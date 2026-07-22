@@ -541,7 +541,7 @@ struct OutLevel {
 }
 
 // Assign every source tile to the output tiles it overlaps, at the given
-// downsample factor (need not be a power of two, e.g. for --mpp). Returns
+// downsample factor (need not be a power of two, e.g. for --scale <mpp>). Returns
 // None if the level is below MIN_PYRAMID_SIDE.
 fn build_level(src: &MiraxSource, downsample: f64) -> Option<OutLevel> {
     let d = downsample;
@@ -594,18 +594,18 @@ pub(crate) fn convert_mrxs(
     let src = MiraxSource::open(mrxs_path, verbose)
         .ok_or_else(|| "not a valid MIRAX slide (missing Slidedat.ini / Index.dat)".to_string())?;
 
-    // Resolve the base (level 0 in the output) downsample factor: --mpp targets
-    // an arbitrary scale (source MPP / target MPP need not be a power of two);
-    // --half halves / --quarter quarters unconditionally, regardless of source
-    // MPP; --20x picks a power-of-two factor from the source's magnification
-    // bucket; otherwise the base is full resolution.
+    // Resolve the base (level 0 in the output) downsample factor: --scale <mpp>
+    // targets an arbitrary scale (source MPP / target MPP need not be a power of
+    // two); --scale half halves / --scale quarter quarters unconditionally,
+    // regardless of source MPP; --scale 20x picks a power-of-two factor from the
+    // source's magnification bucket; otherwise the base is full resolution.
     let base_downsample: f64 = if let Some(target) = mpp {
         if src.mpp_x <= 0.0 {
-            eprintln!("  [warn ] [mirax] source MPP unknown; ignoring --mpp");
+            eprintln!("  [warn ] [mirax] source MPP unknown; ignoring --scale");
             1.0
         } else if target <= src.mpp_x {
             eprintln!(
-                "  [warn ] [mirax] requested MPP {:.4} µm/px ≤ source {:.4} µm/px (upscaling not supported); ignoring --mpp",
+                "  [warn ] [mirax] requested MPP {:.4} µm/px ≤ source {:.4} µm/px (upscaling not supported); ignoring --scale",
                 target, src.mpp_x
             );
             1.0
@@ -618,7 +618,7 @@ pub(crate) fn convert_mrxs(
         2.0
     } else if mag_20x {
         crate::factor_to_20x(src.mpp_x)
-            .ok_or_else(|| "source MPP unknown or ≥0.7 µm/px (--20x cannot upscale)".to_string())?
+            .ok_or_else(|| "source MPP unknown or ≥0.7 µm/px (--scale 20x cannot upscale)".to_string())?
             as f64
     } else {
         1.0

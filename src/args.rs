@@ -26,25 +26,14 @@ pub struct Args {
     #[arg(long)]
     pub use_parent_name: bool,
 
-    /// Downsample to 20x scan magnification (~0.5 µm/px), auto-detected from
-    /// source MPP (80x→quarter, 40x→half, 20x→copy through, 10x→skip);
-    /// mutually exclusive with --mpp, --half and --quarter
-    #[arg(long = "20x", conflicts_with_all = ["mpp", "half", "quarter"])]
-    pub mag_20x: bool,
-
-    /// Halve both width and height (1/4 area) unconditionally, regardless of
-    /// source MPP; works even when the source resolution is unknown.
-    /// Mutually exclusive with --mpp, --20x and --quarter
-    #[arg(long, conflicts_with_all = ["mpp", "mag_20x", "quarter"])]
-    pub half: bool,
-
-    /// Quarter both width and height (1/16 area) unconditionally, regardless
-    /// of source MPP; works even when the source resolution is unknown.
-    /// Sources usually already carry a precomputed 1/4-scale pyramid level
-    /// (unlike 1/2), so this is typically faster than --half.
-    /// Mutually exclusive with --mpp, --20x and --half
-    #[arg(long, conflicts_with_all = ["mpp", "mag_20x", "half"])]
-    pub quarter: bool,
+    /// Downsampling target - pick one:
+    ///   20x       auto-detect from source MPP (80x->quarter, 40x->half, 20x->copy through, 10x->skip)
+    ///   half      halve both dimensions unconditionally, even if source MPP is unknown
+    ///   quarter   quarter both dimensions unconditionally; usually a precomputed
+    ///             pyramid level, so typically faster than half
+    ///   <number>  explicit target resolution in microns-per-pixel [0.001..=2.0], e.g. 0.5
+    #[arg(long, value_parser = parse_scale, verbatim_doc_comment)]
+    pub scale: Option<Scale>,
 
     /// Apply ICC color profile and convert to sRGB
     #[arg(long)]
@@ -54,16 +43,12 @@ pub struct Args {
     #[arg(short = 'j', long, value_parser = parse_jobs)]
     pub jobs: Option<usize>,
 
-    /// Target resolution in microns-per-pixel [0.001..=2.0]
-    #[arg(long, value_parser = parse_mpp)]
-    pub mpp: Option<f64>,
-
     /// JPEG quality for resampling [20..=100]
     #[arg(long, default_value_t = 87, value_parser = clap::value_parser!(u8).range(20..=100))]
     pub quality: u8,
 
-    /// Resampling filter for --mpp [nearest, triangle, catmullrom, gaussian, lanczos3].
-    /// Ignored with --20x/--half/--quarter: decode-side downsampling (DCT 1/2 or 1/4 / DWT
+    /// Resampling filter for --scale <number> [nearest, triangle, catmullrom, gaussian, lanczos3].
+    /// Ignored with --scale 20x/half/quarter: decode-side downsampling (DCT 1/2 or 1/4 / DWT
     /// level-1 or level-2) produces the exact target size, so no pixel-domain resize step is performed.
     #[arg(long, default_value = "nearest", value_parser = parse_filter)]
     pub filter: FilterType,
@@ -71,6 +56,43 @@ pub struct Args {
     /// Override the default log file path (parent directory must exist)
     #[arg(long, value_parser = parse_log_file)]
     pub log_file: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum Scale {
+    Mag20x,
+    Half,
+    Quarter,
+    Mpp(f64),
+}
+
+impl Args {
+    pub fn mag_20x(&self) -> bool { matches!(self.scale, Some(Scale::Mag20x)) }
+    pub fn half(&self) -> bool { matches!(self.scale, Some(Scale::Half)) }
+    pub fn quarter(&self) -> bool { matches!(self.scale, Some(Scale::Quarter)) }
+    pub fn mpp(&self) -> Option<f64> {
+        match self.scale {
+            Some(Scale::Mpp(v)) => Some(v),
+            _ => None,
+        }
+    }
+}
+
+fn parse_scale(s: &str) -> Result<Scale, String> {
+    match s.to_lowercase().as_str() {
+        "20x"     => Ok(Scale::Mag20x),
+        "half"    => Ok(Scale::Half),
+        "quarter" => Ok(Scale::Quarter),
+        _ => {
+            let v: f64 = s.parse().map_err(|_| format!(
+                "'{}' is not a valid --scale value [20x, half, quarter, or a µm/px number in 0.001..=2.0]", s
+            ))?;
+            if !(0.001..=2.0).contains(&v) {
+                return Err(format!("--scale must be 20x, half, quarter, or a number between 0.001 and 2.0, got {}", v));
+            }
+            Ok(Scale::Mpp(v))
+        }
+    }
 }
 
 fn parse_jobs(s: &str) -> Result<usize, String> {
@@ -99,14 +121,6 @@ fn parse_output_dir(s: &str) -> Result<String, String> {
         return Err(format!("parent directory '{}' does not exist", parent.display()));
     }
     Ok(s.to_string())
-}
-
-fn parse_mpp(s: &str) -> Result<f64, String> {
-    let v: f64 = s.parse().map_err(|_| format!("'{}' is not a valid number", s))?;
-    if !(0.001..=2.0).contains(&v) {
-        return Err(format!("--mpp must be between 0.001 and 2.0, got {}", v));
-    }
-    Ok(v)
 }
 
 fn parse_filter(s: &str) -> Result<FilterType, String> {

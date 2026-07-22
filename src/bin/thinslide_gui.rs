@@ -384,11 +384,11 @@ impl App {
         if self.legacy { cmd.arg("--legacy"); }
         match &self.mpp_mode {
             MppMode::X20 => {
-                cmd.arg("--20x");
+                cmd.arg("--scale"); cmd.arg("20x");
                 cmd.arg("--quality"); cmd.arg(self.quality.to_string());
             }
             MppMode::X10 => {
-                cmd.arg("--mpp"); cmd.arg("1.0");
+                cmd.arg("--scale"); cmd.arg("1.0");
                 cmd.arg("--quality"); cmd.arg(self.quality.to_string());
             }
             MppMode::Passthrough => {}

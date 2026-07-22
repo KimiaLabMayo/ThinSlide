@@ -3,12 +3,12 @@
 **Optimize whole-slide images** — for storage, portability, and interoperability.
 
 - **Convert** — WSIs are fragmented. Consolidate them into clean TIFF/OME-TIFF. *(default)*
-- **Downsample** — WSIs are heavy. Normalize 40x scans to 20x and save storage by ~75%. `--20x`
+- **Downsample** — WSIs are heavy. Normalize 40x scans to 20x and save storage by ~75%. `--scale 20x`
 - **Standardize** — Colors are not portable. Bake ICC profiles into the pixels. `--icc-bake`
 
 ## Formats
 
-| Input | default | `--20x` | `--icc-bake` |
+| Input | default | `--scale 20x` | `--icc-bake` |
 |---|:---:|:---:|:---:|
 | **DICOM** | 🔵  | 🟢  | 🟢 |
 | **VSI** (CellSens)¹ | 🔵  | 🟢  | 🟢  |
@@ -21,10 +21,10 @@
 Output is OME-TIFF by default, or SVS-like BigTIFF with `--legacy`.
 
 ¹ Experimental reader. 16-bit fluorescence channels are skipped (8-bit brightfield only).
-  `--mpp` is not supported for VSI yet.
+  `--scale <number>` is not supported for VSI yet.
   
 ² Already a single valid slide file — nothing to convert. Skipped unless combined with
-  `--20x` or `--icc-bake`.
+  `--scale` or `--icc-bake`.
 
 ## Desktop app (no command line)
 
@@ -54,13 +54,13 @@ thinslide /data/dicoms /data/output
 thinslide /data/dicoms /data/output --legacy
 
 # Normalize everything to 20x
-thinslide /data/slides /data/output --20x
+thinslide /data/slides /data/output --scale 20x
 
 # Bake ICC profiles into pixels, output sRGB JPEG
 thinslide /data/slides /data/output --icc-bake
 
 # Both at once, in a single pass, tuning quality and threads
-thinslide /data/slides /data/output --20x --icc-bake --quality 90 -j 4
+thinslide /data/slides /data/output --scale 20x --icc-bake --quality 90 -j 4
 ```
 
 > OME-TIFF inputs keep their original OME-XML metadata through downsampling.
@@ -101,28 +101,22 @@ cargo install thinslide
 
 ## Advanced
 
-**`--mpp <value>`** — downsample to an arbitrary resolution instead of normalizing to 20x.
-Always resamples in full, so it is slower than `--20x`. Use `--filter` to pick the kernel.
+**`--scale <20x|half|quarter|number>`** — pick exactly one downsampling target:
+
+- **`20x`** — auto-detect from source MPP and normalize to 20x scan magnification.
+- **`half`** — halve both dimensions unconditionally, without reading source MPP.
+  Useful when the source has no resolution metadata (so `20x` would have to skip it).
+- **`quarter`** — quarter both dimensions unconditionally, without reading source MPP.
+  Same idea as `half`, but a 1/4-scale level is usually already precomputed in the
+  source pyramid (unlike 1/2), so this is typically faster.
+- **`<number>`** — downsample to an arbitrary resolution (µm/px) instead of normalizing
+  to 20x. Always resamples in full, so it is slower than `20x`/`half`/`quarter`.
+  Use `--filter` to pick the kernel.
 
 ```sh
-thinslide /data/slides /data/output --mpp 0.5 --filter lanczos3
-```
-
-**`--half`** — halve both dimensions unconditionally, without reading source MPP.
-Useful when the source has no resolution metadata (so `--20x` would have to skip it).
-Mutually exclusive with `--20x`, `--mpp` and `--quarter`.
-
-```sh
-thinslide /data/slides /data/output --half
-```
-
-**`--quarter`** — quarter both dimensions unconditionally, without reading source MPP.
-Same idea as `--half`, but a 1/4-scale level is usually already precomputed in the
-source pyramid (unlike 1/2), so this is typically faster. Mutually exclusive with
-`--20x`, `--mpp` and `--half`.
-
-```sh
-thinslide /data/slides /data/output --quarter
+thinslide /data/slides /data/output --scale half
+thinslide /data/slides /data/output --scale quarter
+thinslide /data/slides /data/output --scale 0.5 --filter lanczos3
 ```
 
 ## Acknowledgments

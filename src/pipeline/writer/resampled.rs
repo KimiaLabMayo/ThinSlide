@@ -128,7 +128,7 @@ pub(crate) fn write_resampled_tiff(
     ome: bool,
     pb: Option<&ProgressBar>,
     verbose: bool,
-    // 0 = generic --mpp resampling; 1/2 = --20x DCT-domain half/quarter decode
+    // 0 = generic --scale <mpp> resampling; 1/2 = --scale 20x DCT-domain half/quarter decode
     // (turbojpeg ONE_HALF/ONE_QUARTER, JP2K DWT level-1/level-2).
     decode_shift: u32,
     icc_bake: bool,
@@ -197,7 +197,7 @@ pub(crate) fn write_resampled_tiff(
 
         if passthrough {
             let compr = tiff_compression_tag(&chosen_meta.transfer_syntax_uid);
-            // In --mpp resampling mode the output is always JPEG.  Passing through
+            // In --scale <mpp> resampling mode the output is always JPEG.  Passing through
             // a non-JPEG source level (e.g. JP2K) would embed a different compression
             // in the pyramid, which confuses readers such as QuPath.
             // Force resample for any non-JPEG source so the pyramid stays uniformly JPEG.
@@ -216,7 +216,7 @@ pub(crate) fn write_resampled_tiff(
                 // No scaling: output dimensions equal the source dimensions.
                 (chosen_w, chosen_h, chosen_tw, chosen_th, chosen_mpp_x, chosen_mpp_y)
             } else {
-                // For --half/--quarter/--20x: JP2K DWT level-N and JPEG (turbojpeg)
+                // For --scale half/quarter/20x: JP2K DWT level-N and JPEG (turbojpeg)
                 // scaled decode both yield exactly ceil(tw/2^N) per quad; use that
                 // directly so the assembled canvas matches out_tile exactly — no
                 // correction resize needed.
@@ -401,8 +401,8 @@ pub(crate) fn write_resampled_tiff(
         );
 
         // n_reduce for JP2K DWT: choose the number of resolution reduction levels.
-        // For --20x the out_tile was computed from ceil(src/2^decode_shift), so
-        // n_reduce=decode_shift is exact. For --mpp, derive n_reduce from the
+        // For --scale 20x the out_tile was computed from ceil(src/2^decode_shift), so
+        // n_reduce=decode_shift is exact. For --scale <mpp>, derive n_reduce from the
         // scale ratio so DWT does most of the work.
         let n_reduce: u32 = if is_jp2k_src && decode_shift > 0 {
             decode_shift

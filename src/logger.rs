@@ -129,8 +129,8 @@ impl ConversionLogger {
         self.write_line(&format!(
             "options: legacy={} verbose={} mag_20x={} icc_bake={} use_parent_name={} \
              quality={} jobs={:?} mpp={:?} filter={}",
-            args.legacy, args.verbose, args.mag_20x, args.icc_bake,
-            args.use_parent_name, args.quality, args.jobs, args.mpp, filter_name
+            args.legacy, args.verbose, args.mag_20x(), args.icc_bake,
+            args.use_parent_name, args.quality, args.jobs, args.mpp(), filter_name
         ));
         self.write_line("---");
     }
