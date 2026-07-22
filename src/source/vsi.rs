@@ -552,7 +552,7 @@ fn build_levels(ets: &Ets, pyr: &VsiPyramid) -> Vec<VsiLevel> {
 pub(crate) fn convert_vsi(
     vsi_path: &str,
     out_path: &str,
-    legacy: bool,
+    openslide: bool,
     quality: u8,
     mag_20x: bool,
     half: bool,
@@ -609,10 +609,10 @@ pub(crate) fn convert_vsi(
     // step, starting at a resolution index derived from the source's magnification
     // bucket (JPEG tiles still pass through losslessly — no resize):
     //   - default/passthrough:  start_res=0 → res 0, 2, 4, ...  → 1, 1/4, 1/16, ...
-    //   - --half:               start_res=1 → res 1, 3, 5, ...  → 1/2, 1/8, 1/32, ... (unconditional)
-    //   - --quarter:            start_res=2 → res 2, 4, 6, ...  → 1/4, 1/16, 1/64, ... (unconditional)
-    //   - --20x @ 40x source:   start_res=1 → res 1, 3, 5, ...  → 1/2, 1/8, 1/32, ...
-    //   - --20x @ 80x source:   start_res=2 → res 2, 4, 6, ...  → 1/4, 1/16, 1/64, ...
+    //   - --scale half:         start_res=1 → res 1, 3, 5, ...  → 1/2, 1/8, 1/32, ... (unconditional)
+    //   - --scale quarter:      start_res=2 → res 2, 4, 6, ...  → 1/4, 1/16, 1/64, ... (unconditional)
+    //   - --scale 20x @ 40x src: start_res=1 → res 1, 3, 5, ...  → 1/2, 1/8, 1/32, ...
+    //   - --scale 20x @ 80x src: start_res=2 → res 2, 4, 6, ...  → 1/4, 1/16, 1/64, ...
     // A source without enough sub-resolution levels to reach start_res is left
     // untouched (full default pyramid).
     let start_res: u32 = if quarter {
@@ -622,14 +622,14 @@ pub(crate) fn convert_vsi(
     } else if mag_20x {
         match crate::factor_to_20x(levels[0].mpp_x) {
             Some(f) => f.trailing_zeros(),
-            None => return Err("source MPP unknown or ≥0.7 µm/px (--20x cannot upscale)".to_string()),
+            None => return Err("source MPP unknown or ≥0.7 µm/px (--scale 20x cannot upscale)".to_string()),
         }
     } else {
         0
     };
     if start_res > 0 && (levels.len() as u32) <= start_res {
         if verbose {
-            let flag = if quarter { "--quarter" } else if half { "--half" } else { "--20x" };
+            let flag = if quarter { "--scale quarter" } else if half { "--scale half" } else { "--scale 20x" };
             vlog(pb, format!("  [vsi  ] {flag} ignored: source has no level at 1/{} scale", 1u32 << start_res));
         }
     } else {
@@ -651,7 +651,7 @@ pub(crate) fn convert_vsi(
     }).sum();
     if let Some(p) = pb { p.set_length(total_tiles); }
 
-    let ome = !legacy;
+    let ome = !openslide;
     let out_photometric = if spp == 1 { PHOTOMETRIC_MINISBLACK } else { PHOTOMETRIC_YCBCR };
 
     let image_desc_c: Option<CString> = if ome {

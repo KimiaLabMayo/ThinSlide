@@ -99,7 +99,7 @@ impl ConversionLogger {
 
     fn write_header(&self, args: &Args, start_dt: &str) {
         use image::imageops::FilterType;
-        let filter_name = match args.filter {
+        let kernel_name = match args.kernel {
             FilterType::Nearest    => "nearest",
             FilterType::Triangle   => "triangle",
             FilterType::CatmullRom => "catmullrom",
@@ -127,10 +127,10 @@ impl ConversionLogger {
         self.write_line(&format!("cpu:    {}  logical={}  physical={}", cpu_brand, logical, physical));
         self.write_line(&format!("ram:    {} MB", total_ram_mb));
         self.write_line(&format!(
-            "options: legacy={} verbose={} mag_20x={} icc_bake={} use_parent_name={} \
-             quality={} jobs={:?} mpp={:?} filter={}",
-            args.legacy, args.verbose, args.mag_20x, args.icc_bake,
-            args.use_parent_name, args.quality, args.jobs, args.mpp, filter_name
+            "options: openslide={} verbose={} mag_20x={} icc_bake={} use_parent_name={} \
+             quality={} jobs={:?} mpp={:?} kernel={}",
+            args.openslide, args.verbose, args.mag_20x(), args.icc_bake,
+            args.use_parent_name, args.quality, args.jobs, args.mpp(), kernel_name
         ));
         self.write_line("---");
     }
@@ -155,6 +155,18 @@ impl ConversionLogger {
 
     pub fn log_fail(&self, idx: usize, name: &str, reason: &str) {
         self.write_line(&format!("FAIL ({:>4}) {:<52}  {}", idx, name, reason));
+    }
+
+    /// Extracts a human-readable message from a caught panic payload so it can
+    /// be recorded via `log_fail` instead of being lost when a panic is caught.
+    pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        }
     }
 
     pub fn log_skip(&self, idx: usize, filename: &str) {

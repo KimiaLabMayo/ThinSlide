@@ -3,28 +3,28 @@
 **Optimize whole-slide images** — for storage, portability, and interoperability.
 
 - **Convert** — WSIs are fragmented. Consolidate them into clean TIFF/OME-TIFF. *(default)*
-- **Downsample** — WSIs are heavy. Normalize 40x scans to 20x and save storage by ~75%. `--20x`
+- **Downsample** — WSIs are heavy. Normalize 40x scans to 20x and save storage by ~75%. `--scale 20x`
 - **Standardize** — Colors are not portable. Bake ICC profiles into the pixels. `--icc-bake`
 
 ## Formats
 
-| Input | default | `--20x` | `--icc-bake` |
+| Input | default | `--scale 20x` | `--icc-bake` |
 |---|:---:|:---:|:---:|
 | **DICOM** | 🔵  | 🟢  | 🟢 |
-| **VSI** (CellSens)¹ | 🔵  | 🟢  | 🟢  |
 | **SVS / TIFF** | —² | 🟢  | 🟢  |
+| **VSI** (CellSens)¹ | 🔵  | 🟢  | 🟢  |
 
 **🔵 repackaging** — compressed tiles are copied straight through, at near-copy speed. No image quality change.
 
 **🟢 re-encoding** — only where the pixels actually change.
 
-Output is OME-TIFF by default, or SVS-like BigTIFF with `--legacy`.
+Output is OME-TIFF by default, or SVS-like BigTIFF with `--openslide` (matches the
+source's original compression, and is readable by [OpenSlide](https://openslide.org/)).
 
-¹ Experimental reader. 16-bit fluorescence channels are skipped (8-bit brightfield only).
-  `--mpp` is not supported for VSI yet.
+¹ Experimental reader. 8-bit brightfield only.
+  `--scale <number>` is not supported for VSI yet.
   
-² Already a single valid slide file — nothing to convert. Skipped unless combined with
-  `--20x` or `--icc-bake`.
+² Skipped unless combined with `--scale` or `--icc-bake`.
 
 ## Desktop app (no command line)
 
@@ -50,17 +50,17 @@ Input and output are directories — ThinSlide processes every slide it finds, m
 # Convert a folder of DICOM slides into OME-TIFF (uses all CPUs)
 thinslide /data/dicoms /data/output
 
-# Same, but write SVS-like BigTIFF instead
-thinslide /data/dicoms /data/output --legacy
+# Same, but write SVS-like BigTIFF instead, OpenSlide-compatible
+thinslide /data/dicoms /data/output --openslide
 
 # Normalize everything to 20x
-thinslide /data/slides /data/output --20x
+thinslide /data/slides /data/output --scale 20x
 
 # Bake ICC profiles into pixels, output sRGB JPEG
 thinslide /data/slides /data/output --icc-bake
 
 # Both at once, in a single pass, tuning quality and threads
-thinslide /data/slides /data/output --20x --icc-bake --quality 90 -j 4
+thinslide /data/slides /data/output --scale 20x --icc-bake --quality 90 -j 4
 ```
 
 > OME-TIFF inputs keep their original OME-XML metadata through downsampling.
@@ -101,29 +101,39 @@ cargo install thinslide
 
 ## Advanced
 
-**`--mpp <value>`** — downsample to an arbitrary resolution instead of normalizing to 20x.
-Always resamples in full, so it is slower than `--20x`. Use `--filter` to pick the kernel.
+**`--scale <20x|half|quarter|number>`** — pick exactly one downsampling target:
+
+- **`20x`** — auto-detect from source MPP and normalize to 20x scan magnification.
+- **`half`** — halve both dimensions unconditionally, without reading source MPP.
+  Useful when the source has no resolution metadata (so `20x` would have to skip it).
+- **`quarter`** — quarter both dimensions unconditionally, without reading source MPP.
+  Same idea as `half`, but a 1/4-scale level is usually already precomputed in the
+  source pyramid (unlike 1/2), so this is typically faster.
+- **`<number>`** — downsample to an arbitrary resolution (µm/px) instead of normalizing
+  to 20x. Always resamples in full, so it is slower than `20x`/`half`/`quarter`.
+  Use `--kernel` to pick the resampling kernel.
 
 ```sh
-thinslide /data/slides /data/output --mpp 0.5 --filter lanczos3
+thinslide /data/slides /data/output --scale half
+thinslide /data/slides /data/output --scale quarter
+thinslide /data/slides /data/output --scale 0.5 --kernel lanczos3
 ```
 
-**`--half`** — halve both dimensions unconditionally, without reading source MPP.
-Useful when the source has no resolution metadata (so `--20x` would have to skip it).
-Mutually exclusive with `--20x`, `--mpp` and `--quarter`.
+## PHI handling
 
-```sh
-thinslide /data/slides /data/output --half
-```
-
-**`--quarter`** — quarter both dimensions unconditionally, without reading source MPP.
-Same idea as `--half`, but a 1/4-scale level is usually already precomputed in the
-source pyramid (unlike 1/2), so this is typically faster. Mutually exclusive with
-`--20x`, `--mpp` and `--half`.
-
-```sh
-thinslide /data/slides /data/output --quarter
-```
+- **All output formats** — DICOM tags that identify a patient (patient name, ID, birth date,
+  accession number, SeriesInstanceUID, etc.) are never copied into the output file's metadata.
+  Only non-identifying technical parameters are retained: image dimensions, tile size,
+  magnification (MPP), and compression. OME-TIFF additionally embeds the source `Manufacturer`
+  in its OME-XML.
+- **DICOM input — output filename** — by default the output filename is derived from the
+  source SeriesInstanceUID (not from the in-file metadata above). Use `--use-parent-name` to
+  name the output after the input folder instead if the UID should not appear in the filename.
+- **TIFF / OME-TIFF output** — the label and thumbnail images are dropped from the output.
+- **SVS output (`--openslide`)** — the label and thumbnail images are carried over from the
+  source DICOM as-is; DICOM PHI tags are still not carried over.
+- In all cases, any personal information that is visibly embedded in the tissue region itself
+  (as image content, not metadata) is not removed.
 
 ## Acknowledgments
 

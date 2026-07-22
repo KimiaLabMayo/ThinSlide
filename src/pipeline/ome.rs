@@ -9,34 +9,18 @@ pub fn xml_escape(s: &str) -> String {
      .replace('"', "&quot;")
 }
 
-fn uid_to_uuid(uid: &str) -> String {
-    const OFFSET: u64 = 14695981039346656037;
-    const PRIME:  u64 = 1099511628211;
-    let bytes = uid.as_bytes();
-    let mut a = OFFSET;
-    for &b in bytes { a ^= b as u64; a = a.wrapping_mul(PRIME); }
-    let mut bv = OFFSET ^ 0xdeadbeef_cafebabe_u64;
-    for &byte in bytes { bv ^= byte as u64; bv = bv.wrapping_mul(PRIME); }
-    format!(
-        "{:08x}-{:04x}-4{:03x}-{:04x}-{:012x}",
-        (a >> 32) as u32,
-        (a >> 16) as u16,
-        a as u16 & 0x0FFF,
-        ((bv >> 48) as u16 & 0x3FFF) | 0x8000,
-        bv & 0x0000_FFFF_FFFF_FFFF_u64,
-    )
-}
-
 /// Build a conforming OME-XML string (schema 2016-06) for a DICOM-derived pyramid.
 /// Placed in ImageDescription tag of IFD 0; identifies the file as OME-TIFF for BioFormats.
+/// The `Image` element has no `Name` and the `OME` element has no `UUID`: both are optional,
+/// and the only DICOM-derived value available for them is SeriesInstanceUID, which is PHI
+/// and must never appear in the output (note the default output filename is also derived
+/// from SeriesInstanceUID, so it cannot be used as a stand-in either).
 pub(crate) fn generate_dicom_ome_xml(metadata_list: &[DcmMetadata]) -> String {
     let base   = &metadata_list[0];
     let width  = base.px_columns.unwrap_or(0);
     let height = base.px_rows.unwrap_or(0);
     let mpp_x  = base.mpp_x.unwrap_or(0.25);
     let mpp_y  = base.mpp_y.unwrap_or(mpp_x);
-    let uuid   = uid_to_uuid(&base.series_instance_uid);
-    let name   = &base.series_instance_uid;
 
     let spp: u32 = base.spp as u32;
     let dcm = dicom::object::open_file(&base.file_path).ok();
@@ -77,9 +61,8 @@ pub(crate) fn generate_dicom_ome_xml(metadata_list: &[DcmMetadata]) -> String {
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <OME xmlns="http://www.openmicroscopy.org/Schemas/OME/2016-06"
      xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-     xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd"
-     UUID="urn:uuid:{uuid}">
-{instrument_block}  <Image ID="Image:0" Name="{name}">
+     xsi:schemaLocation="http://www.openmicroscopy.org/Schemas/OME/2016-06 http://www.openmicroscopy.org/Schemas/OME/2016-06/ome.xsd">
+{instrument_block}  <Image ID="Image:0">
 {instrument_ref}    <Pixels ID="Pixels:0"
             DimensionOrder="XYZCT"
             Type="{pixel_type}"

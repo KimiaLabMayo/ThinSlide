@@ -70,19 +70,19 @@ fn convert_one_series(
     let src_mpp     = src_mpp_opt.unwrap_or(0.0);
 
     let mut decode_shift: u32 = 0;
-    let effective_mpp: Option<f64> = if args.quarter {
+    let effective_mpp: Option<f64> = if args.quarter() {
         decode_shift = 2;
         Some(src_mpp * 4.0)
-    } else if args.half {
+    } else if args.half() {
         decode_shift = 1;
         Some(src_mpp * 2.0)
-    } else if args.mag_20x {
+    } else if args.mag_20x() {
         match src_mpp_opt.and_then(crate::factor_to_20x) {
             None => {
                 stats.skipped.fetch_add(1, Ordering::Relaxed);
                 logger.log_skip(series_idx, &series_id);
                 if args.verbose {
-                    eprintln!("  [skip ] {}  source MPP unknown or ≥0.7 µm/px (--20x cannot upscale)", series_id);
+                    eprintln!("  [skip ] {}  source MPP unknown or ≥0.7 µm/px (--scale 20x cannot upscale)", series_id);
                 }
                 return;
             }
@@ -95,11 +95,11 @@ fn convert_one_series(
     } else {
         if src_mpp_opt.is_none() {
             if args.verbose {
-                eprintln!("  [warn ] source MPP unknown; skipping (--mpp requires known source MPP)");
+                eprintln!("  [warn ] source MPP unknown; skipping (--scale <mpp> requires known source MPP)");
             }
             None
         } else {
-            let mut em = if let Some(t) = args.mpp {
+            let mut em = if let Some(t) = args.mpp() {
                 if t <= src_mpp {
                     eprintln!(
                         "  [warn ] requested MPP {:.4} µm/px ≤ source {:.4} µm/px (upscaling not supported); skipping",
@@ -136,9 +136,9 @@ fn convert_one_series(
             series_idx, series_id, comp, src_mpp, src.slide_levels.len(), mode);
     }
 
-    // When --legacy is set, the source is JP2K, and a matching level exists,
+    // When --openslide is set, the source is JP2K, and a matching level exists,
     // passthrough as SVS without decoding.
-    let jp2k_svs_skip: Option<usize> = if !args.legacy || args.icc_bake { None } else {
+    let jp2k_svs_skip: Option<usize> = if !args.openslide || args.icc_bake { None } else {
         effective_mpp.and_then(|target| {
             if !is_jpeg2000(&comp) { return None; }
             let skip = src.slide_levels.iter()
@@ -166,14 +166,14 @@ fn convert_one_series(
     let output_path = if jp2k_svs_skip.is_some() {
         format!("{}/{}.svs", args.output_dir, file_stem)
     } else if effective_mpp.is_some() {
-        if args.legacy {
+        if args.openslide {
             format!("{}/{}.tiff", args.output_dir, file_stem)
         } else {
             format!("{}/{}.ome.tiff", args.output_dir, file_stem)
         }
-    } else if args.legacy && is_jpeg2000(&comp) {
+    } else if args.openslide && is_jpeg2000(&comp) {
         format!("{}/{}.svs", args.output_dir, file_stem)
-    } else if args.legacy {
+    } else if args.openslide {
         format!("{}/{}.tiff", args.output_dir, file_stem)
     } else {
         format!("{}/{}.ome.tiff", args.output_dir, file_stem)
@@ -222,14 +222,14 @@ fn convert_one_series(
     } else if let Some(target_mpp) = effective_mpp {
         writer::write_resampled_tiff(
             &src.slide_levels, &tmp_path,
-            target_mpp, args.quality, args.filter,
-            !args.legacy,
+            target_mpp, args.quality, args.kernel,
+            !args.openslide,
             Some(&pb),
             args.verbose,
             decode_shift,
             args.icc_bake,
         );
-    } else if args.legacy {
+    } else if args.openslide {
         if is_jpeg2000(&comp) {
             writer::write_svs(
                 &src.slide_levels,
@@ -318,6 +318,29 @@ fn convert_one_series(
     pb.finish_and_clear();
 }
 
+// Runs `convert_one_series` behind a panic guard: an unexpected panic in the
+// decode/encode path (e.g. an unwrap on a malformed file) is recorded as a
+// FAILed conversion instead of aborting the whole batch.
+fn convert_one_series_guarded(
+    series_meta: Vec<DcmMetadata>,
+    series_idx: usize,
+    args: &Args,
+    mp: &MultiProgress,
+    logger: &ConversionLogger,
+    stats: &ConversionStats,
+) {
+    let label = series_meta.first()
+        .map(|m| m.series_instance_uid.clone())
+        .unwrap_or_default();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        convert_one_series(series_meta, series_idx, args, mp, logger, stats);
+    }));
+    if let Err(payload) = result {
+        stats.fail.fetch_add(1, Ordering::Relaxed);
+        logger.log_fail(series_idx, &label, &format!("panic: {}", ConversionLogger::panic_message(&*payload)));
+    }
+}
+
 pub fn run(args: Args) {
     if let Some(n) = args.jobs {
         let _ = rayon::ThreadPoolBuilder::new()
@@ -325,8 +348,8 @@ pub fn run(args: Args) {
             .build_global();
     }
 
-    if (args.mag_20x || args.half || args.quarter) && !matches!(args.filter, image::imageops::FilterType::Nearest) {
-        eprintln!("[warn] --filter is ignored with --20x/--half/--quarter: decode-side downsampling skips the resize step");
+    if (args.mag_20x() || args.half() || args.quarter()) && !matches!(args.kernel, image::imageops::FilterType::Nearest) {
+        eprintln!("[warn] --kernel is ignored with --scale 20x/half/quarter: decode-side downsampling skips the resize step");
     }
 
     if args.verbose {
@@ -466,10 +489,10 @@ pub fn run(args: Args) {
 
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
-            if args_ref.mpp.is_some() || args_ref.mag_20x || args_ref.half || args_ref.quarter {
-                convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
+            if args_ref.mpp().is_some() || args_ref.mag_20x() || args_ref.half() || args_ref.quarter() {
+                convert_one_series_guarded(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
             } else if n_concurrent <= 1 {
-                convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
+                convert_one_series_guarded(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
             } else {
                 if args.verbose {
                     println!("Passthrough mode");
@@ -484,7 +507,7 @@ pub fn run(args: Args) {
                 }
                 let sem_clone = Arc::clone(&sem);
                 s.spawn(move |_| {
-                    convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
+                    convert_one_series_guarded(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
                     let (lock, cvar) = &*sem_clone;
                     let mut active = lock.lock().unwrap();
                     *active -= 1;
@@ -498,23 +521,23 @@ pub fn run(args: Args) {
     meta_pb.finish_and_clear();
 
     if !tiff_paths.is_empty() {
-        if args.mpp.is_some() || args.mag_20x || args.half || args.quarter || args.icc_bake {
+        if args.mpp().is_some() || args.mag_20x() || args.half() || args.quarter() || args.icc_bake {
             tiff_paths.sort();
-            tiffds::process_files(&tiff_paths, &args, &mp, &stats);
+            tiffds::process_files(&tiff_paths, &args, &mp, &logger, &stats);
         } else {
-            eprintln!("  {} TIFF/SVS file(s) found; specify --mpp, --20x, --half, --quarter, or --icc-bake to process them.",
+            eprintln!("  {} TIFF/SVS file(s) found; specify --scale or --icc-bake to process them.",
                 tiff_paths.len());
         }
     }
 
     if !vsi_paths.is_empty() {
         vsi_paths.sort();
-        convert_vsi_files(&vsi_paths, &args, &mp, &stats);
+        convert_vsi_files(&vsi_paths, &args, &mp, &logger, &stats);
     }
 
     if !mrxs_paths.is_empty() {
         mrxs_paths.sort();
-        convert_mrxs_files(&mrxs_paths, &args, &mp, &stats);
+        convert_mrxs_files(&mrxs_paths, &args, &mp, &logger, &stats);
     }
 
     // Report after every format has been converted, not just DICOM.
@@ -529,12 +552,13 @@ pub fn run(args: Args) {
 
 // Experimental: transcode the main 2D pyramid of each CellSens .vsi to TIFF.
 fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress,
-                     stats: &ConversionStats) {
-    for path in paths {
+                     logger: &ConversionLogger, stats: &ConversionStats) {
+    for (i, path) in paths.iter().enumerate() {
+        let idx = i + 1;
         let src = path.to_string_lossy().to_string();
         let stem = sanitize_file_stem(
             path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
-        let out_path = if args.legacy {
+        let out_path = if args.openslide {
             format!("{}/{}.tiff", args.output_dir, stem)
         } else {
             format!("{}/{}.ome.tiff", args.output_dir, stem)
@@ -542,6 +566,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
         if Path::new(&out_path).exists() {
             if args.verbose { eprintln!("  [skip ] exists: {}", out_path); }
             stats.skipped.fetch_add(1, Ordering::Relaxed);
+            logger.log_skip(idx, &stem);
             continue;
         }
 
@@ -552,14 +577,18 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
         pb.set_message(stem.clone());
 
         let tmp_path = format!("{}.tmp", out_path);
-        match crate::source::vsi::convert_vsi(
-            &src, &tmp_path, args.legacy, args.quality, args.mag_20x, args.half, args.quarter, args.verbose, Some(&pb),
-        ) {
-            Ok(()) => {
+        let conv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::source::vsi::convert_vsi(
+                &src, &tmp_path, args.openslide, args.quality, args.mag_20x(), args.half(), args.quarter(), args.verbose, Some(&pb),
+            )
+        }));
+        match conv_result {
+            Ok(Ok(())) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
                     let _ = std::fs::remove_file(&tmp_path);
                     eprintln!("  [error] rename failed for {}: {}", stem, e);
                     stats.fail.fetch_add(1, Ordering::Relaxed);
+                    logger.log_fail(idx, &stem, &format!("rename failed: {}", e));
                 } else {
                     mp.println(format!("  {} (vsi)", stem)).ok();
                     let in_b  = crate::source::vsi::input_size(&src);
@@ -569,10 +598,18 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
                     stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let _ = std::fs::remove_file(&tmp_path);
                 eprintln!("  [skip ] {}: {}", stem, e);
                 stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &stem, &e.to_string());
+            }
+            Err(payload) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                let msg = ConversionLogger::panic_message(&*payload);
+                eprintln!("  [skip ] {}: panic: {}", stem, msg);
+                stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &stem, &format!("panic: {}", msg));
             }
         }
         pb.finish_and_clear();
@@ -581,12 +618,13 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
 
 // Transcode each MIRAX (.mrxs) slide's level-0 placement into a pyramidal TIFF.
 fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress,
-                      stats: &ConversionStats) {
-    for path in paths {
+                      logger: &ConversionLogger, stats: &ConversionStats) {
+    for (i, path) in paths.iter().enumerate() {
+        let idx = i + 1;
         let src = path.to_string_lossy().to_string();
         let stem = sanitize_file_stem(
             path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
-        let out_path = if args.legacy {
+        let out_path = if args.openslide {
             format!("{}/{}.tiff", args.output_dir, stem)
         } else {
             format!("{}/{}.ome.tiff", args.output_dir, stem)
@@ -594,6 +632,7 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
         if Path::new(&out_path).exists() {
             if args.verbose { eprintln!("  [skip ] exists: {}", out_path); }
             stats.skipped.fetch_add(1, Ordering::Relaxed);
+            logger.log_skip(idx, &stem);
             continue;
         }
 
@@ -604,14 +643,18 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
         pb.set_message(stem.clone());
 
         let tmp_path = format!("{}.tmp", out_path);
-        match crate::source::mrxs::convert_mrxs(
-            &src, &tmp_path, args.legacy, args.quality, args.mag_20x, args.half, args.quarter, args.mpp, args.verbose, Some(&pb),
-        ) {
-            Ok(()) => {
+        let conv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::source::mrxs::convert_mrxs(
+                &src, &tmp_path, args.openslide, args.quality, args.mag_20x(), args.half(), args.quarter(), args.mpp(), args.verbose, Some(&pb),
+            )
+        }));
+        match conv_result {
+            Ok(Ok(())) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
                     let _ = std::fs::remove_file(&tmp_path);
                     eprintln!("  [error] rename failed for {}: {}", stem, e);
                     stats.fail.fetch_add(1, Ordering::Relaxed);
+                    logger.log_fail(idx, &stem, &format!("rename failed: {}", e));
                 } else {
                     mp.println(format!("  {} (mrxs)", stem)).ok();
                     let in_b  = crate::source::mrxs::input_size(&src);
@@ -621,10 +664,18 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
                     stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let _ = std::fs::remove_file(&tmp_path);
                 eprintln!("  [skip ] {}: {}", stem, e);
                 stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &stem, &e.to_string());
+            }
+            Err(payload) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                let msg = ConversionLogger::panic_message(&*payload);
+                eprintln!("  [skip ] {}: panic: {}", stem, msg);
+                stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &stem, &format!("panic: {}", msg));
             }
         }
         pb.finish_and_clear();
