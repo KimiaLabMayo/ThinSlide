@@ -157,6 +157,18 @@ impl ConversionLogger {
         self.write_line(&format!("FAIL ({:>4}) {:<52}  {}", idx, name, reason));
     }
 
+    /// Extracts a human-readable message from a caught panic payload so it can
+    /// be recorded via `log_fail` instead of being lost when a panic is caught.
+    pub fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+        if let Some(s) = payload.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = payload.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "unknown panic".to_string()
+        }
+    }
+
     pub fn log_skip(&self, idx: usize, filename: &str) {
         self.write_line(&format!(
             "SKIP ({:>4}) {:<52}  (output already exists)", idx, filename

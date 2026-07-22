@@ -152,6 +152,7 @@ pub(crate) fn process_files(
     paths: &[std::path::PathBuf],
     args: &crate::Args,
     mp: &MultiProgress,
+    logger: &crate::logger::ConversionLogger,
     stats: &crate::logger::ConversionStats,
 ) {
     if paths.is_empty() { return; }
@@ -169,7 +170,8 @@ pub(crate) fn process_files(
         ).unwrap().progress_chars("=>-")
     );
 
-    for path in paths {
+    for (i, path) in paths.iter().enumerate() {
+        let idx = i + 1;
         let src_path = path.to_string_lossy().to_string();
         let src_name = path.file_name().unwrap_or_default()
             .to_string_lossy().to_string();
@@ -193,6 +195,7 @@ pub(crate) fn process_files(
             if args.verbose { vlog(None, format!("  [skip ] exists: {src_name}")); }
             skipped.fetch_add(1, Ordering::Relaxed);
             stats.skipped.fetch_add(1, Ordering::Relaxed);
+            logger.log_skip(idx, &src_name);
             file_bar.inc(1);
             continue;
         }
@@ -201,7 +204,18 @@ pub(crate) fn process_files(
         pb.set_style(bar_style.clone());
         pb.set_message(src_name.clone());
 
-        process_file(&src_path, &args.output_dir, &src_stem, args, &pb);
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            process_file(&src_path, &args.output_dir, &src_stem, args, &pb);
+        }));
+
+        if let Err(payload) = panic_result {
+            let msg = crate::logger::ConversionLogger::panic_message(&*payload);
+            stats.fail.fetch_add(1, Ordering::Relaxed);
+            logger.log_fail(idx, &src_name, &format!("panic: {}", msg));
+            pb.finish_and_clear();
+            file_bar.inc(1);
+            continue;
+        }
 
         // process_file has no return value; infer success from output presence.
         let produced: Option<std::path::PathBuf> = candidates.iter()
@@ -215,6 +229,7 @@ pub(crate) fn process_files(
             stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
         } else {
             stats.fail.fetch_add(1, Ordering::Relaxed);
+            logger.log_fail(idx, &src_name, "no output produced");
         }
 
         pb.finish_and_clear();

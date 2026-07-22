@@ -318,6 +318,29 @@ fn convert_one_series(
     pb.finish_and_clear();
 }
 
+// Runs `convert_one_series` behind a panic guard: an unexpected panic in the
+// decode/encode path (e.g. an unwrap on a malformed file) is recorded as a
+// FAILed conversion instead of aborting the whole batch.
+fn convert_one_series_guarded(
+    series_meta: Vec<DcmMetadata>,
+    series_idx: usize,
+    args: &Args,
+    mp: &MultiProgress,
+    logger: &ConversionLogger,
+    stats: &ConversionStats,
+) {
+    let label = series_meta.first()
+        .map(|m| m.series_instance_uid.clone())
+        .unwrap_or_default();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        convert_one_series(series_meta, series_idx, args, mp, logger, stats);
+    }));
+    if let Err(payload) = result {
+        stats.fail.fetch_add(1, Ordering::Relaxed);
+        logger.log_fail(series_idx, &label, &format!("panic: {}", ConversionLogger::panic_message(&*payload)));
+    }
+}
+
 pub fn run(args: Args) {
     if let Some(n) = args.jobs {
         let _ = rayon::ThreadPoolBuilder::new()
@@ -467,9 +490,9 @@ pub fn run(args: Args) {
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
             if args_ref.mpp().is_some() || args_ref.mag_20x() || args_ref.half() || args_ref.quarter() {
-                convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
+                convert_one_series_guarded(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
             } else if n_concurrent <= 1 {
-                convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
+                convert_one_series_guarded(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
             } else {
                 if args.verbose {
                     println!("Passthrough mode");
@@ -484,7 +507,7 @@ pub fn run(args: Args) {
                 }
                 let sem_clone = Arc::clone(&sem);
                 s.spawn(move |_| {
-                    convert_one_series(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
+                    convert_one_series_guarded(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
                     let (lock, cvar) = &*sem_clone;
                     let mut active = lock.lock().unwrap();
                     *active -= 1;
@@ -500,7 +523,7 @@ pub fn run(args: Args) {
     if !tiff_paths.is_empty() {
         if args.mpp().is_some() || args.mag_20x() || args.half() || args.quarter() || args.icc_bake {
             tiff_paths.sort();
-            tiffds::process_files(&tiff_paths, &args, &mp, &stats);
+            tiffds::process_files(&tiff_paths, &args, &mp, &logger, &stats);
         } else {
             eprintln!("  {} TIFF/SVS file(s) found; specify --scale or --icc-bake to process them.",
                 tiff_paths.len());
@@ -509,12 +532,12 @@ pub fn run(args: Args) {
 
     if !vsi_paths.is_empty() {
         vsi_paths.sort();
-        convert_vsi_files(&vsi_paths, &args, &mp, &stats);
+        convert_vsi_files(&vsi_paths, &args, &mp, &logger, &stats);
     }
 
     if !mrxs_paths.is_empty() {
         mrxs_paths.sort();
-        convert_mrxs_files(&mrxs_paths, &args, &mp, &stats);
+        convert_mrxs_files(&mrxs_paths, &args, &mp, &logger, &stats);
     }
 
     // Report after every format has been converted, not just DICOM.
@@ -529,8 +552,9 @@ pub fn run(args: Args) {
 
 // Experimental: transcode the main 2D pyramid of each CellSens .vsi to TIFF.
 fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress,
-                     stats: &ConversionStats) {
-    for path in paths {
+                     logger: &ConversionLogger, stats: &ConversionStats) {
+    for (i, path) in paths.iter().enumerate() {
+        let idx = i + 1;
         let src = path.to_string_lossy().to_string();
         let stem = sanitize_file_stem(
             path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
@@ -542,6 +566,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
         if Path::new(&out_path).exists() {
             if args.verbose { eprintln!("  [skip ] exists: {}", out_path); }
             stats.skipped.fetch_add(1, Ordering::Relaxed);
+            logger.log_skip(idx, &stem);
             continue;
         }
 
@@ -552,14 +577,18 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
         pb.set_message(stem.clone());
 
         let tmp_path = format!("{}.tmp", out_path);
-        match crate::source::vsi::convert_vsi(
-            &src, &tmp_path, args.openslide, args.quality, args.mag_20x(), args.half(), args.quarter(), args.verbose, Some(&pb),
-        ) {
-            Ok(()) => {
+        let conv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::source::vsi::convert_vsi(
+                &src, &tmp_path, args.openslide, args.quality, args.mag_20x(), args.half(), args.quarter(), args.verbose, Some(&pb),
+            )
+        }));
+        match conv_result {
+            Ok(Ok(())) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
                     let _ = std::fs::remove_file(&tmp_path);
                     eprintln!("  [error] rename failed for {}: {}", stem, e);
                     stats.fail.fetch_add(1, Ordering::Relaxed);
+                    logger.log_fail(idx, &stem, &format!("rename failed: {}", e));
                 } else {
                     mp.println(format!("  {} (vsi)", stem)).ok();
                     let in_b  = crate::source::vsi::input_size(&src);
@@ -569,10 +598,18 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
                     stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let _ = std::fs::remove_file(&tmp_path);
                 eprintln!("  [skip ] {}: {}", stem, e);
                 stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &stem, &e.to_string());
+            }
+            Err(payload) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                let msg = ConversionLogger::panic_message(&*payload);
+                eprintln!("  [skip ] {}: panic: {}", stem, msg);
+                stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &stem, &format!("panic: {}", msg));
             }
         }
         pb.finish_and_clear();
@@ -581,8 +618,9 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
 
 // Transcode each MIRAX (.mrxs) slide's level-0 placement into a pyramidal TIFF.
 fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress,
-                      stats: &ConversionStats) {
-    for path in paths {
+                      logger: &ConversionLogger, stats: &ConversionStats) {
+    for (i, path) in paths.iter().enumerate() {
+        let idx = i + 1;
         let src = path.to_string_lossy().to_string();
         let stem = sanitize_file_stem(
             path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
@@ -594,6 +632,7 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
         if Path::new(&out_path).exists() {
             if args.verbose { eprintln!("  [skip ] exists: {}", out_path); }
             stats.skipped.fetch_add(1, Ordering::Relaxed);
+            logger.log_skip(idx, &stem);
             continue;
         }
 
@@ -604,14 +643,18 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
         pb.set_message(stem.clone());
 
         let tmp_path = format!("{}.tmp", out_path);
-        match crate::source::mrxs::convert_mrxs(
-            &src, &tmp_path, args.openslide, args.quality, args.mag_20x(), args.half(), args.quarter(), args.mpp(), args.verbose, Some(&pb),
-        ) {
-            Ok(()) => {
+        let conv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::source::mrxs::convert_mrxs(
+                &src, &tmp_path, args.openslide, args.quality, args.mag_20x(), args.half(), args.quarter(), args.mpp(), args.verbose, Some(&pb),
+            )
+        }));
+        match conv_result {
+            Ok(Ok(())) => {
                 if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
                     let _ = std::fs::remove_file(&tmp_path);
                     eprintln!("  [error] rename failed for {}: {}", stem, e);
                     stats.fail.fetch_add(1, Ordering::Relaxed);
+                    logger.log_fail(idx, &stem, &format!("rename failed: {}", e));
                 } else {
                     mp.println(format!("  {} (mrxs)", stem)).ok();
                     let in_b  = crate::source::mrxs::input_size(&src);
@@ -621,10 +664,18 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
                     stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
                 }
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 let _ = std::fs::remove_file(&tmp_path);
                 eprintln!("  [skip ] {}: {}", stem, e);
                 stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &stem, &e.to_string());
+            }
+            Err(payload) => {
+                let _ = std::fs::remove_file(&tmp_path);
+                let msg = ConversionLogger::panic_message(&*payload);
+                eprintln!("  [skip ] {}: panic: {}", stem, msg);
+                stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &stem, &format!("panic: {}", msg));
             }
         }
         pb.finish_and_clear();
