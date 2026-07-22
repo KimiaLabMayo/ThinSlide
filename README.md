@@ -111,12 +111,12 @@ cargo install thinslide
   source pyramid (unlike 1/2), so this is typically faster.
 - **`<number>`** — downsample to an arbitrary resolution (µm/px) instead of normalizing
   to 20x. Always resamples in full, so it is slower than `20x`/`half`/`quarter`.
-  Use `--filter` to pick the kernel.
+  Use `--kernel` to pick the resampling kernel.
 
 ```sh
 thinslide /data/slides /data/output --scale half
 thinslide /data/slides /data/output --scale quarter
-thinslide /data/slides /data/output --scale 0.5 --filter lanczos3
+thinslide /data/slides /data/output --scale 0.5 --kernel lanczos3
 ```
 
 ## Acknowledgments

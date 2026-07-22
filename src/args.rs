@@ -47,11 +47,11 @@ pub struct Args {
     #[arg(long, default_value_t = 87, value_parser = clap::value_parser!(u8).range(20..=100))]
     pub quality: u8,
 
-    /// Resampling filter for --scale <number> [nearest, triangle, catmullrom, gaussian, lanczos3].
+    /// Resampling kernel for --scale <number> [nearest, triangle, catmullrom, gaussian, lanczos3].
     /// Ignored with --scale 20x/half/quarter: decode-side downsampling (DCT 1/2 or 1/4 / DWT
     /// level-1 or level-2) produces the exact target size, so no pixel-domain resize step is performed.
-    #[arg(long, default_value = "nearest", value_parser = parse_filter)]
-    pub filter: FilterType,
+    #[arg(long, default_value = "nearest", value_parser = parse_kernel)]
+    pub kernel: FilterType,
 
     /// Override the default log file path (parent directory must exist)
     #[arg(long, value_parser = parse_log_file)]
@@ -123,7 +123,7 @@ fn parse_output_dir(s: &str) -> Result<String, String> {
     Ok(s.to_string())
 }
 
-fn parse_filter(s: &str) -> Result<FilterType, String> {
+fn parse_kernel(s: &str) -> Result<FilterType, String> {
     match s.to_lowercase().as_str() {
         "nearest"                => Ok(FilterType::Nearest),
         "triangle" | "bilinear" => Ok(FilterType::Triangle),
@@ -131,7 +131,7 @@ fn parse_filter(s: &str) -> Result<FilterType, String> {
         "gaussian"              => Ok(FilterType::Gaussian),
         "lanczos3"              => Ok(FilterType::Lanczos3),
         _ => Err(format!(
-            "'{}' is not a valid filter [nearest, triangle, catmullrom, gaussian, lanczos3]", s
+            "'{}' is not a valid kernel [nearest, triangle, catmullrom, gaussian, lanczos3]", s
         ))
     }
 }

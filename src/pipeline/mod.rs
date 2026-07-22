@@ -222,7 +222,7 @@ fn convert_one_series(
     } else if let Some(target_mpp) = effective_mpp {
         writer::write_resampled_tiff(
             &src.slide_levels, &tmp_path,
-            target_mpp, args.quality, args.filter,
+            target_mpp, args.quality, args.kernel,
             !args.openslide,
             Some(&pb),
             args.verbose,
@@ -325,8 +325,8 @@ pub fn run(args: Args) {
             .build_global();
     }
 
-    if (args.mag_20x() || args.half() || args.quarter()) && !matches!(args.filter, image::imageops::FilterType::Nearest) {
-        eprintln!("[warn] --filter is ignored with --scale 20x/half/quarter: decode-side downsampling skips the resize step");
+    if (args.mag_20x() || args.half() || args.quarter()) && !matches!(args.kernel, image::imageops::FilterType::Nearest) {
+        eprintln!("[warn] --kernel is ignored with --scale 20x/half/quarter: decode-side downsampling skips the resize step");
     }
 
     if args.verbose {

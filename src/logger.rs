@@ -99,7 +99,7 @@ impl ConversionLogger {
 
     fn write_header(&self, args: &Args, start_dt: &str) {
         use image::imageops::FilterType;
-        let filter_name = match args.filter {
+        let kernel_name = match args.kernel {
             FilterType::Nearest    => "nearest",
             FilterType::Triangle   => "triangle",
             FilterType::CatmullRom => "catmullrom",
@@ -128,9 +128,9 @@ impl ConversionLogger {
         self.write_line(&format!("ram:    {} MB", total_ram_mb));
         self.write_line(&format!(
             "options: openslide={} verbose={} mag_20x={} icc_bake={} use_parent_name={} \
-             quality={} jobs={:?} mpp={:?} filter={}",
+             quality={} jobs={:?} mpp={:?} kernel={}",
             args.openslide, args.verbose, args.mag_20x(), args.icc_bake,
-            args.use_parent_name, args.quality, args.jobs, args.mpp(), filter_name
+            args.use_parent_name, args.quality, args.jobs, args.mpp(), kernel_name
         ));
         self.write_line("---");
     }

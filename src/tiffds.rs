@@ -815,7 +815,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     let out_spp: u32 = if base_src.spp >= 3 { 3 } else { 1 };
     let out_photometric = if out_spp == 1 { PHOTOMETRIC_MINISBLACK } else { PHOTOMETRIC_YCBCR };
 
-    let fir_alg = match args.filter {
+    let fir_alg = match args.kernel {
         FilterType::Nearest    => fir::ResizeAlg::Nearest,
         FilterType::Triangle   => fir::ResizeAlg::Convolution(fir::FilterType::Bilinear),
         FilterType::CatmullRom => fir::ResizeAlg::Convolution(fir::FilterType::CatmullRom),
