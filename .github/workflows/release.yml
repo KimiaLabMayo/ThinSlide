@@ -94,7 +94,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
 
       - name: Install Homebrew deps
-        run: brew install libtiff little-cms2 pkg-config
+        run: brew install pkg-config
+
+      - name: Build zlib (macOS static)
+        run: |
+          curl -sL https://github.com/madler/zlib/releases/download/v1.3.1/zlib-1.3.1.tar.gz | tar -xz
+          cd zlib-1.3.1
+          cmake -B build -DCMAKE_BUILD_TYPE=Release "-DCMAKE_INSTALL_PREFIX=${{ runner.temp }}/zlib-static"
+          cmake --build build --config Release --parallel
+          cmake --install build --config Release
+
+      - name: Build libtiff (macOS static, JPEG disabled)
+        run: |
+          curl -sL https://download.osgeo.org/libtiff/tiff-4.7.1.tar.gz | tar -xz
+          cd tiff-4.7.1
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            "-DCMAKE_INSTALL_PREFIX=${{ runner.temp }}/tiff-static" \
+            "-DCMAKE_PREFIX_PATH=${{ runner.temp }}/zlib-static" \
+            -Dtiff-tools=OFF -Dtiff-tests=OFF -Dtiff-docs=OFF \
+            -Djpeg=OFF -Dold-jpeg=OFF -Dlzma=OFF -Dzstd=OFF -Dwebp=OFF -Djbig=OFF -Dlibdeflate=OFF
+          cmake --build build --config Release --parallel
+          cmake --install build --config Release
 
       - name: Cache cargo registry
         uses: actions/cache@v4
@@ -106,7 +128,10 @@ jobs:
 
       - name: Build thinslide + thinslide-gui
         env:
-          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig
+          TIFF_LIB_DIR: ${{ runner.temp }}/tiff-static/lib
+          TIFF_STATIC: "1"
+          ZLIB_LIB_DIR: ${{ runner.temp }}/zlib-static/lib
+          LCMS2_STATIC: "1"
         run: cargo build --release --bin thinslide --bin thinslide-gui
 
       - name: Rename artifacts
@@ -114,12 +139,18 @@ jobs:
           cp target/release/thinslide thinslide-macos-arm64
           cp target/release/thinslide-gui thinslide-gui-macos-arm64
 
+      - name: Package .app and .dmg
+        run: |
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          ./scripts/package_macos_app.sh target/release/thinslide-gui "$VERSION" .
+
       - uses: actions/upload-artifact@v4
         with:
           name: thinslide-macos-arm64
           path: |
             thinslide-macos-arm64
             thinslide-gui-macos-arm64
+            thinslide-macos-arm64.dmg
 
   # ── Windows x86_64 MSVC (thinslide + thinslide-gui) ────────────────────────
   build-windows:
@@ -219,5 +250,6 @@ jobs:
             thinslide-linux-x86_64-musl
             thinslide-macos-arm64
             thinslide-gui-macos-arm64
+            thinslide-macos-arm64.dmg
             thinslide-windows-x86_64.exe
             thinslide-gui-windows-x86_64.exe

@@ -460,10 +460,19 @@ fn main() -> eframe::Result<()> {
         println!("Total execution time: {:.2?}", start_time.elapsed());
         return Ok(());
     }
+    let icon = image::load_from_memory(include_bytes!("../../assets/icon.png"))
+        .expect("failed to decode assets/icon.png")
+        .into_rgba8();
+    let (icon_width, icon_height) = icon.dimensions();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("ThinSlide")
-            .with_inner_size([680.0, 560.0]),
+            .with_inner_size([680.0, 560.0])
+            .with_icon(egui::IconData {
+                rgba: icon.into_raw(),
+                width: icon_width,
+                height: icon_height,
+            }),
         ..Default::default()
     };
     eframe::run_native("ThinSlide", options, Box::new(|cc| Ok(Box::new(App::new(cc)))))

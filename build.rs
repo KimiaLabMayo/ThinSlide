@@ -2,6 +2,14 @@ fn main() {
     let target_env = std::env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
     let target_os = std::env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
 
+    // Embed the app icon as a PE resource so thinslide.exe / thinslide-gui.exe
+    // show it in Explorer, not just in the taskbar at runtime.
+    #[cfg(windows)]
+    winresource::WindowsResource::new()
+        .set_icon("assets/icon.ico")
+        .compile()
+        .expect("failed to embed Windows icon resource");
+
     // Highest priority: explicit env var (used by CI for musl/Windows builds).
     if let Ok(lib_dir) = std::env::var("TIFF_LIB_DIR") {
         println!("cargo:rustc-link-search=native={lib_dir}");
