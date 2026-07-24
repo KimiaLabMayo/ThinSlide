@@ -410,7 +410,7 @@ pub fn run(args: Args) {
                     last_dir_count = n_dirs;
                 }
             }
-            "tiff" | "svs" => {
+            "tiff" | "tif" | "svs" => {
                 tiff_paths.push(entry.path().to_owned());
                 scan_pb.set_message(format!("{} DCM in {} dirs, {} TIFF/SVS",
                     total_file_count, dir_map.len(), tiff_paths.len()));

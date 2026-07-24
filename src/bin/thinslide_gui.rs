@@ -234,7 +234,9 @@ impl eframe::App for App {
                 i.raw.dropped_files.iter().filter_map(|f| f.path.clone()).collect()
             });
             for path in dropped {
-                if path.is_dir() {
+                let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                let is_input_file = path.is_file() && matches!(ext.as_str(), "tiff" | "tif" | "svs");
+                if path.is_dir() || is_input_file {
                     if self.input_dir.is_empty() {
                         self.input_dir = path.display().to_string();
                     } else {
@@ -245,16 +247,19 @@ impl eframe::App for App {
             if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
                 ui.colored_label(
                     egui::Color32::from_rgb(60, 140, 220),
-                    "↓  Drop a folder to set input path (or output path if input is already set)",
+                    "↓  Drop a folder (or .tiff/.tif/.svs file) to set input path (or output path if input is already set)",
                 );
             }
 
             egui::Grid::new("folders").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                ui.label("Input folder:");
+                ui.label("Input path:");
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Browse…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
+                            if let Some(p) = rfd::FileDialog::new()
+                                .add_filter("TIFF/SVS", &["tiff", "tif", "svs"])
+                                .pick_file_or_folder()
+                            {
                                 self.input_dir = p.display().to_string();
                             }
                         }
