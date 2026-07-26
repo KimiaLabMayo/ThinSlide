@@ -1,8 +1,8 @@
 # ThinSlide
 
-**Optimize whole-slide images** — for storage, portability, and interoperability.
+**Whole-slide image (WSI) optimization — toward sustainable digital pathology.**
 
-- **Convert** — WSIs are fragmented. Consolidate them into clean TIFF/OME-TIFF. *(default)*
+- **Convert** — WSIs are fragmented. Consolidate them into clean TIFF/OME-TIFF.
 - **Downsample** — WSIs are heavy. Normalize 40x scans to 20x and save storage by ~75%. `--scale 20x`
 - **Standardize** — Colors are not portable. Bake ICC profiles into the pixels. `--icc-bake`
 
@@ -26,15 +26,15 @@ source's original compression, and is readable by [OpenSlide](https://openslide.
   
 ² Skipped unless combined with `--scale` or `--icc-bake`.
 
-## Desktop app (no command line)
+## Desktop app (no command)
 
 If you'd rather not use the terminal, **`thinslide-gui`** does the same thing in a window.
 
-1. Download `thinslide-gui` for [macOS or Windows](../../releases/latest).
-2. Open it, then choose a folder of slides and a destination folder.
-3. Pick what you want, and click **Run**.
-
-On macOS, also run `brew install libtiff little-cms2` once. No such step is needed on Windows.
+1. Download `thinslide-macos-arm64.dmg` (macOS) or `thinslide-gui-windows-x86_64.exe` (Windows)
+   from the [latest release](../../releases/latest).
+2. On macOS, open the .dmg and drag **ThinSlide** into Applications. On Windows, just run the .exe.
+3. Open it, then choose a folder of slides and a destination folder.
+4. Pick what you want, and click **Run**.
 
 ![ThinSlide GUI screenshot](assets/gui_screenshot.png)
 
@@ -67,24 +67,23 @@ thinslide /data/slides /data/output --scale 20x --icc-bake --quality 90 -j 4
 
 ### Installation
 
-Prebuilt binaries are attached to every [release](https://github.com/uegamiw/thinslide/releases/latest).
+Prebuilt binaries are attached to every [release](https://github.com/KimiaLabMayo/ThinSlide/releases/latest).
 Download the one for your platform, make it executable, and put it on your `PATH`:
 
 | Platform | Asset | Includes GUI | Dependencies |
 |----------|-------|:---:|---|
 | Linux x86_64 | `thinslide-linux-x86_64-musl` | — | none (static musl) |
-| macOS arm64 | `thinslide-macos-arm64` | ✓ | libtiff, Little CMS 2 |
+| macOS arm64 | `thinslide-macos-arm64` | ✓ | none (static) |
 | Windows x86_64 | `thinslide-windows-x86_64.exe` | ✓ | none (static) |
 
 ```sh
 # Linux / macOS
-curl -L -o thinslide https://github.com/uegamiw/thinslide/releases/latest/download/thinslide-linux-x86_64-musl
+curl -L -o thinslide https://github.com/KimiaLabMayo/ThinSlide/releases/latest/download/thinslide-linux-x86_64-musl
 chmod +x thinslide
 sudo mv thinslide /usr/local/bin/
 ```
 
 On Windows, download `thinslide-windows-x86_64.exe` and add its folder to `PATH`.
-On macOS, install the two dynamic libraries once with `brew install libtiff little-cms2`.
 
 #### From crates.io or source
 
@@ -146,7 +145,8 @@ and in part ported from, the following open-source projects:
 ## License
 
 Copyright (C) 2026 Wataru Uegami, MD, PhD
-thinslide is licensed under the GNU General Public License v2.0 or later (GPL-2.0-or-later).
+
+ThinSlide is licensed under the GNU General Public License v2.0 or later (GPL-2.0-or-later).
 
 
 ## Disclaimer

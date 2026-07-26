@@ -40,6 +40,7 @@ fn sanitize_file_stem(stem: &str) -> String {
 fn convert_one_series(
     series_meta: Vec<DcmMetadata>,
     series_idx: usize,
+    total_known: &AtomicUsize,
     args: &Args,
     mp: &MultiProgress,
     logger: &ConversionLogger,
@@ -181,7 +182,8 @@ fn convert_one_series(
 
     let fname    = Path::new(&output_path)
         .file_name().and_then(|n| n.to_str()).unwrap_or(series_id.as_str());
-    let prefix   = format!("({})", series_idx);
+    let total    = total_known.load(Ordering::Relaxed).max(series_idx);
+    let prefix   = format!("({}/{})", series_idx, total);
     let max_name = 52usize.saturating_sub(prefix.len() + 1);
     let name_str = if fname.len() > max_name {
         format!("…{}", &fname[fname.len() - max_name.saturating_sub(1)..])
@@ -314,8 +316,27 @@ fn convert_one_series(
     };
 
     logger.log_ok(series_idx, fname, elapsed_s, input_bytes, out_bytes, detail);
-    mp.println(format!("  {} {:.2}s", pb_msg, elapsed_s)).ok();
-    pb.finish_and_clear();
+
+    // DICOM sources always get re-tiled into the destination container, so
+    // "repack" applies unconditionally; append whichever downsample/ICC bake
+    // was actually requested and applied.
+    let mut ops: Vec<String> = vec!["repack".to_string()];
+    if args.quarter() {
+        ops.push("quarter".to_string());
+    } else if args.half() {
+        ops.push("half".to_string());
+    } else if args.mag_20x() {
+        if decode_shift > 0 { ops.push("20x downsample".to_string()); }
+    } else if let Some(target) = effective_mpp {
+        ops.push(format!("mpp {:.4} downsample", target));
+    }
+    if args.icc_bake { ops.push("ICC".to_string()); }
+
+    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+    pb.finish_with_message(format!(
+        "{}{}  {} \u{2192} {}  ({:.2}s)",
+        pb_msg, crate::format_ops(&ops), crate::format_mb(input_bytes), crate::format_mb(out_bytes), elapsed_s
+    ));
 }
 
 // Runs `convert_one_series` behind a panic guard: an unexpected panic in the
@@ -324,6 +345,7 @@ fn convert_one_series(
 fn convert_one_series_guarded(
     series_meta: Vec<DcmMetadata>,
     series_idx: usize,
+    total_known: &AtomicUsize,
     args: &Args,
     mp: &MultiProgress,
     logger: &ConversionLogger,
@@ -333,7 +355,7 @@ fn convert_one_series_guarded(
         .map(|m| m.series_instance_uid.clone())
         .unwrap_or_default();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        convert_one_series(series_meta, series_idx, args, mp, logger, stats);
+        convert_one_series(series_meta, series_idx, total_known, args, mp, logger, stats);
     }));
     if let Err(payload) = result {
         stats.fail.fetch_add(1, Ordering::Relaxed);
@@ -410,7 +432,7 @@ pub fn run(args: Args) {
                     last_dir_count = n_dirs;
                 }
             }
-            "tiff" | "svs" => {
+            "tiff" | "tif" | "svs" => {
                 tiff_paths.push(entry.path().to_owned());
                 scan_pb.set_message(format!("{} DCM in {} dirs, {} TIFF/SVS",
                     total_file_count, dir_map.len(), tiff_paths.len()));
@@ -440,29 +462,24 @@ pub fn run(args: Args) {
         }
     }
 
-    // Phase 2+3: metadata extraction pipelined with conversion.
-    let meta_pb = mp.add(ProgressBar::new(total_files));
-    meta_pb.set_style(
-        ProgressStyle::with_template(
-            "  Extracting metadata [{bar:35.cyan/white}] {pos}/{len} ({elapsed})"
-        ).unwrap().progress_chars("=>-"),
-    );
-
+    // Phase 2+3: metadata extraction pipelined with conversion. `total_known`
+    // tracks how many series have been discovered so far and grows as the
+    // scanner thread groups more directories; it is the denominator shown on
+    // each per-series progress line instead of a separate overall bar.
     let series_counter = AtomicUsize::new(0);
+    let total_known = Arc::new(AtomicUsize::new(0));
 
     let (tx, rx) = mpsc::channel::<Vec<DcmMetadata>>();
 
-    let meta_pb_clone = meta_pb.clone();
+    let total_known_scanner = Arc::clone(&total_known);
     let scanner = std::thread::spawn(move || {
         for files in dir_groups {
-            let n = files.len() as u64;
             let metas: Vec<DcmMetadata> = files.iter()
                 .filter_map(|p| match extract_metadata(p) {
                     Ok(m) => Some(m),
                     Err(e) => { eprintln!("  [skip] {}: {}", p, e); None }
                 })
                 .collect();
-            meta_pb_clone.inc(n);
 
             let mut by_series: std::collections::HashMap<String, Vec<DcmMetadata>> =
                 std::collections::HashMap::new();
@@ -472,16 +489,18 @@ pub fn run(args: Args) {
                         .or_default().push(m);
                 }
             }
+            total_known_scanner.fetch_add(by_series.len(), Ordering::SeqCst);
             for (_, series_metas) in by_series {
                 tx.send(series_metas).ok();
             }
         }
     });
 
-    let mp_ref     = &mp;
-    let args_ref   = &args;
-    let logger_ref = &logger;
-    let stats_ref  = &stats;
+    let mp_ref          = &mp;
+    let args_ref         = &args;
+    let logger_ref       = &logger;
+    let stats_ref        = &stats;
+    let total_known_ref: &AtomicUsize = &total_known;
 
     rayon::scope(|s| {
         let n_concurrent = rayon::current_num_threads();
@@ -490,9 +509,9 @@ pub fn run(args: Args) {
         for series_meta in rx {
             let series_idx = series_counter.fetch_add(1, Ordering::SeqCst) + 1;
             if args_ref.mpp().is_some() || args_ref.mag_20x() || args_ref.half() || args_ref.quarter() {
-                convert_one_series_guarded(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
+                convert_one_series_guarded(series_meta, series_idx, total_known_ref, args_ref, mp_ref, logger_ref, stats_ref);
             } else if n_concurrent <= 1 {
-                convert_one_series_guarded(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
+                convert_one_series_guarded(series_meta, series_idx, total_known_ref, args_ref, mp_ref, logger_ref, stats_ref);
             } else {
                 if args.verbose {
                     println!("Passthrough mode");
@@ -507,7 +526,7 @@ pub fn run(args: Args) {
                 }
                 let sem_clone = Arc::clone(&sem);
                 s.spawn(move |_| {
-                    convert_one_series_guarded(series_meta, series_idx, args_ref, mp_ref, logger_ref, stats_ref);
+                    convert_one_series_guarded(series_meta, series_idx, total_known_ref, args_ref, mp_ref, logger_ref, stats_ref);
                     let (lock, cvar) = &*sem_clone;
                     let mut active = lock.lock().unwrap();
                     *active -= 1;
@@ -518,7 +537,6 @@ pub fn run(args: Args) {
     });
 
     scanner.join().unwrap();
-    meta_pb.finish_and_clear();
 
     if !tiff_paths.is_empty() {
         if args.mpp().is_some() || args.mag_20x() || args.half() || args.quarter() || args.icc_bake {
@@ -553,11 +571,13 @@ pub fn run(args: Args) {
 // Experimental: transcode the main 2D pyramid of each CellSens .vsi to TIFF.
 fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress,
                      logger: &ConversionLogger, stats: &ConversionStats) {
+    let total = paths.len();
     for (i, path) in paths.iter().enumerate() {
         let idx = i + 1;
         let src = path.to_string_lossy().to_string();
         let stem = sanitize_file_stem(
             path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
+        let pb_msg = format!("({}/{}) {}", idx, total, stem);
         let out_path = if args.openslide {
             format!("{}/{}.tiff", args.output_dir, stem)
         } else {
@@ -574,7 +594,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
         pb.set_style(ProgressStyle::with_template(
             "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
         ).unwrap().progress_chars("=>-"));
-        pb.set_message(stem.clone());
+        pb.set_message(pb_msg.clone());
 
         let tmp_path = format!("{}.tmp", out_path);
         let conv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -589,13 +609,28 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
                     eprintln!("  [error] rename failed for {}: {}", stem, e);
                     stats.fail.fetch_add(1, Ordering::Relaxed);
                     logger.log_fail(idx, &stem, &format!("rename failed: {}", e));
+                    pb.finish_and_clear();
                 } else {
-                    mp.println(format!("  {} (vsi)", stem)).ok();
                     let in_b  = crate::source::vsi::input_size(&src);
                     let out_b = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
                     stats.ok.fetch_add(1, Ordering::Relaxed);
                     stats.in_bytes.fetch_add(in_b, Ordering::Relaxed);
                     stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
+
+                    let mut ops: Vec<String> = vec!["repack".to_string()];
+                    if args.quarter() {
+                        ops.push("quarter".to_string());
+                    } else if args.half() {
+                        ops.push("half".to_string());
+                    } else if args.mag_20x() {
+                        ops.push("20x downsample".to_string());
+                    }
+
+                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                    pb.finish_with_message(format!(
+                        "{} (vsi){}  {} \u{2192} {}",
+                        pb_msg, crate::format_ops(&ops), crate::format_mb(in_b), crate::format_mb(out_b)
+                    ));
                 }
             }
             Ok(Err(e)) => {
@@ -603,6 +638,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
                 eprintln!("  [skip ] {}: {}", stem, e);
                 stats.fail.fetch_add(1, Ordering::Relaxed);
                 logger.log_fail(idx, &stem, &e.to_string());
+                pb.finish_and_clear();
             }
             Err(payload) => {
                 let _ = std::fs::remove_file(&tmp_path);
@@ -610,20 +646,22 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
                 eprintln!("  [skip ] {}: panic: {}", stem, msg);
                 stats.fail.fetch_add(1, Ordering::Relaxed);
                 logger.log_fail(idx, &stem, &format!("panic: {}", msg));
+                pb.finish_and_clear();
             }
         }
-        pb.finish_and_clear();
     }
 }
 
 // Transcode each MIRAX (.mrxs) slide's level-0 placement into a pyramidal TIFF.
 fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress,
                       logger: &ConversionLogger, stats: &ConversionStats) {
+    let total = paths.len();
     for (i, path) in paths.iter().enumerate() {
         let idx = i + 1;
         let src = path.to_string_lossy().to_string();
         let stem = sanitize_file_stem(
             path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
+        let pb_msg = format!("({}/{}) {}", idx, total, stem);
         let out_path = if args.openslide {
             format!("{}/{}.tiff", args.output_dir, stem)
         } else {
@@ -640,7 +678,7 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
         pb.set_style(ProgressStyle::with_template(
             "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
         ).unwrap().progress_chars("=>-"));
-        pb.set_message(stem.clone());
+        pb.set_message(pb_msg.clone());
 
         let tmp_path = format!("{}.tmp", out_path);
         let conv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -655,13 +693,30 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
                     eprintln!("  [error] rename failed for {}: {}", stem, e);
                     stats.fail.fetch_add(1, Ordering::Relaxed);
                     logger.log_fail(idx, &stem, &format!("rename failed: {}", e));
+                    pb.finish_and_clear();
                 } else {
-                    mp.println(format!("  {} (mrxs)", stem)).ok();
                     let in_b  = crate::source::mrxs::input_size(&src);
                     let out_b = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
                     stats.ok.fetch_add(1, Ordering::Relaxed);
                     stats.in_bytes.fetch_add(in_b, Ordering::Relaxed);
                     stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
+
+                    let mut ops: Vec<String> = vec!["repack".to_string()];
+                    if args.quarter() {
+                        ops.push("quarter".to_string());
+                    } else if args.half() {
+                        ops.push("half".to_string());
+                    } else if args.mag_20x() {
+                        ops.push("20x downsample".to_string());
+                    } else if let Some(target) = args.mpp() {
+                        ops.push(format!("mpp {:.4} downsample", target));
+                    }
+
+                    pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+                    pb.finish_with_message(format!(
+                        "{} (mrxs){}  {} \u{2192} {}",
+                        pb_msg, crate::format_ops(&ops), crate::format_mb(in_b), crate::format_mb(out_b)
+                    ));
                 }
             }
             Ok(Err(e)) => {
@@ -669,6 +724,7 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
                 eprintln!("  [skip ] {}: {}", stem, e);
                 stats.fail.fetch_add(1, Ordering::Relaxed);
                 logger.log_fail(idx, &stem, &e.to_string());
+                pb.finish_and_clear();
             }
             Err(payload) => {
                 let _ = std::fs::remove_file(&tmp_path);
@@ -676,8 +732,8 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
                 eprintln!("  [skip ] {}: panic: {}", stem, msg);
                 stats.fail.fetch_add(1, Ordering::Relaxed);
                 logger.log_fail(idx, &stem, &format!("panic: {}", msg));
+                pb.finish_and_clear();
             }
         }
-        pb.finish_and_clear();
     }
 }

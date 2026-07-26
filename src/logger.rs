@@ -64,6 +64,7 @@ impl ConversionStats {
     }
 }
 
+#[derive(Default)]
 pub struct ConversionDetail {
     pub input_path:  String,
     pub output_path: String,
