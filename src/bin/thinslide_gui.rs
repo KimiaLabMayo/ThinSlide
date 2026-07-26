@@ -256,10 +256,7 @@ impl eframe::App for App {
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.button("Browse…").clicked() {
-                            if let Some(p) = rfd::FileDialog::new()
-                                .add_filter("TIFF/SVS", &["tiff", "tif", "svs"])
-                                .pick_file_or_folder()
-                            {
+                            if let Some(p) = rfd::FileDialog::new().pick_folder() {
                                 self.input_dir = p.display().to_string();
                             }
                         }
