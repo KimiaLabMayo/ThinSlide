@@ -140,7 +140,7 @@ impl Default for App {
             "─────────────────────────────────────────────────────────\n",
             "\n",
             "Features:\n",
-            "  • DICOM → TIFF lossless conversion  (zero quality loss)\n",
+            "  • DICOM → TIFF conversion (zero quality change)\n",
             "  • Downsampling  (20x / 10x)\n",
             "  • ICC profile baking  (converts to sRGB, removes embedded profile)\n",
             "\n",

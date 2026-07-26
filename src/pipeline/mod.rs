@@ -316,10 +316,26 @@ fn convert_one_series(
     };
 
     logger.log_ok(series_idx, fname, elapsed_s, input_bytes, out_bytes, detail);
+
+    // DICOM sources always get re-tiled into the destination container, so
+    // "repack" applies unconditionally; append whichever downsample/ICC bake
+    // was actually requested and applied.
+    let mut ops: Vec<String> = vec!["repack".to_string()];
+    if args.quarter() {
+        ops.push("quarter".to_string());
+    } else if args.half() {
+        ops.push("half".to_string());
+    } else if args.mag_20x() {
+        if decode_shift > 0 { ops.push("20x downsample".to_string()); }
+    } else if let Some(target) = effective_mpp {
+        ops.push(format!("mpp {:.4} downsample", target));
+    }
+    if args.icc_bake { ops.push("ICC".to_string()); }
+
     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
     pb.finish_with_message(format!(
-        "{}  {} \u{2192} {}  ({:.2}s)",
-        pb_msg, crate::format_mb(input_bytes), crate::format_mb(out_bytes), elapsed_s
+        "{}{}  {} \u{2192} {}  ({:.2}s)",
+        pb_msg, crate::format_ops(&ops), crate::format_mb(input_bytes), crate::format_mb(out_bytes), elapsed_s
     ));
 }
 
@@ -600,10 +616,20 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
                     stats.ok.fetch_add(1, Ordering::Relaxed);
                     stats.in_bytes.fetch_add(in_b, Ordering::Relaxed);
                     stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
+
+                    let mut ops: Vec<String> = vec!["repack".to_string()];
+                    if args.quarter() {
+                        ops.push("quarter".to_string());
+                    } else if args.half() {
+                        ops.push("half".to_string());
+                    } else if args.mag_20x() {
+                        ops.push("20x downsample".to_string());
+                    }
+
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(format!(
-                        "{} (vsi)  {} \u{2192} {}",
-                        pb_msg, crate::format_mb(in_b), crate::format_mb(out_b)
+                        "{} (vsi){}  {} \u{2192} {}",
+                        pb_msg, crate::format_ops(&ops), crate::format_mb(in_b), crate::format_mb(out_b)
                     ));
                 }
             }
@@ -674,10 +700,22 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
                     stats.ok.fetch_add(1, Ordering::Relaxed);
                     stats.in_bytes.fetch_add(in_b, Ordering::Relaxed);
                     stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
+
+                    let mut ops: Vec<String> = vec!["repack".to_string()];
+                    if args.quarter() {
+                        ops.push("quarter".to_string());
+                    } else if args.half() {
+                        ops.push("half".to_string());
+                    } else if args.mag_20x() {
+                        ops.push("20x downsample".to_string());
+                    } else if let Some(target) = args.mpp() {
+                        ops.push(format!("mpp {:.4} downsample", target));
+                    }
+
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(format!(
-                        "{} (mrxs)  {} \u{2192} {}",
-                        pb_msg, crate::format_mb(in_b), crate::format_mb(out_b)
+                        "{} (mrxs){}  {} \u{2192} {}",
+                        pb_msg, crate::format_ops(&ops), crate::format_mb(in_b), crate::format_mb(out_b)
                     ));
                 }
             }

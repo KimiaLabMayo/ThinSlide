@@ -36,6 +36,12 @@ pub(crate) fn format_mb(bytes: u64) -> String {
     format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
 }
 
+/// Formats the operations applied to a conversion (e.g. "repack", "20x downsample",
+/// "ICC") as a bracketed suffix, or an empty string when `tags` is empty.
+pub(crate) fn format_ops(tags: &[String]) -> String {
+    if tags.is_empty() { String::new() } else { format!(" [{}]", tags.join(", ")) }
+}
+
 /// Minimum length of the longer image side (pixels) required to include a
 /// pyramid level in the resampled output.
 pub const MIN_PYRAMID_SIDE: u32 = 512;

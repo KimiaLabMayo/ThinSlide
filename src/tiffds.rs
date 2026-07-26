@@ -199,18 +199,22 @@ pub(crate) fn process_files(
         pb.set_message(pb_msg.clone());
 
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            process_file(&src_path, &args.output_dir, &src_stem, args, &pb);
+            process_file(&src_path, &args.output_dir, &src_stem, args, &pb)
         }));
 
-        if let Err(payload) = panic_result {
-            let msg = crate::logger::ConversionLogger::panic_message(&*payload);
-            stats.fail.fetch_add(1, Ordering::Relaxed);
-            logger.log_fail(idx, &src_name, &format!("panic: {}", msg));
-            pb.finish_and_clear();
-            continue;
-        }
+        let ops = match panic_result {
+            Ok(ops) => ops,
+            Err(payload) => {
+                let msg = crate::logger::ConversionLogger::panic_message(&*payload);
+                stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &src_name, &format!("panic: {}", msg));
+                pb.finish_and_clear();
+                continue;
+            }
+        };
 
-        // process_file has no return value; infer success from output presence.
+        // process_file infers success from output presence; the returned tags
+        // describe which operations (repack/downsample/ICC) were applied.
         let produced: Option<std::path::PathBuf> = candidates.iter()
             .map(|name| Path::new(&args.output_dir).join(name))
             .find(|p| p.exists());
@@ -222,8 +226,8 @@ pub(crate) fn process_files(
             stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
             pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
             pb.finish_with_message(format!(
-                "{}  {} \u{2192} {}",
-                pb_msg, crate::format_mb(in_b), crate::format_mb(out_b)
+                "{}{}  {} \u{2192} {}",
+                pb_msg, crate::format_ops(&ops), crate::format_mb(in_b), crate::format_mb(out_b)
             ));
         } else {
             stats.fail.fetch_add(1, Ordering::Relaxed);
@@ -621,16 +625,16 @@ fn write_jp2k_svs_from_tiff(
 
 // ─── Per-file processing ──────────────────────────────────────────────────────
 
-fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Args, pb: &ProgressBar) {
+fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Args, pb: &ProgressBar) -> Vec<String> {
     let Some(src) = TiffSource::open(src_path) else {
         eprintln!("  [error] Cannot open: {src_path}");
-        return;
+        return Vec::new();
     };
     let (mut src_levels, icc_profile, ome_xml, _meta) = src.into_parts();
 
     if src_levels.is_empty() {
         eprintln!("  [warn] No tiled pyramid found in: {src_path}");
-        return;
+        return Vec::new();
     }
 
     // --icc-bake: no ICC profile → copy and return
@@ -642,7 +646,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         if let Err(e) = std::fs::copy(src_path, &dst) {
             eprintln!("  [error] Copy failed for {src_name}: {e}");
         }
-        return;
+        return vec!["copy".to_string()];
     }
 
     // --scale half / quarter / 20x: classify the source magnification bucket;
@@ -658,7 +662,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             Some(f) => f,
             None => {
                 eprintln!("  [skip ] {src_path}: source MPP unknown or ≥0.7 µm/px (--scale 20x cannot upscale)");
-                return;
+                return Vec::new();
             }
         }
     } else {
@@ -673,7 +677,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         if let Err(e) = std::fs::copy(src_path, &dst) {
             eprintln!("  [error] Copy failed for {src_name}: {e}");
         }
-        return;
+        return vec!["copy".to_string()];
     }
 
     // Pure 1:1 ICC bake: plain --icc-bake, or --scale 20x already at native 20x.
@@ -687,7 +691,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         } else {
             eprintln!("  [error] Invalid ICC profile in {src_path}; skipping.");
         }
-        return;
+        return vec!["ICC".to_string()];
     }
 
     // --scale half/quarter with unknown source MPP: derive a synthetic 1.0 µm/px
@@ -721,7 +725,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             if base.mpp_x <= 0.0 {
                 eprintln!("  [error] Cannot determine resolution for {src_path}: \
                     no XRESOLUTION tag and no 'MPP = <value>' in ImageDescription. Skipping.");
-                return;
+                return Vec::new();
             }
             if t <= base.mpp_x {
                 eprintln!(
@@ -733,11 +737,12 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                     let icc = icc_profile.as_deref().unwrap();
                     if let Some(xform) = crate::build_icc_transform(icc) {
                         process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb);
+                        return vec!["ICC".to_string()];
                     } else {
                         eprintln!("  [error] Invalid ICC profile in {src_path}; skipping.");
                     }
                 }
-                return;
+                return Vec::new();
             }
         }
     }
@@ -765,11 +770,23 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     };
     let tmp_path = format!("{out_path}.tmp");
 
+    let mut ops: Vec<String> = vec!["repack".to_string()];
+    if args.quarter() {
+        ops.push("quarter".to_string());
+    } else if args.half() {
+        ops.push("half".to_string());
+    } else if args.mag_20x() {
+        ops.push("20x downsample".to_string());
+    } else if args.mpp().is_some() {
+        ops.push(format!("mpp {:.4} downsample", target_mpp));
+    }
+    if args.icc_bake { ops.push("ICC".to_string()); }
+
     if let Some(skip) = jp2k_svs_skip {
         write_jp2k_svs_from_tiff(src_path, &src_levels[skip..], &tmp_path, args.verbose, pb);
         std::fs::rename(&tmp_path, &out_path)
             .expect("Failed to rename tmp to output");
-        return;
+        return ops;
     }
 
     let mut output_levels = compute_output_levels(&src_levels, target_mpp, args.verbose, args.icc_bake, decode_shift);
@@ -781,7 +798,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     }
     if output_levels.is_empty() {
         eprintln!("  [warn] No output levels produced for {src_path}");
-        return;
+        return Vec::new();
     }
 
     let total_tiles: u64 = output_levels.iter()
@@ -856,13 +873,13 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     let src_tiff = unsafe { TIFFOpen(src_c.as_ptr(), r_mode.as_ptr()) };
     if src_tiff.is_null() {
         eprintln!("  [error] Cannot re-open: {src_path}");
-        return;
+        return Vec::new();
     }
     let dst_tiff = unsafe { TIFFOpen(tmp_c.as_ptr(), w8_mode.as_ptr()) };
     if dst_tiff.is_null() {
         eprintln!("  [error] Cannot create: {tmp_path}");
         unsafe { TIFFClose(src_tiff); }
-        return;
+        return Vec::new();
     }
 
     let n_subifds = output_levels.len() - 1;
@@ -1118,6 +1135,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         eprintln!("  [error] Failed to rename {tmp_path} → {out_path}: {e}");
         let _ = std::fs::remove_file(&tmp_path);
     }
+    ops
 }
 
 // ─── Output pyramid computation ───────────────────────────────────────────────
