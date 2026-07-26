@@ -1,6 +1,8 @@
 # ThinSlide
 
-**Optimize whole-slide images** — for storage, portability, and interoperability.
+**Whole-slide image (WSI) optimization — toward sustainable digital pathology.**
+
+Tools for storage optimization, format conversion, and color standardization.
 
 - **Convert** — WSIs are fragmented. Consolidate them into clean TIFF/OME-TIFF. *(default)*
 - **Downsample** — WSIs are heavy. Normalize 40x scans to 20x and save storage by ~75%. `--scale 20x`
