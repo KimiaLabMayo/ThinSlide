@@ -2,9 +2,7 @@
 
 **Whole-slide image (WSI) optimization — toward sustainable digital pathology.**
 
-Tools for storage optimization, format conversion, and color standardization.
-
-- **Convert** — WSIs are fragmented. Consolidate them into clean TIFF/OME-TIFF. *(default)*
+- **Convert** — WSIs are fragmented. Consolidate them into clean TIFF/OME-TIFF.
 - **Downsample** — WSIs are heavy. Normalize 40x scans to 20x and save storage by ~75%. `--scale 20x`
 - **Standardize** — Colors are not portable. Bake ICC profiles into the pixels. `--icc-bake`
 
@@ -28,7 +26,7 @@ source's original compression, and is readable by [OpenSlide](https://openslide.
   
 ² Skipped unless combined with `--scale` or `--icc-bake`.
 
-## Desktop app (no command line)
+## Desktop app (no command)
 
 If you'd rather not use the terminal, **`thinslide-gui`** does the same thing in a window.
 
@@ -147,7 +145,8 @@ and in part ported from, the following open-source projects:
 ## License
 
 Copyright (C) 2026 Wataru Uegami, MD, PhD
-thinslide is licensed under the GNU General Public License v2.0 or later (GPL-2.0-or-later).
+
+ThinSlide is licensed under the GNU General Public License v2.0 or later (GPL-2.0-or-later).
 
 
 ## Disclaimer
