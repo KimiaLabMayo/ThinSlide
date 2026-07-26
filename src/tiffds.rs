@@ -158,23 +158,18 @@ pub(crate) fn process_files(
     if paths.is_empty() { return; }
 
     let bar_style = ProgressStyle::with_template(
-        "  {spinner:.green} [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} tiles  {msg}"
+        "  {msg}  [{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} tiles"
     ).unwrap().progress_chars("=>-");
 
     let total_files = paths.len();
     let skipped = AtomicUsize::new(0);
-    let file_bar = mp.add(ProgressBar::new(total_files as u64));
-    file_bar.set_style(
-        ProgressStyle::with_template(
-            "  [{elapsed_precise}] {bar:40.green/black} {pos}/{len} TIFF/SVS"
-        ).unwrap().progress_chars("=>-")
-    );
 
     for (i, path) in paths.iter().enumerate() {
         let idx = i + 1;
         let src_path = path.to_string_lossy().to_string();
         let src_name = path.file_name().unwrap_or_default()
             .to_string_lossy().to_string();
+        let pb_msg = format!("({}/{}) {}", idx, total_files, src_name);
         let raw_stem = path.file_stem().unwrap_or_default().to_string_lossy();
         // Strip ".ome" suffix so foo.ome.tiff → stem "foo", output "foo.ome.tiff"
         let src_stem = if raw_stem.ends_with(".ome") {
@@ -196,13 +191,12 @@ pub(crate) fn process_files(
             skipped.fetch_add(1, Ordering::Relaxed);
             stats.skipped.fetch_add(1, Ordering::Relaxed);
             logger.log_skip(idx, &src_name);
-            file_bar.inc(1);
             continue;
         }
 
         let pb = mp.add(ProgressBar::new(0));
         pb.set_style(bar_style.clone());
-        pb.set_message(src_name.clone());
+        pb.set_message(pb_msg.clone());
 
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             process_file(&src_path, &args.output_dir, &src_stem, args, &pb);
@@ -213,7 +207,6 @@ pub(crate) fn process_files(
             stats.fail.fetch_add(1, Ordering::Relaxed);
             logger.log_fail(idx, &src_name, &format!("panic: {}", msg));
             pb.finish_and_clear();
-            file_bar.inc(1);
             continue;
         }
 
@@ -227,16 +220,17 @@ pub(crate) fn process_files(
             stats.ok.fetch_add(1, Ordering::Relaxed);
             stats.in_bytes.fetch_add(in_b, Ordering::Relaxed);
             stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
+            pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+            pb.finish_with_message(format!(
+                "{}  {} \u{2192} {}",
+                pb_msg, crate::format_mb(in_b), crate::format_mb(out_b)
+            ));
         } else {
             stats.fail.fetch_add(1, Ordering::Relaxed);
             logger.log_fail(idx, &src_name, "no output produced");
+            pb.finish_and_clear();
         }
-
-        pb.finish_and_clear();
-        file_bar.inc(1);
     }
-
-    file_bar.finish_and_clear();
 
     let sk = skipped.load(Ordering::Relaxed);
     if sk > 0 {

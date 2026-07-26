@@ -67,7 +67,7 @@ thinslide /data/slides /data/output --scale 20x --icc-bake --quality 90 -j 4
 
 ### Installation
 
-Prebuilt binaries are attached to every [release](https://github.com/uegamiw/thinslide/releases/latest).
+Prebuilt binaries are attached to every [release](https://github.com/KimiaLabMayo/ThinSlide/releases/latest).
 Download the one for your platform, make it executable, and put it on your `PATH`:
 
 | Platform | Asset | Includes GUI | Dependencies |
@@ -78,7 +78,7 @@ Download the one for your platform, make it executable, and put it on your `PATH
 
 ```sh
 # Linux / macOS
-curl -L -o thinslide https://github.com/uegamiw/thinslide/releases/latest/download/thinslide-linux-x86_64-musl
+curl -L -o thinslide https://github.com/KimiaLabMayo/ThinSlide/releases/latest/download/thinslide-linux-x86_64-musl
 chmod +x thinslide
 sudo mv thinslide /usr/local/bin/
 ```
