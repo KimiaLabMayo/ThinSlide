@@ -38,6 +38,12 @@ If you'd rather not use the terminal, **`thinslide-gui`** does the same thing in
 
 ![ThinSlide GUI screenshot](assets/gui_screenshot.png)
 
+> **macOS security warning?** Since ThinSlide isn't notarized by Apple, macOS may
+> block it on first launch ("cannot be opened because the developer cannot be
+> verified"). Go to **System Settings > Privacy & Security**, scroll down to the
+> message about ThinSlide, and click **Open Anyway**. Confirm in the dialog that
+> follows, then launch ThinSlide again.
+
 ## Command line
 
 ```sh
