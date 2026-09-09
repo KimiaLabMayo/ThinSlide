@@ -2,6 +2,7 @@ pub(crate) mod icc;
 pub(crate) mod encode;
 pub(crate) mod writer;
 pub(crate) mod ome;
+pub(crate) mod jpegtables_ext;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex, Condvar};

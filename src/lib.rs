@@ -21,6 +21,7 @@ pub(crate) use pipeline::writer::set_tiff_ifd_tags;
 // Public API
 pub use pipeline::ome::xml_escape;
 pub use pipeline::run;
+pub use pipeline::jpegtables_ext::ensure_jpegtables_tag_registered;
 
 mod tiffds;
 

@@ -1,7 +1,8 @@
 use clap::Parser;
-use thinslide::{Args, run};
+use thinslide::{Args, run, ensure_jpegtables_tag_registered};
 
 fn main() {
+    ensure_jpegtables_tag_registered();
     let start_time = std::time::Instant::now();
 
     let args = Args::parse();

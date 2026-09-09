@@ -1,7 +1,7 @@
 use clap::Parser;
 use eframe::egui;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use thinslide::{Args, run};
+use thinslide::{Args, run, ensure_jpegtables_tag_registered};
 use std::{io::Read, path::PathBuf, sync::{Arc, Mutex, mpsc}, thread};
 
 // ---------- VT100 terminal buffer -------------------------------------------
@@ -453,6 +453,7 @@ impl App {
 // ---------- main ------------------------------------------------------------
 
 fn main() -> eframe::Result<()> {
+    ensure_jpegtables_tag_registered();
     let raw: Vec<String> = std::env::args().collect();
     // Positional args present → CLI mode (no GUI window)
     if raw[1..].iter().any(|a| !a.starts_with('-')) {
