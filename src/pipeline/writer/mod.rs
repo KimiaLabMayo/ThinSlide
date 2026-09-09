@@ -18,7 +18,7 @@ use crate::bindings::{
     TIFFTAG_SAMPLEFORMAT, TIFFTAG_PLANARCONFIG, TIFFTAG_ORIENTATION,
     TIFFTAG_RESOLUTIONUNIT, TIFFTAG_XRESOLUTION, TIFFTAG_YRESOLUTION,
     SAMPLEFORMAT_UINT, PLANARCONFIG_CONTIG, ORIENTATION_TOPLEFT,
-    RESUNIT_CENTIMETER,
+    RESUNIT_CENTIMETER, TIFFTAG_JPEGTABLES,
 };
 use std::sync::Arc;
 use indicatif::ProgressBar;
@@ -56,6 +56,18 @@ pub(crate) unsafe fn set_tiff_ifd_tags(
         TIFFSetField(tiff, TIFFTAG_YRESOLUTION as u32,   1e4 / mpp_y);
     }
 }}
+
+/// Register the shared JPEG quantization/Huffman tables for the current IFD.
+/// Every raw tile written afterwards under Compression=7 relies on this tag
+/// being present in the file, since tiles are stripped of their own tables —
+/// a silent libtiff failure here would leave those tiles undecodable.
+pub(crate) fn set_jpeg_tables(tiff: *mut TIFF, tables: &[u8]) {
+    let ok = unsafe {
+        TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
+            tables.len() as u32, tables.as_ptr() as *const std::os::raw::c_void)
+    };
+    assert!(ok == 1, "TIFFSetField(JPEGTABLES) failed — output tiles would be undecodable");
+}
 
 fn pixel_fragments(dcm: &dicom::object::DefaultDicomObject) -> &[Vec<u8>] {
     dcm.element_by_name("PixelData")

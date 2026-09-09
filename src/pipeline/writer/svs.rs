@@ -13,7 +13,7 @@ use crate::bindings::{
     TIFFTAG_COMPRESSION, TIFFTAG_PHOTOMETRIC, TIFFTAG_SAMPLESPERPIXEL,
     TIFFTAG_BITSPERSAMPLE, TIFFTAG_PLANARCONFIG,
     PHOTOMETRIC_RGB, PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK,
-    TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_ICCPROFILE, TIFFTAG_JPEGTABLES,
+    TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_ICCPROFILE,
     PLANARCONFIG_CONTIG, TIFFTAG_ROWSPERSTRIP,
     FILETYPE_REDUCEDIMAGE,
 };
@@ -103,8 +103,7 @@ unsafe fn write_svs_tiled_level(
             let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
                 match registered_tables {
                     None => {
-                        TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                            tables.len() as u32, tables.as_ptr());
+                        super::set_jpeg_tables(tiff, tables);
                         registered_tables = Some(tables.clone());
                         tile_data.as_slice()
                     }
@@ -129,8 +128,7 @@ unsafe fn write_svs_tiled_level(
             let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
                 match registered_tables {
                     None => {
-                        TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                            tables.len() as u32, tables.as_ptr());
+                        super::set_jpeg_tables(tiff, tables);
                         registered_tables = Some(tables.clone());
                         tile_data.as_slice()
                     }

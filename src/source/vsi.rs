@@ -28,7 +28,7 @@ use std::os::raw::c_void;
 
 use crate::bindings::{
     TIFF, TIFFOpen, TIFFClose, TIFFSetField, TIFFWriteDirectory, TIFFWriteRawTile,
-    TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_SUBIFD, TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_JPEGTABLES,
+    TIFFTAG_IMAGEDESCRIPTION, TIFFTAG_SUBIFD, TIFFTAG_YCBCRSUBSAMPLING,
     PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK, COMPRESSION_JPEG, FILETYPE_REDUCEDIMAGE,
 };
 use crate::{set_tiff_ifd_tags, write_enc_chunk, split_jpeg_to_tables_and_tile, vlog};
@@ -450,7 +450,7 @@ unsafe fn write_jpeg_tile(dst: *mut TIFF, id: u32, jpeg: &[u8], registered: &mut
     let write_bytes: &[u8] = match &split {
         Some((tables, tile_data)) => {
             if registered.is_none() {
-                unsafe { TIFFSetField(dst, TIFFTAG_JPEGTABLES as u32, tables.len() as u32, tables.as_ptr()); }
+                crate::pipeline::writer::set_jpeg_tables(dst, tables);
                 *registered = Some(tables.clone());
                 tile_data
             } else if registered.as_ref() == Some(tables) {

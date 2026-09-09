@@ -3,7 +3,7 @@ use image::imageops::FilterType;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "thinslide", about = "Whole Slide Image Optimizer")]
+#[command(name = "thinslide", about = "Whole Slide Image Optimizer", version)]
 pub struct Args {
     /// Input directory containing DICOM/VSI/MRXS files, or a direct path to a
     /// single TIFF/SVS file (must exist)

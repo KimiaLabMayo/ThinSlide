@@ -3,7 +3,7 @@ use std::sync::mpsc;
 use rayon::prelude::*;
 use fast_image_resize as fir;
 
-use crate::bindings::{TIFF, TIFFSetField, TIFFWriteRawTile, TIFFTAG_JPEGTABLES};
+use crate::bindings::{TIFF, TIFFWriteRawTile};
 use super::icc::{IccTransform, apply_icc};
 
 /// Assemble a pixel buffer from decoded JP2K components with nearest-neighbor chroma upsampling.
@@ -199,10 +199,7 @@ pub(crate) unsafe fn write_enc_chunk(
         let split = split_jpeg_to_tables_and_tile(jpeg);
         if !*jpegtables_registered {
             if let Some((ref tables, _)) = split {
-                unsafe {
-                    TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                        tables.len() as u32, tables.as_ptr());
-                }
+                super::writer::set_jpeg_tables(tiff, tables);
                 *jpegtables_registered = true;
             }
         }
