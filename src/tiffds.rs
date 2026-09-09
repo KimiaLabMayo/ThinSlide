@@ -983,7 +983,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                     &mut tlen as *mut u32,
                     &mut tptr as *mut *const u8) };
                 if ok != 0 && !tptr.is_null() && tlen > 2 {
-                    unsafe { TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES, tlen, tptr); }
+                    let set_ok = unsafe { TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES, tlen, tptr) };
+                    assert!(set_ok == 1, "TIFFSetField(JPEGTABLES) failed — output tiles would be undecodable");
                 }
             }
         } else if out_photometric == PHOTOMETRIC_YCBCR {

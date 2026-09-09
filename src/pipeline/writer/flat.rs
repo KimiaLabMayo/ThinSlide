@@ -1,6 +1,6 @@
 use crate::bindings::{
     TIFFOpen, TIFFSetField, TIFFWriteRawTile, TIFFWriteDirectory, TIFFClose,
-    TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_ICCPROFILE, TIFFTAG_JPEGTABLES,
+    TIFFTAG_YCBCRSUBSAMPLING, TIFFTAG_ICCPROFILE,
     PHOTOMETRIC_RGB, PHOTOMETRIC_YCBCR, PHOTOMETRIC_MINISBLACK,
     FILETYPE_REDUCEDIMAGE,
 };
@@ -172,8 +172,7 @@ pub(crate) fn write_flat_multipage_tiff(
                     let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
                         match registered_tables {
                             None => {
-                                unsafe { TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                    tables.len() as u32, tables.as_ptr()); }
+                                super::set_jpeg_tables(tiff, tables);
                                 registered_tables = Some(tables.clone());
                                 tile_data.as_slice()
                             }
@@ -197,8 +196,7 @@ pub(crate) fn write_flat_multipage_tiff(
                     let write_bytes: &[u8] = if let Some((ref tables, ref tile_data)) = split {
                         match registered_tables {
                             None => {
-                                unsafe { TIFFSetField(tiff, TIFFTAG_JPEGTABLES as u32,
-                                    tables.len() as u32, tables.as_ptr()); }
+                                super::set_jpeg_tables(tiff, tables);
                                 registered_tables = Some(tables.clone());
                                 tile_data.as_slice()
                             }
