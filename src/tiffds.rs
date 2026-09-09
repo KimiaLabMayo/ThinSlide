@@ -433,13 +433,7 @@ fn process_file_icc_bake_only(
             src_is_jp2k && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
 
         let jpeg_tables_arc: Option<Arc<Vec<u8>>> = if src_is_jpeg {
-            let mut tlen: u32 = 0;
-            let mut tptr: *const u8 = std::ptr::null();
-            let ok = unsafe { TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
-                &mut tlen as *mut u32, &mut tptr as *mut *const u8) };
-            if ok != 0 && !tptr.is_null() && tlen > 2 {
-                Some(Arc::new(unsafe { std::slice::from_raw_parts(tptr, tlen as usize) }.to_vec()))
-            } else { None }
+            crate::pipeline::jpegtables_ext::get_jpeg_tables(src_tiff, src_path).map(Arc::new)
         } else { None };
 
         let raw_buf_size = (unsafe { TIFFTileSize(src_tiff) } as usize)
@@ -977,13 +971,9 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                     src_subsamp_h as u32, src_subsamp_v as u32); }
             }
             if src_lv.compression as u32 == COMPRESSION_JPEG {
-                let mut tlen: u32 = 0;
-                let mut tptr: *const u8 = std::ptr::null();
-                let ok = unsafe { TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
-                    &mut tlen as *mut u32,
-                    &mut tptr as *mut *const u8) };
-                if ok != 0 && !tptr.is_null() && tlen > 2 {
-                    let set_ok = unsafe { TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES, tlen, tptr) };
+                if let Some(tables) = crate::pipeline::jpegtables_ext::get_jpeg_tables(src_tiff, src_path) {
+                    let set_ok = unsafe { TIFFSetField(dst_tiff, TIFFTAG_JPEGTABLES,
+                        tables.len() as u32, tables.as_ptr()) };
                     assert!(set_ok == 1, "TIFFSetField(JPEGTABLES) failed — output tiles would be undecodable");
                 }
             }
@@ -1033,16 +1023,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         };
 
         let jpeg_tables_arc: Option<Arc<Vec<u8>>> = if src_is_jpeg && !lv_out.passthrough {
-            let mut tlen: u32 = 0;
-            let mut tptr: *const u8 = std::ptr::null();
-            let ok = unsafe { TIFFGetField(src_tiff, TIFFTAG_JPEGTABLES,
-                &mut tlen as *mut u32,
-                &mut tptr as *mut *const u8) };
-            if ok != 0 && !tptr.is_null() && tlen > 2 {
-                Some(Arc::new(unsafe { std::slice::from_raw_parts(tptr, tlen as usize) }.to_vec()))
-            } else {
-                None
-            }
+            crate::pipeline::jpegtables_ext::get_jpeg_tables(src_tiff, src_path).map(Arc::new)
         } else {
             None
         };
