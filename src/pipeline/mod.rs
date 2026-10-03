@@ -375,6 +375,14 @@ pub fn run(args: Args) {
         eprintln!("[warn] --kernel is ignored with --scale 20x/half/quarter: decode-side downsampling skips the resize step");
     }
 
+    if let Some(ref r) = args.roi {
+        if Path::new(r).is_file() && Path::new(&args.input_dir).is_dir() {
+            eprintln!("[error] --roi <file.geojson> requires a single slide file as input; \
+                pass a directory of <name>.geojson files for directory input");
+            std::process::exit(2);
+        }
+    }
+
     if args.verbose {
         eprintln!("[src] {}", args.input_dir);
         eprintln!("[out] {}", args.output_dir);
@@ -455,6 +463,10 @@ pub fn run(args: Args) {
         .collect();
     dir_groups.sort_by(|a, b| a[0].cmp(&b[0]));
     let total_files = total_file_count as u64;
+
+    if args.roi.is_some() && (!dir_groups.is_empty() || !vsi_paths.is_empty() || !mrxs_paths.is_empty()) {
+        eprintln!("[warn] --roi is applied to TIFF/SVS input only; DICOM/VSI/MRXS slides are converted in full");
+    }
 
     if args.verbose {
         eprintln!("Found {} DICOM files in {} directories", total_files, dir_groups.len());
@@ -540,11 +552,11 @@ pub fn run(args: Args) {
     scanner.join().unwrap();
 
     if !tiff_paths.is_empty() {
-        if args.mpp().is_some() || args.mag_20x() || args.half() || args.quarter() || args.icc_bake {
+        if args.mpp().is_some() || args.mag_20x() || args.half() || args.quarter() || args.icc_bake || args.roi.is_some() {
             tiff_paths.sort();
             tiffds::process_files(&tiff_paths, &args, &mp, &logger, &stats);
         } else {
-            eprintln!("  {} TIFF/SVS file(s) found; specify --scale or --icc-bake to process them.",
+            eprintln!("  {} TIFF/SVS file(s) found; specify --scale, --icc-bake or --roi to process them.",
                 tiff_paths.len());
         }
     }

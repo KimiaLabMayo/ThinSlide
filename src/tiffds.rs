@@ -67,9 +67,14 @@ struct EncodeParams {
     decode_shift:      u32,
     jpeg_tables:       Option<Arc<Vec<u8>>>,
     icc_transform:     Option<Arc<crate::IccTransform>>,
+    // --roi: (per-output-tile "touches an annotation" flags, pre-encoded white tile)
+    roi_fill:          Option<(Vec<bool>, Vec<u8>)>,
 }
 
 fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u32, Vec<u8>)> {
+    if let Some((in_roi, white)) = &p.roi_fill {
+        if !in_roi[out_id as usize] { return Some((out_id, white.clone())); }
+    }
     let ch = p.spp as usize;
     const APP14_ADOBE_RGB: [u8; 16] = [
         0xFF, 0xEE, 0x00, 0x0E,
@@ -198,9 +203,22 @@ pub(crate) fn process_files(
         pb.set_style(bar_style.clone());
         pb.set_message(pb_msg.clone());
 
+        let roi = match args.roi.as_deref().map(|r| crate::roi::Roi::resolve(r, &src_stem)).transpose() {
+            Ok(r) => r.flatten(),
+            Err(e) => {
+                stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &src_name, &format!("--roi: {}", e));
+                pb.finish_and_clear();
+                continue;
+            }
+        };
+        if args.roi.is_some() && roi.is_none() && args.verbose {
+            vlog(Some(&pb), format!("  [roi  ] no {src_stem}.geojson; converting the whole slide"));
+        }
+
         let file_start = std::time::Instant::now();
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            process_file(&src_path, &args.output_dir, &src_stem, args, &pb)
+            process_file(&src_path, &args.output_dir, &src_stem, args, &pb, roi.as_ref())
         }));
 
         let (ops, detail) = match panic_result {
@@ -347,6 +365,7 @@ fn process_file_icc_bake_only(
     src_levels: &[TiffLevel],
     ome_xml:    Option<&str>,
     pb:         &ProgressBar,
+    roi:        Option<&crate::roi::Roi>,
 ) {
     let out_path = if args.openslide {
         format!("{out_dir}/{out_stem}.tiff")
@@ -442,6 +461,16 @@ fn process_file_icc_bake_only(
         let pix_size = src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize;
         let tile_ids: Vec<u32> = (0..src_lv.n_tiles).collect();
 
+        // --roi: (per-tile flags, white tile) for tiles outside the annotations.
+        let roi_fill: Option<Arc<(Vec<bool>, Vec<u8>)>> = roi.map(|r| {
+            let grid = (src_lv.img_w.div_ceil(src_lv.tile_w), src_lv.img_h.div_ceil(src_lv.tile_h));
+            let mask = r.tile_mask(grid, (src_lv.tile_w, src_lv.tile_h),
+                (src_lv.img_w, src_lv.img_h), (base.img_w, base.img_h));
+            Arc::new((mask, crate::pipeline::encode::white_jpeg_tile(
+                out_tile_w, out_tile_h, out_spp, false, (2, 2), args.quality)))
+        });
+        let in_roi = |id: u32| roi_fill.as_ref().map_or(true, |f| f.0.get(id as usize).copied().unwrap_or(true));
+
         type BakeTile = (u32, Option<(Vec<u8>, bool, bool)>);
 
         let (raw_tx, raw_rx) = mpsc::sync_channel::<Vec<BakeTile>>(2);
@@ -454,11 +483,15 @@ fn process_file_icc_bake_only(
         let src_tile_w     = src_lv.tile_w;
         let src_tile_h     = src_lv.tile_h;
         let src_photometric = src_lv.photometric as u32;
+        let roi_fill_t     = roi_fill.clone();
 
         let compute_handle = std::thread::spawn(move || {
             for raw_chunk in raw_rx {
                 let mut encoded: EncChunk = raw_chunk.par_iter()
                     .filter_map(|(id, tile_opt)| {
+                        if let Some(f) = &roi_fill_t {
+                            if !f.0.get(*id as usize).copied().unwrap_or(true) { return Some((*id, f.1.clone())); }
+                        }
                         let (data, is_raw_jpeg, is_jp2k_tile) = tile_opt.as_ref()?;
                         let jpeg = bake_single_tile(
                             data, *is_raw_jpeg, *is_jp2k_tile, src_jp2k_is_ycbcr,
@@ -481,7 +514,9 @@ fn process_file_icc_bake_only(
         for chunk in tile_ids.chunks(chunk_size) {
             let raw_chunk: Vec<BakeTile> = chunk.iter()
                 .map(|&tile_num| {
-                    if src_is_jp2k || src_is_jpeg {
+                    if !in_roi(tile_num) {
+                        (tile_num, None)
+                    } else if src_is_jp2k || src_is_jpeg {
                         let mut buf = vec![0u8; raw_buf_size];
                         let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
                             buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
@@ -544,6 +579,8 @@ fn write_jp2k_svs_from_tiff(
     dst_path: &str,
     verbose: bool,
     pb: &ProgressBar,
+    roi: Option<&crate::roi::Roi>,
+    base_dim: (u32, u32),
 ) {
     if levels.is_empty() { return; }
     let base = &levels[0];
@@ -601,8 +638,25 @@ fn write_jp2k_svs_from_tiff(
                 idx, lv.img_w, lv.img_h, lv.mpp_x, lv.tile_w, lv.tile_h, lv.n_tiles));
         }
 
+        // --roi: tiles outside the annotations get a white JP2K tile instead of a raw copy.
+        let roi_fill = roi.map(|r| {
+            let grid = (lv.img_w.div_ceil(lv.tile_w), lv.img_h.div_ceil(lv.tile_h));
+            let mask = r.tile_mask(grid, (lv.tile_w, lv.tile_h), (lv.img_w, lv.img_h), base_dim);
+            let white = crate::pipeline::encode::white_jp2k_tile(lv.tile_w, lv.tile_h, lv.spp as u32,
+                aperio_compr == COMPRESSION_APERIO_JP2_YCBCR).expect("white JP2K tile encode failed");
+            (mask, white)
+        });
+
         let raw_buf_size = (unsafe { TIFFTileSize(src_tiff) } as usize).max(1 << 17);
         for tile_num in 0..lv.n_tiles {
+            if let Some((mask, white)) = &roi_fill {
+                if !mask.get(tile_num as usize).copied().unwrap_or(true) {
+                    unsafe { TIFFWriteRawTile(dst_tiff, tile_num,
+                        white.as_ptr() as *mut c_void, white.len() as i64); }
+                    pb.inc(1);
+                    continue;
+                }
+            }
             let mut buf = vec![0u8; raw_buf_size];
             let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
                 buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
@@ -648,7 +702,8 @@ fn passthrough_detail(src_path: &str, out_path: &str, lv: &TiffLevel) -> crate::
     }
 }
 
-fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Args, pb: &ProgressBar) -> (Vec<String>, crate::logger::ConversionDetail) {
+fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Args, pb: &ProgressBar,
+                roi: Option<&crate::roi::Roi>) -> (Vec<String>, crate::logger::ConversionDetail) {
     let Some(src) = TiffSource::open(src_path) else {
         eprintln!("  [error] Cannot open: {src_path}");
         return (Vec::new(), Default::default());
@@ -693,8 +748,9 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         1
     };
 
-    // --scale 20x at native 20x, no color conversion requested: copy through as-is.
-    if args.mag_20x() && mag_factor == 1 && !args.icc_bake {
+    // --scale 20x at native 20x (or no --scale, i.e. a --roi directory without a
+    // matching GeoJSON), no color conversion requested: copy through as-is.
+    if (args.scale.is_none() || (args.mag_20x() && mag_factor == 1)) && !args.icc_bake && roi.is_none() {
         let src_name = Path::new(src_path).file_name()
             .unwrap_or_default().to_string_lossy().to_string();
         let dst = std::path::PathBuf::from(out_dir).join(&src_name);
@@ -717,19 +773,24 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             if args.verbose {
                 vlog(Some(pb), format!("  [icc  ] baking {} bytes → sRGB", icc.len()));
             }
-            process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb);
+            process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb, roi);
         } else {
             eprintln!("  [error] Invalid ICC profile in {src_path}; skipping.");
         }
         let detail = passthrough_detail(src_path, &out_path, &src_levels[0]);
-        return (vec!["ICC".to_string()], detail);
+        let mut ops = vec!["ICC".to_string()];
+        if roi.is_some() { ops.push("ROI".to_string()); }
+        return (ops, detail);
     }
+
+    // Reaching here without --scale means --roi crop at full resolution.
+    let crop = args.scale.is_none();
 
     // --scale half/quarter with unknown source MPP: derive a synthetic 1.0 µm/px
     // base so downstream MPP-based level selection still works, but remember
     // to blank the resolution tags on output (see mpp_unknown below).
     let mpp_unknown = src_levels[0].mpp_x <= 0.0;
-    if (args.half() || args.quarter()) && mpp_unknown {
+    if (args.half() || args.quarter() || crop) && mpp_unknown {
         let bw = src_levels[0].img_w as f64;
         let bh = src_levels[0].img_h as f64;
         src_levels[0].mpp_x = 1.0;
@@ -772,7 +833,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                         format!("{out_dir}/{out_stem}.ome.tiff")
                     };
                     if let Some(xform) = crate::build_icc_transform(icc) {
-                        process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb);
+                        process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb, roi);
                         let detail = passthrough_detail(src_path, &out_path, &src_levels[0]);
                         return (vec!["ICC".to_string()], detail);
                     } else {
@@ -785,7 +846,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     }
 
     let decode_shift: u32 = if args.mag_20x() || args.half() || args.quarter() { mag_factor.trailing_zeros() } else { 0 };
-    let target_mpp = if args.mag_20x() || args.half() || args.quarter() { base.mpp_x * mag_factor as f64 } else { args.mpp().unwrap() };
+    let target_mpp = if args.mag_20x() || args.half() || args.quarter() || crop { base.mpp_x * mag_factor as f64 } else { args.mpp().unwrap() };
     let jp2k_svs_skip: Option<usize> = if !args.icc_bake && is_jp2k(base.compression as u32) {
         let skip = src_levels.iter()
             .take_while(|lv| lv.mpp_x < target_mpp * 0.9)
@@ -793,7 +854,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         let has_match = src_levels.get(skip)
             .map(|lv| (lv.mpp_x - target_mpp).abs() / target_mpp < 0.1)
             .unwrap_or(false);
-        if skip > 0 && has_match { Some(skip) } else { None }
+        // With --roi a 1:1 match (skip == 0) is also raw-copied, with white fill.
+        if (skip > 0 || roi.is_some()) && has_match { Some(skip) } else { None }
     } else {
         None
     };
@@ -818,9 +880,11 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         ops.push(format!("mpp {:.4} downsample", target_mpp));
     }
     if args.icc_bake { ops.push("ICC".to_string()); }
+    if roi.is_some() { ops.push("ROI".to_string()); }
 
     if let Some(skip) = jp2k_svs_skip {
-        write_jp2k_svs_from_tiff(src_path, &src_levels[skip..], &tmp_path, args.verbose, pb);
+        write_jp2k_svs_from_tiff(src_path, &src_levels[skip..], &tmp_path, args.verbose, pb,
+            roi, (src_levels[0].img_w, src_levels[0].img_h));
         std::fs::rename(&tmp_path, &out_path)
             .expect("Failed to rename tmp to output");
         let detail = crate::logger::ConversionDetail {
@@ -1029,9 +1093,24 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         };
 
         if lv_out.passthrough {
+            // --roi: tiles outside the annotations get a white tile matching the
+            // source's photometric/subsampling instead of a raw copy.
+            let roi_fill = roi.map(|r| {
+                let grid = (src_lv.img_w.div_ceil(src_lv.tile_w), src_lv.img_h.div_ceil(src_lv.tile_h));
+                let mask = r.tile_mask(grid, (src_lv.tile_w, src_lv.tile_h),
+                    (src_lv.img_w, src_lv.img_h), (src_levels[0].img_w, src_levels[0].img_h));
+                let white = crate::pipeline::encode::white_jpeg_tile(src_lv.tile_w, src_lv.tile_h, out_spp,
+                    src_lv.photometric as u32 == PHOTOMETRIC_RGB, (src_subsamp_h, src_subsamp_v), args.quality);
+                (mask, white)
+            });
             for chunk in tile_ids.chunks(chunk_size) {
                 let raw_chunk: Vec<(u32, Vec<u8>)> = chunk.iter()
                     .map(|&tile_num| {
+                        if let Some((mask, white)) = &roi_fill {
+                            if !mask.get(tile_num as usize).copied().unwrap_or(true) {
+                                return (tile_num, white.clone());
+                            }
+                        }
                         let mut buf = vec![0u8; raw_buf_size];
                         let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
                             buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
@@ -1058,6 +1137,18 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             let out_nty = (lv_out.out_img_h + out_tile_h - 1) / out_tile_h;
             let out_tile_ids: Vec<u32> = (0..out_ntx * out_nty).collect();
 
+            // An output tile is built from the 2x2 source tiles below, so its
+            // footprint is a (2*tile_w x 2*tile_h) cell on the source level.
+            let roi_fill = roi.map(|r| {
+                let in_roi = r.tile_mask((out_ntx, out_nty), (2 * src_tile_w, 2 * src_tile_h),
+                    (src_lv.img_w, src_lv.img_h), (src_levels[0].img_w, src_levels[0].img_h));
+                if args.verbose {
+                    vlog(Some(pb), format!("  [roi  ] lv{}  {}/{} tiles inside annotations",
+                        lv_idx, in_roi.iter().filter(|&&b| b).count(), in_roi.len()));
+                }
+                (in_roi, crate::pipeline::encode::white_jpeg_tile(out_tile_w, out_tile_h, out_spp, false, (2, 2), args.quality))
+            });
+
             let enc_params = Arc::new(EncodeParams {
                 quality:           args.quality,
                 src_tile_w,
@@ -1074,6 +1165,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                 decode_shift,
                 jpeg_tables:       jpeg_tables_arc.clone(),
                 icc_transform:     icc_transform_arc.clone(),
+                roi_fill,
             });
 
             let (raw_tx, raw_rx) = mpsc::sync_channel::<RawChunk>(2);
@@ -1092,6 +1184,10 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                         let oc  = out_id % out_ntx;
                         let or_ = out_id / out_ntx;
                         let mut quads: RawQuad = [None, None, None, None];
+                        // Outside --roi: skip source reads; encode_one_tile emits white.
+                        if enc_params.roi_fill.as_ref().is_some_and(|(m, _)| !m[out_id as usize]) {
+                            return (out_id, quads);
+                        }
                         for qi in 0..4usize {
                             let dc = (qi % 2) as u32;
                             let dr = (qi / 2) as u32;

@@ -104,6 +104,119 @@ pub fn split_jpeg_to_tables_and_tile(jpeg: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> 
     Some((tables, tile))
 }
 
+// ─── White fill tiles for --roi ──────────────────────────────────────────────
+
+/// Uniform white JPEG tile used for tiles outside --roi.
+/// Component values are written directly (YCbCr 255/128/128, or 255/255/255 for an
+/// RGB-photometric destination, flagged with an Adobe APP14 marker), so the tile can
+/// sit in a raw-copied level. DQT/DHT stay inside the stream so it decodes regardless
+/// of the level's JPEGTABLES. `subsamp` is the TIFF YCbCrSubSampling (h, v).
+pub(crate) fn white_jpeg_tile(w: u32, h: u32, spp: u32, rgb: bool, subsamp: (u16, u16), quality: u8) -> Vec<u8> {
+    const APP14_ADOBE_RGB: [u8; 16] = [
+        0xFF, 0xEE, 0x00, 0x0E,
+        b'A', b'd', b'o', b'b', b'e',
+        0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let (w, h) = (w as usize, h as usize);
+    let jpeg = if spp == 1 {
+        turbojpeg::compress(turbojpeg::Image::<&[u8]> {
+            pixels: &vec![255u8; w * h], width: w, pitch: w, height: h,
+            format: turbojpeg::PixelFormat::GRAY,
+        }, quality as i32, turbojpeg::Subsamp::Gray)
+    } else {
+        let (sub, sh, sv) = match (rgb, subsamp) {
+            (true, _) | (false, (1, 1)) => (turbojpeg::Subsamp::None, 1, 1),
+            (false, (2, 1))             => (turbojpeg::Subsamp::Sub2x1, 2, 1),
+            _                           => (turbojpeg::Subsamp::Sub2x2, 2, 2),
+        };
+        let (cw, ch) = (w.div_ceil(sh), h.div_ceil(sv));
+        let chroma = if rgb { 255u8 } else { 128u8 };
+        let y = vec![255u8; w * h];
+        let c = vec![chroma; cw * ch];
+        turbojpeg::compress_yuv_planes(&turbojpeg::YuvPlanesImage::<&[u8]> {
+            y_plane: &y, u_plane: &c, v_plane: &c,
+            width: w, height: h, y_stride: w, u_stride: cw, v_stride: cw, subsamp: sub,
+        }, quality as i32)
+    }.expect("white tile encode failed");
+
+    // Rebuild as SOI [APP14] DQT/DHT SOF.. SOS.. EOI, dropping the JFIF APP0 marker.
+    let (tables, tile) = split_jpeg_to_tables_and_tile(&jpeg).expect("white tile split failed");
+    let mut out = vec![0xFF, 0xD8];
+    if rgb && spp == 3 { out.extend_from_slice(&APP14_ADOBE_RGB); }
+    out.extend_from_slice(&tables[2..tables.len() - 2]);
+    out.extend_from_slice(&tile[2..]);
+    out
+}
+
+/// Uniform white JPEG 2000 codestream (raw J2K, lossless) with `ncomp` full-resolution
+/// components: 255/128/128 for YCbCr sources, 255 in every component otherwise.
+pub(crate) fn white_jp2k_tile(w: u32, h: u32, ncomp: u32, ycbcr: bool) -> Option<Vec<u8>> {
+    use openjp2::openjpeg::*;
+
+    struct MemWriter { buf: Vec<u8>, pos: usize }
+    unsafe extern "C" fn write_fn(src: *mut c_void, n: usize, user: *mut c_void) -> usize {
+        let wr = unsafe { &mut *(user as *mut MemWriter) };
+        let data = unsafe { std::slice::from_raw_parts(src as *const u8, n) };
+        let end = wr.pos + n;
+        if wr.buf.len() < end { wr.buf.resize(end, 0); }
+        wr.buf[wr.pos..end].copy_from_slice(data);
+        wr.pos = end;
+        n
+    }
+    unsafe extern "C" fn skip_fn(n: i64, user: *mut c_void) -> i64 {
+        let wr = unsafe { &mut *(user as *mut MemWriter) };
+        wr.pos = (wr.pos as i64 + n).max(0) as usize;
+        n
+    }
+    unsafe extern "C" fn seek_fn(pos: i64, user: *mut c_void) -> i32 {
+        let wr = unsafe { &mut *(user as *mut MemWriter) };
+        wr.pos = pos.max(0) as usize;
+        1
+    }
+
+    // The DWT needs at least 2^(numresolution-1) pixels per side.
+    let numres = (w.min(h).max(1).ilog2() + 1).min(6) as i32;
+    let mut cmpt: Vec<openjp2::opj_image_comptparm> = (0..ncomp).map(|_| openjp2::opj_image_comptparm {
+        dx: 1, dy: 1, w, h, x0: 0, y0: 0, prec: 8, bpp: 8, sgnd: 0,
+    }).collect();
+
+    unsafe {
+        let image = opj_image_create(ncomp, cmpt.as_mut_ptr(), OPJ_COLOR_SPACE::OPJ_CLRSPC_UNSPECIFIED);
+        if image.is_null() { return None; }
+        (*image).x1 = w;
+        (*image).y1 = h;
+        for i in 0..ncomp as usize {
+            let comp = &mut *(*image).comps.add(i);
+            let v = if ycbcr && i > 0 { 128 } else { 255 };
+            std::slice::from_raw_parts_mut(comp.data, (w * h) as usize).fill(v);
+        }
+
+        let mut params = std::mem::zeroed::<opj_cparameters_t>();
+        opj_set_default_encoder_parameters(&mut params);
+        params.tcp_numlayers = 1;
+        params.tcp_rates[0] = 0.0;
+        params.cp_disto_alloc = 1;
+        params.numresolution = numres;
+        params.tcp_mct = 0;
+
+        let mut wr = MemWriter { buf: Vec::new(), pos: 0 };
+        let codec = opj_create_compress(OPJ_CODEC_FORMAT::OPJ_CODEC_J2K);
+        let stream = opj_stream_create(1 << 16, 0);
+        opj_stream_set_write_function(stream, Some(write_fn));
+        opj_stream_set_skip_function(stream, Some(skip_fn));
+        opj_stream_set_seek_function(stream, Some(seek_fn));
+        opj_stream_set_user_data(stream, &mut wr as *mut MemWriter as *mut c_void, None);
+        let ok = opj_setup_encoder(codec, &mut params, image) == 1
+            && opj_start_compress(codec, image, stream) == 1
+            && opj_encode(codec, stream) == 1
+            && opj_end_compress(codec, stream) == 1;
+        opj_stream_destroy(stream);
+        opj_destroy_codec(codec);
+        opj_image_destroy(image);
+        if ok { Some(wr.buf) } else { None }
+    }
+}
+
 pub(crate) fn compose_and_encode(
     out_id: u32,
     decoded: [Option<(Vec<u8>, u32, u32)>; 4],
@@ -208,6 +321,36 @@ pub(crate) unsafe fn write_enc_chunk(
             TIFFWriteRawTile(tiff, *id,
                 write_bytes.as_ptr() as *mut c_void,
                 write_bytes.len() as i64);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn white_jpeg_tile_decodes_to_white() {
+        for (spp, rgb, sub) in [(3, false, (2, 2)), (3, false, (2, 1)), (3, true, (1, 1)), (1, false, (1, 1))] {
+            let jpeg = white_jpeg_tile(240, 240, spp, rgb, sub, 80);
+            let fmt = if spp == 1 { turbojpeg::PixelFormat::GRAY } else { turbojpeg::PixelFormat::RGB };
+            let img = turbojpeg::decompress(&jpeg, fmt).unwrap();
+            assert_eq!((img.width, img.height), (240, 240));
+            assert!(img.pixels.iter().all(|&v| v >= 254), "spp={spp} rgb={rgb} sub={sub:?}");
+        }
+    }
+
+    #[test]
+    fn white_jp2k_tile_component_values() {
+        for (ycbcr, expect) in [(false, [255, 255, 255]), (true, [255, 128, 128])] {
+            let j2k = white_jp2k_tile(240, 240, 3, ycbcr).unwrap();
+            let img = jpeg2k::Image::from_bytes_with(&j2k, jpeg2k::DecodeParameters::default()).unwrap();
+            let comps = img.components();
+            assert_eq!(comps.len(), 3);
+            for (c, e) in comps.iter().zip(expect) {
+                assert_eq!((c.width(), c.height()), (240, 240));
+                assert!(c.data_u8().all(|v| v == e));
+            }
         }
     }
 }

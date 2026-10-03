@@ -24,7 +24,7 @@ source's original compression, and is readable by [OpenSlide](https://openslide.
 ¹ Experimental reader. 8-bit brightfield only.
   `--scale <number>` is not supported for VSI yet.
   
-² Skipped unless combined with `--scale` or `--icc-bake`.
+² Skipped unless combined with `--scale`, `--icc-bake` or `--roi`.
 
 ## Desktop app (no command)
 
@@ -122,6 +122,27 @@ cargo install thinslide
 thinslide /data/slides /data/output --scale half
 thinslide /data/slides /data/output --scale quarter
 thinslide /data/slides /data/output --scale 0.5 --kernel lanczos3
+```
+
+**`--roi <file.geojson|DIR>`** — keep only the annotated regions (SVS / TIFF input for now).
+Annotations are [QuPath](https://qupath.github.io/) GeoJSON in level-0 pixel coordinates
+(`FeatureCollection`, an array of features, a single feature, or a bare geometry;
+`Polygon` and `MultiPolygon` are used, holes included).
+
+- Processing stays tile-based: every tile an annotation passes through is kept, and every
+  tile completely outside is filled with white. The output is still the full rectangle.
+- Tiles outside the annotations are never read, so conversion is faster and the
+  output smaller.
+- Kept tiles go through the normal pipeline: copied straight through where possible
+  (no quality change), re-encoded only where `--scale` or `--icc-bake` changes the pixels.
+- Without `--scale`, the slide is cropped at full resolution.
+- **`<file.geojson>`** — applies to a single slide file given as the input.
+- **`<DIR>`** — each slide is matched to `<DIR>/<output name>.geojson` (e.g. `CMU-1.svs`
+  → `CMU-1.geojson`). Slides without a match are converted in full.
+
+```sh
+thinslide /data/CMU-1.svs /data/output --roi /data/CMU-1.geojson
+thinslide /data/slides /data/output --roi /data/annotations --scale 20x
 ```
 
 ## PHI handling

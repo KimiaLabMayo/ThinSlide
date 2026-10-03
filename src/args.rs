@@ -56,6 +56,16 @@ pub struct Args {
     /// Override the default log file path (parent directory must exist)
     #[arg(long, value_parser = parse_log_file)]
     pub log_file: Option<String>,
+
+    /// QuPath GeoJSON annotations (level-0 pixel coordinates). Only tiles touching an
+    /// annotation are kept; all other tiles are filled with white. Without --scale the
+    /// slide is cropped at full resolution.
+    ///   <file.geojson>  applied to a single input slide file
+    ///   <directory>     <output name>.geojson is looked up per slide; slides without
+    ///                   a match are converted in full
+    /// Currently applies to TIFF/SVS input only.
+    #[arg(long, value_name = "GEOJSON|DIR", value_parser = parse_roi, verbatim_doc_comment)]
+    pub roi: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -141,6 +151,16 @@ fn parse_log_file(s: &str) -> Result<String, String> {
     let parent = p.parent().unwrap_or(Path::new("."));
     if !parent.as_os_str().is_empty() && !parent.exists() {
         return Err(format!("parent directory '{}' does not exist", parent.display()));
+    }
+    Ok(s.to_string())
+}
+
+fn parse_roi(s: &str) -> Result<String, String> {
+    let p = Path::new(s);
+    if p.is_file() {
+        crate::roi::Roi::load(s)?;
+    } else if !p.is_dir() {
+        return Err(format!("'{}' does not exist", s));
     }
     Ok(s.to_string())
 }

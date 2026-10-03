@@ -10,6 +10,7 @@ pub mod args;
 pub mod logger;
 pub mod pipeline;
 pub mod source;
+pub mod roi;
 pub use args::Args;
 
 // Re-exports required by tiffds.rs (via crate:: paths)

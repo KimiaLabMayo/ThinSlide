@@ -7,5 +7,6 @@
 *.tmp
 CLAUDE*.md
 *.log
+*.geojson
 
 .DS_Store
