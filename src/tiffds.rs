@@ -170,7 +170,7 @@ fn decode_jp2k_tile(data: &[u8], spp: u32, src_jp2k_is_ycbcr: bool, reduce: u32)
 /// pushed in tile-id order. Each output tile is a 4x4 block of input tiles decoded
 /// at 1/4 scale. Input tiles may be TIFF JPEG (abbreviated with `jpeg_tables`),
 /// full JPEG, or a JP2K codestream; missing tiles become white.
-struct Reducer {
+pub(crate) struct Reducer {
     in_cols:     u32,
     out_grid:    (u32, u32),
     tile:        (u32, u32),
@@ -185,7 +185,7 @@ struct Reducer {
 }
 
 impl Reducer {
-    fn new(in_grid: (u32, u32), tile: (u32, u32), spp: u32, quality: u8,
+    pub(crate) fn new(in_grid: (u32, u32), tile: (u32, u32), spp: u32, quality: u8,
            jpeg_tables: Option<Vec<u8>>, rgb_app14: bool, jp2k_ycbcr: bool) -> Reducer {
         Reducer {
             in_cols: in_grid.0,
@@ -197,7 +197,7 @@ impl Reducer {
         }
     }
 
-    fn push(&mut self, id: u32, data: &[u8]) {
+    pub(crate) fn push(&mut self, id: u32, data: &[u8]) {
         while id / self.in_cols >= self.band_row + 4 { self.flush_band(); }
         self.band[(id - self.band_row * self.in_cols) as usize] = Some(data.to_vec());
     }
@@ -252,14 +252,14 @@ impl Reducer {
 }
 
 /// --roi: number of 1/4-step levels below a cropped base of size `dim`.
-fn roi_reduced_levels(dim: (u32, u32)) -> u32 {
+pub(crate) fn roi_reduced_levels(dim: (u32, u32)) -> u32 {
     let mut n = 0;
     while dim.0.max(dim.1).div_ceil(4u32.pow(n + 1)) >= MIN_PYRAMID_SIDE { n += 1; }
     n
 }
 
 /// --roi: tiles per reduced level for a base of `base_grid` tiles.
-fn roi_reduced_tiles(base_grid: (u32, u32), n_levels: u32) -> u64 {
+pub(crate) fn roi_reduced_tiles(base_grid: (u32, u32), n_levels: u32) -> u64 {
     (1..=n_levels).map(|k| {
         let d = 4u32.pow(k);
         base_grid.0.div_ceil(d) as u64 * base_grid.1.div_ceil(d) as u64
@@ -268,7 +268,7 @@ fn roi_reduced_tiles(base_grid: (u32, u32), n_levels: u32) -> u64 {
 
 /// --roi: crop of a level `grid` whose tiles each cover `footprint` pixels of a source
 /// level sized `level`; None (with a warning) if no annotation overlaps the slide.
-fn roi_crop_of(roi: &crate::roi::Roi, grid: (u32, u32), footprint: (u32, u32), level: (u32, u32),
+pub(crate) fn roi_crop_of(roi: &crate::roi::Roi, grid: (u32, u32), footprint: (u32, u32), level: (u32, u32),
                base: (u32, u32), src_path: &str) -> Option<crate::roi::RoiCrop> {
     let crop = crate::roi::RoiCrop::from_mask(&roi.tile_mask(grid, footprint, level, base), grid);
     if crop.is_none() { eprintln!("  [warn ] --roi: no annotation overlaps {src_path}; skipping"); }
@@ -277,14 +277,14 @@ fn roi_crop_of(roi: &crate::roi::Roi, grid: (u32, u32), footprint: (u32, u32), l
 
 /// --roi: writes the 1/4-step levels below the base, one reduced-image IFD each,
 /// starting from the reducer fed with the base tiles.
-unsafe fn write_reduced_levels(
+pub(crate) unsafe fn write_reduced_levels(
     dst_tiff: *mut crate::bindings::TIFF,
     reducer: Reducer,
     base_dim: (u32, u32),
     base_mpp: (f64, f64),
     n_levels: u32,
     verbose: bool,
-    pb: &ProgressBar,
+    pb: Option<&ProgressBar>,
 ) {
     let (tw, th) = reducer.tile;
     let (spp, quality) = (reducer.spp, reducer.quality);
@@ -296,7 +296,7 @@ unsafe fn write_reduced_levels(
         let Some(reducer) = next.take() else { break; };
         let tiles = reducer.finish();
         if verbose {
-            vlog(Some(pb), format!("  [roi  ] lv{}  {}x{}  1/{} of base  tile {}x{}", k, w, h, d, tw, th));
+            vlog(pb, format!("  [roi  ] lv{}  {}x{}  1/{} of base  tile {}x{}", k, w, h, d, tw, th));
         }
         unsafe {
             set_tiff_ifd_tags(dst_tiff, FILETYPE_REDUCEDIMAGE, w, h, tw, th,
@@ -313,7 +313,7 @@ unsafe fn write_reduced_levels(
             write_enc_chunk(dst_tiff, &tiles, &mut jpegtables_registered);
             TIFFWriteDirectory(dst_tiff);
         }
-        pb.inc(tiles.len() as u64);
+        if let Some(p) = pb { p.inc(tiles.len() as u64); }
     }
 }
 
@@ -838,7 +838,7 @@ fn write_jp2k_svs_from_tiff(
 
     if let Some(r) = reducer {
         unsafe { write_reduced_levels(dst_tiff, r, (base_w, base_h),
-            (base.mpp_x, base.mpp_y), roi_levels, verbose, pb); }
+            (base.mpp_x, base.mpp_y), roi_levels, verbose, Some(pb)); }
     }
 
     unsafe { TIFFClose(dst_tiff); }
@@ -1480,7 +1480,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     if let Some(r) = reducer {
         let b = &output_levels[0];
         unsafe { write_reduced_levels(dst_tiff, r, (b.out_img_w, b.out_img_h),
-            (b.actual_mpp_x, b.actual_mpp_y), roi_levels, args.verbose, pb); }
+            (b.actual_mpp_x, b.actual_mpp_y), roi_levels, args.verbose, Some(pb)); }
     }
 
     unsafe { TIFFClose(dst_tiff); }

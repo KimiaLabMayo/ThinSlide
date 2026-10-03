@@ -124,7 +124,7 @@ thinslide /data/slides /data/output --scale quarter
 thinslide /data/slides /data/output --scale 0.5 --kernel lanczos3
 ```
 
-**`--roi <file.geojson|DIR>`** — keep only the annotated regions (SVS / TIFF input for now).
+**`--roi <file.geojson|DIR>`** — keep only the annotated regions (SVS / TIFF, DICOM and VSI input; not MRXS).
 Annotations are [QuPath](https://qupath.github.io/) GeoJSON in level-0 pixel coordinates
 (`FeatureCollection`, an array of features, a single feature, or a bare geometry;
 `Polygon` and `MultiPolygon` are used, holes included).
@@ -139,9 +139,13 @@ Annotations are [QuPath](https://qupath.github.io/) GeoJSON in level-0 pixel coo
   (no quality change), re-encoded only where `--scale` or `--icc-bake` changes the pixels.
   The lower pyramid levels are rebuilt from them at 1/4 steps.
 - Without `--scale`, the slide is cropped at full resolution.
-- **`<file.geojson>`** — applies to a single slide file given as the input.
-- **`<DIR>`** — each slide is matched to `<DIR>/<output name>.geojson` (e.g. `CMU-1.svs`
-  → `CMU-1.geojson`). Slides without a match are converted in full.
+- **`<file.geojson>`** — applies when the input holds a single slide (a slide file, or a
+  folder with one DICOM series or one VSI).
+- **`<DIR>`** — each slide is matched to `<DIR>/<name>.geojson`. Slides without a match are
+  converted in full. The name is the file name without its extension for SVS / TIFF / VSI
+  (e.g. `CMU-1.svs` → `CMU-1.geojson`), and the parent folder name for DICOM
+  (e.g. `JP2K-33003-1/DCM_0.dcm` → `JP2K-33003-1.geojson`).
+- DICOM JPEG 2000 sources copied straight through are written as `.svs`, as for SVS input.
 
 ```sh
 thinslide /data/CMU-1.svs /data/output --roi /data/CMU-1.geojson

@@ -61,10 +61,10 @@ pub struct Args {
     /// annotation are kept; all other tiles are filled with white, and the output is
     /// cropped to the bounding box of the kept tiles. Without --scale the slide is
     /// cropped at full resolution.
-    ///   <file.geojson>  applied to a single input slide file
-    ///   <directory>     <output name>.geojson is looked up per slide; slides without
-    ///                   a match are converted in full
-    /// Currently applies to TIFF/SVS input only.
+    ///   <file.geojson>  applied when the input holds a single slide
+    ///   <directory>     <name>.geojson is looked up per slide (file stem; parent folder
+    ///                   name for DICOM); slides without a match are converted in full
+    /// Applies to TIFF/SVS, DICOM and VSI input (not MRXS).
     #[arg(long, value_name = "GEOJSON|DIR", value_parser = parse_roi, verbatim_doc_comment)]
     pub roi: Option<String>,
 }

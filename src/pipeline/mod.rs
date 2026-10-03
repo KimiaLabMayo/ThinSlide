@@ -154,6 +154,41 @@ fn convert_one_series(
         })
     };
 
+    // --roi: the GeoJSON for a DICOM series is looked up by its parent folder name.
+    let parent_name = Path::new(&src.slide_levels[0].file_path)
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or(series_id.as_str())
+        .to_string();
+    let roi = match args.roi.as_deref().map(|r| crate::roi::Roi::resolve(r, &parent_name)).transpose() {
+        Ok(r) => r.flatten(),
+        Err(e) => {
+            stats.fail.fetch_add(1, Ordering::Relaxed);
+            logger.log_fail(series_idx, &series_id, &format!("--roi: {}", e));
+            return;
+        }
+    };
+    if args.roi.is_some() && roi.is_none() && args.verbose {
+        eprintln!("  [roi  ] no {parent_name}.geojson; converting the whole slide");
+    }
+
+    // --roi: crop the level matching the target scale (the base without --scale).
+    // It is copied raw unless ICC baking is requested or its JPEG tiles are not
+    // 16-aligned; otherwise the resampling writer crops it.
+    let roi_target = effective_mpp.unwrap_or(src_mpp);
+    let roi_groups = crate::source::dicom::group_by_resolution(&src.slide_levels);
+    let roi_raw_group: Option<&Vec<&DcmMetadata>> = roi.as_ref().filter(|_| !args.icc_bake).and_then(|_| {
+        let g = roi_groups.iter().find(|g| g[0].mpp_x
+            .is_some_and(|m| roi_target > 0.0 && (m - roi_target).abs() / roi_target < 0.1))
+            .or(if roi_target > 0.0 { None } else { roi_groups.first() })?;
+        let (tw, th) = g[0].tile_size?;
+        let lv_comp = map_transfer_syntax_to_compression(&g[0].transfer_syntax_uid);
+        let raw_ok = is_jpeg2000(&lv_comp)
+            || (crate::source::dicom::tiff_compression_tag(&g[0].transfer_syntax_uid) == 7 && tw % 16 == 0 && th % 16 == 0);
+        raw_ok.then_some(g)
+    });
+
     let file_stem: String = if args.use_parent_name {
         let raw = Path::new(&src.slide_levels[0].file_path)
             .parent()
@@ -165,7 +200,17 @@ fn convert_one_series(
         sanitize_file_stem(series_id.as_str())
     };
 
-    let output_path = if jp2k_svs_skip.is_some() {
+    let roi_raw_jp2k = roi_raw_group
+        .is_some_and(|g| is_jpeg2000(&map_transfer_syntax_to_compression(&g[0].transfer_syntax_uid)));
+    let output_path = if roi_raw_jp2k {
+        format!("{}/{}.svs", args.output_dir, file_stem)
+    } else if roi.is_some() {
+        if args.openslide {
+            format!("{}/{}.tiff", args.output_dir, file_stem)
+        } else {
+            format!("{}/{}.ome.tiff", args.output_dir, file_stem)
+        }
+    } else if jp2k_svs_skip.is_some() {
         format!("{}/{}.svs", args.output_dir, file_stem)
     } else if effective_mpp.is_some() {
         if args.openslide {
@@ -210,7 +255,31 @@ fn convert_one_series(
 
     let tmp_path = format!("{}.tmp", output_path);
 
-    if let Some(skip) = jp2k_svs_skip {
+    let mut roi_out_dim: Option<(u32, u32)> = None;
+    if let Some(r) = roi.as_ref() {
+        roi_out_dim = match roi_raw_group {
+            Some(g) => writer::write_roi_passthrough(
+                g, &src.slide_levels[0], r, &tmp_path, !args.openslide,
+                args.quality, args.verbose, Some(&pb)),
+            None => writer::write_resampled_tiff(
+                &src.slide_levels, &tmp_path,
+                roi_target, args.quality, args.kernel,
+                !args.openslide,
+                Some(&pb),
+                args.verbose,
+                decode_shift,
+                args.icc_bake,
+                Some(r),
+            ),
+        };
+        if roi_out_dim.is_none() {
+            let _ = std::fs::remove_file(&tmp_path);
+            stats.fail.fetch_add(1, Ordering::Relaxed);
+            logger.log_fail(series_idx, &series_id, "--roi: no annotation overlaps the slide");
+            pb.finish_and_clear();
+            return;
+        }
+    } else if let Some(skip) = jp2k_svs_skip {
         writer::write_svs(
             &src.slide_levels[skip..],
             src.thumbnail.as_ref(),
@@ -231,6 +300,7 @@ fn convert_one_series(
             args.verbose,
             decode_shift,
             args.icc_bake,
+            None,
         );
     } else if args.openslide {
         if is_jpeg2000(&comp) {
@@ -286,7 +356,11 @@ fn convert_one_series(
     let base        = &src.slide_levels[0];
     let in_tile     = base.tile_size;
     let in_dim      = base.px_columns.zip(base.px_rows);
-    let (out_tile, out_dim, out_mpp_log) = if let Some(skip) = jp2k_svs_skip {
+    let (out_tile, out_dim, out_mpp_log) = if let Some(dim) = roi_out_dim {
+        let tile = roi_raw_group.and_then(|g| g[0].tile_size);
+        let mpp = roi_raw_group.and_then(|g| g[0].mpp_x).unwrap_or(roi_target);
+        (tile, Some(dim), mpp)
+    } else if let Some(skip) = jp2k_svs_skip {
         let lv = &src.slide_levels[skip];
         (lv.tile_size, lv.px_columns.zip(lv.px_rows), lv.mpp_x.unwrap_or(src_mpp))
     } else if let Some(target) = effective_mpp {
@@ -332,6 +406,7 @@ fn convert_one_series(
         ops.push(format!("mpp {:.4} downsample", target));
     }
     if args.icc_bake { ops.push("ICC".to_string()); }
+    if roi.is_some() { ops.push("ROI".to_string()); }
 
     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
     pb.finish_with_message(format!(
@@ -373,14 +448,6 @@ pub fn run(args: Args) {
 
     if (args.mag_20x() || args.half() || args.quarter()) && !matches!(args.kernel, image::imageops::FilterType::Nearest) {
         eprintln!("[warn] --kernel is ignored with --scale 20x/half/quarter: decode-side downsampling skips the resize step");
-    }
-
-    if let Some(ref r) = args.roi {
-        if Path::new(r).is_file() && Path::new(&args.input_dir).is_dir() {
-            eprintln!("[error] --roi <file.geojson> requires a single slide file as input; \
-                pass a directory of <name>.geojson files for directory input");
-            std::process::exit(2);
-        }
     }
 
     if args.verbose {
@@ -464,8 +531,16 @@ pub fn run(args: Args) {
     dir_groups.sort_by(|a, b| a[0].cmp(&b[0]));
     let total_files = total_file_count as u64;
 
-    if args.roi.is_some() && (!dir_groups.is_empty() || !vsi_paths.is_empty() || !mrxs_paths.is_empty()) {
-        eprintln!("[warn] --roi is applied to TIFF/SVS input only; DICOM/VSI/MRXS slides are converted in full");
+    if let Some(ref r) = args.roi {
+        let n_slides = dir_groups.len() + tiff_paths.len() + vsi_paths.len() + mrxs_paths.len();
+        if Path::new(r).is_file() && n_slides > 1 {
+            eprintln!("[error] --roi <file.geojson> requires a single slide as input; \
+                pass a directory of <name>.geojson files for multiple slides");
+            std::process::exit(2);
+        }
+        if !mrxs_paths.is_empty() {
+            eprintln!("[warn] --roi is not applied to MRXS input; MRXS slides are converted in full");
+        }
     }
 
     if args.verbose {
@@ -609,10 +684,26 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
         ).unwrap().progress_chars("=>-"));
         pb.set_message(pb_msg.clone());
 
+        // --roi: looked up by the unsanitized file stem, as for TIFF/SVS input.
+        let raw_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+        let roi = match args.roi.as_deref().map(|r| crate::roi::Roi::resolve(r, raw_stem)).transpose() {
+            Ok(r) => r.flatten(),
+            Err(e) => {
+                stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &stem, &format!("--roi: {}", e));
+                pb.finish_and_clear();
+                continue;
+            }
+        };
+        if args.roi.is_some() && roi.is_none() && args.verbose {
+            crate::vlog(Some(&pb), format!("  [roi  ] no {raw_stem}.geojson; converting the whole slide"));
+        }
+
         let tmp_path = format!("{}.tmp", out_path);
         let conv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::source::vsi::convert_vsi(
                 &src, &tmp_path, args.openslide, args.quality, args.mag_20x(), args.half(), args.quarter(), args.verbose, Some(&pb),
+                roi.as_ref(),
             )
         }));
         match conv_result {
@@ -638,6 +729,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
                     } else if args.mag_20x() {
                         ops.push("20x downsample".to_string());
                     }
+                    if roi.is_some() { ops.push("ROI".to_string()); }
 
                     pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
                     pb.finish_with_message(format!(

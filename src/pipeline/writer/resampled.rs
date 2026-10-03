@@ -53,6 +53,8 @@ struct LibEncodeParams {
     n_reduce:         u32,
     decode_shift:     u32,
     icc_transform:    Option<Arc<IccTransform>>,
+    // --roi: (per-output-tile "touches an annotation" flags, pre-encoded white tile)
+    roi_fill:         Option<(Vec<bool>, Vec<u8>)>,
 }
 
 fn encode_one_tile_lib(
@@ -60,6 +62,9 @@ fn encode_one_tile_lib(
     quads:  &[Option<Vec<u8>>; 4],
     p:      &LibEncodeParams,
 ) -> Option<(u32, Vec<u8>)> {
+    if let Some((in_roi, white)) = &p.roi_fill {
+        if !in_roi[out_id as usize] { return Some((out_id, white.clone())); }
+    }
     let ch = p.spp as usize;
 
     let decoded: [Option<(Vec<u8>, u32, u32)>; 4] = std::array::from_fn(|qi| {
@@ -132,7 +137,10 @@ pub(crate) fn write_resampled_tiff(
     // (turbojpeg ONE_HALF/ONE_QUARTER, JP2K DWT level-1/level-2).
     decode_shift: u32,
     icc_bake: bool,
-) {
+    // --roi: only the base level is written, cropped to the tiles touching an
+    // annotation; the levels below are rebuilt from it at 1/4 steps.
+    roi: Option<&crate::roi::Roi>,
+) -> Option<(u32, u32)> {
 
     // ── Group DICOM files by resolution level ─────────────────────────────
     let groups = group_by_resolution(slide_level_metadata_list);
@@ -165,7 +173,7 @@ pub(crate) fn write_resampled_tiff(
         passthrough:  bool,
     }
 
-    let active_levels: Vec<LevelInfo> = groups.iter().enumerate().filter_map(|(i, _)| {
+    let mut active_levels: Vec<LevelInfo> = groups.iter().enumerate().filter_map(|(i, _)| {
         // Target MPP for this output level: scale target_mpp by the ratio of
         // this group's MPP to the base level's MPP.
         let group_mpp_x = groups[i][0].mpp_x.filter(|&v| v > 0.0).unwrap_or(src_mpp_x);
@@ -298,14 +306,41 @@ pub(crate) fn write_resampled_tiff(
         })
     }).collect();
 
-    if active_levels.is_empty() { return; }
+    if active_levels.is_empty() { return None; }
+
+    // --roi: a raw-copyable base is handled by write_roi_passthrough, so the
+    // base here is always resampled (2x2 source tiles per output tile).
+    let roi_crop = match roi {
+        None => None,
+        Some(r) => {
+            active_levels.truncate(1);
+            let lv = &mut active_levels[0];
+            lv.passthrough = false;
+            let grid = (lv.out_img_w.div_ceil(lv.out_tile_w), lv.out_img_h.div_ceil(lv.out_tile_h));
+            let src_dim = (lv.src_group[0].px_columns.unwrap_or(0), lv.src_group[0].px_rows.unwrap_or(0));
+            let crop = crate::roi::RoiCrop::from_mask(
+                &r.tile_mask(grid, (2 * lv.src_tile_w, 2 * lv.src_tile_h), src_dim, (base_w, base_h)), grid)?;
+            (lv.out_img_w, lv.out_img_h) = crop.dim((lv.out_img_w, lv.out_img_h), (lv.out_tile_w, lv.out_tile_h));
+            if verbose {
+                crate::vlog(pb, format!("  [roi  ] crop tiles {}x{} at ({}, {}) → {}x{}  {}/{} tiles inside annotations",
+                    crop.cols, crop.rows, crop.c0, crop.r0, lv.out_img_w, lv.out_img_h,
+                    crop.mask.iter().filter(|&&b| b).count(), crop.mask.len()));
+            }
+            Some(crop)
+        }
+    };
+    let roi_levels = if roi_crop.is_some() {
+        crate::tiffds::roi_reduced_levels((active_levels[0].out_img_w, active_levels[0].out_img_h))
+    } else { 0 };
 
     // n_subifds: pyramid levels stored as SubIFDs (all active levels except base).
-    let n_subifds = active_levels.len() - 1;
+    let n_subifds = active_levels.len() - 1 + roi_levels as usize;
 
     // Total tile count across all active levels for the progress bar.
     let total_tiles: u64 = active_levels.iter().map(|lv| {
-        if lv.passthrough {
+        if let Some(c) = &roi_crop {
+            (c.cols * c.rows) as u64 + crate::tiffds::roi_reduced_tiles((c.cols, c.rows), roi_levels)
+        } else if lv.passthrough {
             lv.src_group.iter().map(|m| m.n_frames.unwrap_or(0) as u64).sum::<u64>()
         } else {
             let out_ntx = (lv.out_img_w + lv.out_tile_w - 1) / lv.out_tile_w;
@@ -381,7 +416,8 @@ pub(crate) fn write_resampled_tiff(
     let fir_pixel_type = if spp == 1 { fir::PixelType::U8 } else { fir::PixelType::U8x3 };
     let resize_opts = fir::ResizeOptions::new().resize_alg(fir_alg);
 
-    let write_level_tiles = |tiff: *mut TIFF, lv: &LevelInfo, decode_shift: u32| {
+    let write_level_tiles = |tiff: *mut TIFF, lv: &LevelInfo, decode_shift: u32,
+                             reducer: &mut Option<crate::tiffds::Reducer>| {
         let chunk_size = (rayon::current_num_threads() * 4).max(1);
 
         // Source image dimensions for grid computation (shared across group files).
@@ -465,6 +501,16 @@ pub(crate) fn write_resampled_tiff(
         let out_nty = (lv.out_img_h + lv.out_tile_h - 1) / lv.out_tile_h;
         let out_tile_ids: Vec<u32> = (0..out_ntx * out_nty).collect();
 
+        // --roi: output tiles are numbered within the crop; (oc0, or0) maps
+        // them back onto the full grid of 2x2 source-tile cells.
+        let (oc0, or0) = roi_crop.as_ref().map_or((0, 0), |c| (c.c0, c.r0));
+        let roi_fill = roi_crop.as_ref().map(|c| {
+            *reducer = Some(crate::tiffds::Reducer::new((c.cols, c.rows), (lv.out_tile_w, lv.out_tile_h),
+                spp, quality, None, false, false));
+            (c.mask.clone(), crate::pipeline::encode::white_jpeg_tile(
+                lv.out_tile_w, lv.out_tile_h, spp, false, (2, 2), quality))
+        });
+
         let enc_params = std::sync::Arc::new(LibEncodeParams {
             spp,
             src_tile_w:       lv.src_tile_w,
@@ -481,6 +527,7 @@ pub(crate) fn write_resampled_tiff(
             n_reduce,
             decode_shift,
             icc_transform:    icc_transform.clone(),
+            roi_fill,
         });
         let (raw_tx, raw_rx) = mpsc::sync_channel::<LibRawChunk>(2);
         let (enc_tx, enc_rx) = mpsc::sync_channel::<LibEncChunk>(2);
@@ -495,9 +542,13 @@ pub(crate) fn write_resampled_tiff(
         for chunk in out_tile_ids.chunks(chunk_size) {
             let raw_chunk: LibRawChunk = chunk.iter()
                 .map(|&out_id| {
-                    let oc  = out_id % out_ntx;
-                    let or_ = out_id / out_ntx;
+                    let oc  = out_id % out_ntx + oc0;
+                    let or_ = out_id / out_ntx + or0;
                     let mut quads: [Option<Vec<u8>>; 4] = [None, None, None, None];
+                    // Outside --roi: no source data; encode_one_tile_lib emits white.
+                    if enc_params.roi_fill.as_ref().is_some_and(|(m, _)| !m[out_id as usize]) {
+                        return (out_id, quads);
+                    }
                     for qi in 0..4usize {
                         let dc = (qi % 2) as u32;
                         let dr = (qi / 2) as u32;
@@ -516,6 +567,7 @@ pub(crate) fn write_resampled_tiff(
             if let Some(prev) = pending_write.take() {
                 let n = prev.len() as u64;
                 unsafe { write_enc_chunk(tiff, &prev, &mut jpegtables_registered); }
+                if let Some(r) = reducer.as_mut() { for (id, t) in &prev { r.push(*id, t); } }
                 if let Some(p) = pb { p.inc(n); }
             }
             pending_write = enc_rx.recv().ok();
@@ -525,11 +577,13 @@ pub(crate) fn write_resampled_tiff(
         if let Some(last) = pending_write.take() {
             let n = last.len() as u64;
             unsafe { write_enc_chunk(tiff, &last, &mut jpegtables_registered); }
+            if let Some(r) = reducer.as_mut() { for (id, t) in &last { r.push(*id, t); } }
             if let Some(p) = pb { p.inc(n); }
         }
         for enc in enc_rx {
             let n = enc.len() as u64;
             unsafe { write_enc_chunk(tiff, &enc, &mut jpegtables_registered); }
+            if let Some(r) = reducer.as_mut() { for (id, t) in &enc { r.push(*id, t); } }
             if let Some(p) = pb { p.inc(n); }
         }
         compute_handle.join().expect("compute thread panicked");
@@ -546,6 +600,7 @@ pub(crate) fn write_resampled_tiff(
         unsafe { TIFFSetField(tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr()); }
     }
 
+    let mut reducer: Option<crate::tiffds::Reducer> = None;
     for (lv_idx, lv) in active_levels.iter().enumerate() {
         let is_base: bool    = lv_idx == 0;
         let subfile_type: u32 = if is_base { 0 } else { FILETYPE_REDUCEDIMAGE };
@@ -652,11 +707,18 @@ pub(crate) fn write_resampled_tiff(
                 }
             }
 
-            write_level_tiles(tiff, lv, decode_shift);
+            write_level_tiles(tiff, lv, decode_shift, &mut reducer);
         }
 
         unsafe { TIFFWriteDirectory(tiff); }
     }
 
+    let base_lv = &active_levels[0];
+    if let Some(r) = reducer {
+        unsafe { crate::tiffds::write_reduced_levels(tiff, r, (base_lv.out_img_w, base_lv.out_img_h),
+            (base_lv.actual_mpp_x, base_lv.actual_mpp_y), roi_levels, verbose, pb); }
+    }
+
     unsafe { TIFFClose(tiff); }
+    Some((base_lv.out_img_w, base_lv.out_img_h))
 }
