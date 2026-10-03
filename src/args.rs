@@ -58,8 +58,9 @@ pub struct Args {
     pub log_file: Option<String>,
 
     /// QuPath GeoJSON annotations (level-0 pixel coordinates). Only tiles touching an
-    /// annotation are kept; all other tiles are filled with white. Without --scale the
-    /// slide is cropped at full resolution.
+    /// annotation are kept; all other tiles are filled with white, and the output is
+    /// cropped to the bounding box of the kept tiles. Without --scale the slide is
+    /// cropped at full resolution.
     ///   <file.geojson>  applied to a single input slide file
     ///   <directory>     <output name>.geojson is looked up per slide; slides without
     ///                   a match are converted in full

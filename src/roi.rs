@@ -67,6 +67,46 @@ impl Roi {
     }
 }
 
+/// Tile-aligned crop of a level: the bounding box of the tiles touching an annotation.
+#[derive(Clone, Debug)]
+pub struct RoiCrop {
+    pub c0:   u32,
+    pub r0:   u32,
+    pub cols: u32,
+    pub rows: u32,
+    full_cols: u32,
+    /// "Touches an annotation" flags of the cropped tiles (row-major).
+    pub mask: Vec<bool>,
+}
+
+impl RoiCrop {
+    /// Builds the crop from a full-grid tile mask; None if no tile is flagged.
+    pub fn from_mask(mask: &[bool], grid: (u32, u32)) -> Option<RoiCrop> {
+        let (mut c0, mut r0, mut c1, mut r1) = (u32::MAX, u32::MAX, 0, 0);
+        for id in (0..mask.len()).filter(|&i| mask[i]) {
+            let (c, r) = (id as u32 % grid.0, id as u32 / grid.0);
+            (c0, r0, c1, r1) = (c0.min(c), r0.min(r), c1.max(c + 1), r1.max(r + 1));
+        }
+        if c1 == 0 { return None; }
+        let (cols, rows) = (c1 - c0, r1 - r0);
+        let crop_mask = (0..cols * rows)
+            .map(|id| mask[((r0 + id / cols) * grid.0 + c0 + id % cols) as usize])
+            .collect();
+        Some(RoiCrop { c0, r0, cols, rows, full_cols: grid.0, mask: crop_mask })
+    }
+
+    /// Tile index in the full grid for cropped tile `id`.
+    pub fn full_id(&self, id: u32) -> u32 {
+        (self.r0 + id / self.cols) * self.full_cols + self.c0 + id % self.cols
+    }
+
+    /// Pixel size of the cropped level; the last tile column/row is clipped to `full`.
+    pub fn dim(&self, full: (u32, u32), tile: (u32, u32)) -> (u32, u32) {
+        (((self.c0 + self.cols) * tile.0).min(full.0) - self.c0 * tile.0,
+         ((self.r0 + self.rows) * tile.1).min(full.1) - self.r0 * tile.1)
+    }
+}
+
 fn collect(v: &Value, out: &mut Vec<Polygon>) -> Result<(), String> {
     match v {
         Value::Array(items) => {
@@ -214,6 +254,21 @@ mod tests {
         assert!(!roi.intersects_rect(40.0, 40.0, 60.0, 60.0));   // inside the hole
         assert!(roi.intersects_rect(5.0, 5.0, 10.0, 10.0));      // on the ring
         assert!(!roi.intersects_rect(250.0, 20.0, 260.0, 30.0)); // in L-shape's empty corner
+    }
+
+    #[test]
+    fn crop_from_mask() {
+        // 4x3 grid with tiles (1,1) and (2,2) flagged.
+        let mut mask = vec![false; 12];
+        mask[5] = true;
+        mask[10] = true;
+        let c = RoiCrop::from_mask(&mask, (4, 3)).unwrap();
+        assert_eq!((c.c0, c.r0, c.cols, c.rows), (1, 1, 2, 2));
+        assert_eq!(c.mask, vec![true, false, false, true]);
+        assert_eq!(c.full_id(3), 10);
+        // Image 1000x700 with 256px tiles: the last row is clipped.
+        assert_eq!(c.dim((1000, 700), (256, 256)), (512, 444));
+        assert!(RoiCrop::from_mask(&[false; 12], (4, 3)).is_none());
     }
 
     #[test]

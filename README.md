@@ -130,11 +130,14 @@ Annotations are [QuPath](https://qupath.github.io/) GeoJSON in level-0 pixel coo
 `Polygon` and `MultiPolygon` are used, holes included).
 
 - Processing stays tile-based: every tile an annotation passes through is kept, and every
-  tile completely outside is filled with white. The output is still the full rectangle.
+  tile completely outside is filled with white.
+- The output is cropped to the bounding box of the kept tiles (aligned to the tile grid),
+  so a small region gives a small image.
 - Tiles outside the annotations are never read, so conversion is faster and the
   output smaller.
-- Kept tiles go through the normal pipeline: copied straight through where possible
+- Full-resolution tiles go through the normal pipeline: copied straight through where possible
   (no quality change), re-encoded only where `--scale` or `--icc-bake` changes the pixels.
+  The lower pyramid levels are rebuilt from them at 1/4 steps.
 - Without `--scale`, the slide is cropped at full resolution.
 - **`<file.geojson>`** — applies to a single slide file given as the input.
 - **`<DIR>`** — each slide is matched to `<DIR>/<output name>.geojson` (e.g. `CMU-1.svs`

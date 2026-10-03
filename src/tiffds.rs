@@ -75,80 +75,246 @@ fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u3
     if let Some((in_roi, white)) = &p.roi_fill {
         if !in_roi[out_id as usize] { return Some((out_id, white.clone())); }
     }
-    let ch = p.spp as usize;
-    const APP14_ADOBE_RGB: [u8; 16] = [
-        0xFF, 0xEE, 0x00, 0x0E,
-        b'A', b'd', b'o', b'b', b'e',
-        0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ];
-
     let decoded: [Option<(Vec<u8>, u32, u32)>; 4] = std::array::from_fn(|qi| {
         let (data, is_raw_decode) = quads[qi].as_ref()?;
         if *is_raw_decode && p.src_is_jpeg {
-            let fmt = if p.spp == 1 { turbojpeg::PixelFormat::GRAY } else { turbojpeg::PixelFormat::RGB };
             let inject_app14 = p.spp == 3 && p.src_photometric == PHOTOMETRIC_RGB;
-            let combined: Vec<u8> = if let Some(ref tables) = p.jpeg_tables {
-                let app14_len = if inject_app14 { APP14_ADOBE_RGB.len() } else { 0 };
-                let mut v = Vec::with_capacity(2 + app14_len + (tables.len() - 4) + (data.len() - 2));
-                v.extend_from_slice(&tables[0..2]);
-                if inject_app14 { v.extend_from_slice(&APP14_ADOBE_RGB); }
-                v.extend_from_slice(&tables[2..tables.len()-2]);
-                v.extend_from_slice(&data[2..]);
-                v
-            } else { data.clone() };
-
-            let scaling = match p.decode_shift {
-                1 => Some(turbojpeg::ScalingFactor::ONE_HALF),
-                2 => Some(turbojpeg::ScalingFactor::ONE_QUARTER),
-                _ => None,
-            };
-            if let Some(sf) = scaling {
-                let mut dec = turbojpeg::Decompressor::new().ok()?;
-                dec.set_scaling_factor(sf).ok()?;
-                let header = dec.read_header(&combined).ok()?;
-                let scaled = header.scaled(sf);
-                let (w, h) = (scaled.width, scaled.height);
-                let pitch = w * ch;
-                let mut pixels = vec![0u8; h * pitch];
-                dec.decompress(&combined, turbojpeg::Image {
-                    pixels: pixels.as_mut_slice(), width: w, pitch, height: h, format: fmt,
-                }).ok()?;
-                Some((pixels, w as u32, h as u32))
-            } else {
-                let dec = turbojpeg::decompress(&combined, fmt).ok()?;
-                let (w, h) = (dec.width as u32, dec.height as u32);
-                let pitch = w as usize * ch;
-                let pix = if dec.pitch == pitch {
-                    dec.pixels
-                } else {
-                    (0..h as usize).flat_map(|r| {
-                        let s = r * dec.pitch;
-                        dec.pixels[s..s+pitch].iter().copied()
-                    }).collect()
-                };
-                Some((pix, w, h))
-            }
+            decode_jpeg_tile(data, p.spp, p.jpeg_tables.as_deref().map(|v| v.as_slice()),
+                inject_app14, p.decode_shift)
         } else if *is_raw_decode {
-            // JP2K
-            let params = jpeg2k::DecodeParameters::default().reduce(p.n_reduce);
-            let img = jpeg2k::Image::from_bytes_with(data, params).ok()?;
-            let (mut pix, luma_w, luma_h) = super::jp2k_assemble_pixels(&img, p.spp as usize)?;
-            let color_space = img.color_space();
-            let needs_ycbcr_cvt = p.spp == 3 && (
-                matches!(color_space, jpeg2k::ColorSpace::SYCC)
-                || (p.src_jp2k_is_ycbcr && !matches!(color_space, jpeg2k::ColorSpace::SRGB))
-            );
-            if needs_ycbcr_cvt {
-                super::ycbcr_to_rgb(&mut pix);
-            }
-            Some((pix, luma_w as u32, luma_h as u32))
+            decode_jp2k_tile(data, p.spp, p.src_jp2k_is_ycbcr, p.n_reduce)
         } else {
             Some((data.clone(), p.src_tile_w, p.src_tile_h))
         }
     });
 
-    crate::compose_and_encode(out_id, decoded, ch, p.out_tile_w, p.out_tile_h,
+    crate::compose_and_encode(out_id, decoded, p.spp as usize, p.out_tile_w, p.out_tile_h,
         p.icc_transform.as_deref(), p.fpt, &p.resize_opts, p.quality, p.spp)
+}
+
+const APP14_ADOBE_RGB: [u8; 16] = [
+    0xFF, 0xEE, 0x00, 0x0E,
+    b'A', b'd', b'o', b'b', b'e',
+    0x00, 0x64, 0x00, 0x00, 0x00, 0x00, 0x00,
+];
+
+// Decodes a TIFF JPEG tile (abbreviated when `tables` is given) to packed RGB/gray,
+// optionally at 1/2^`shift` scale via DCT scaling.
+fn decode_jpeg_tile(data: &[u8], spp: u32, tables: Option<&[u8]>, inject_app14: bool, shift: u32)
+    -> Option<(Vec<u8>, u32, u32)>
+{
+    let ch = spp as usize;
+    let fmt = if spp == 1 { turbojpeg::PixelFormat::GRAY } else { turbojpeg::PixelFormat::RGB };
+    let combined: Vec<u8> = if let Some(tables) = tables {
+        let app14_len = if inject_app14 { APP14_ADOBE_RGB.len() } else { 0 };
+        let mut v = Vec::with_capacity(2 + app14_len + (tables.len() - 4) + (data.len() - 2));
+        v.extend_from_slice(&tables[0..2]);
+        if inject_app14 { v.extend_from_slice(&APP14_ADOBE_RGB); }
+        v.extend_from_slice(&tables[2..tables.len()-2]);
+        v.extend_from_slice(&data[2..]);
+        v
+    } else { data.to_vec() };
+
+    let scaling = match shift {
+        1 => Some(turbojpeg::ScalingFactor::ONE_HALF),
+        2 => Some(turbojpeg::ScalingFactor::ONE_QUARTER),
+        _ => None,
+    };
+    if let Some(sf) = scaling {
+        let mut dec = turbojpeg::Decompressor::new().ok()?;
+        dec.set_scaling_factor(sf).ok()?;
+        let header = dec.read_header(&combined).ok()?;
+        let scaled = header.scaled(sf);
+        let (w, h) = (scaled.width, scaled.height);
+        let pitch = w * ch;
+        let mut pixels = vec![0u8; h * pitch];
+        dec.decompress(&combined, turbojpeg::Image {
+            pixels: pixels.as_mut_slice(), width: w, pitch, height: h, format: fmt,
+        }).ok()?;
+        Some((pixels, w as u32, h as u32))
+    } else {
+        let dec = turbojpeg::decompress(&combined, fmt).ok()?;
+        let (w, h) = (dec.width as u32, dec.height as u32);
+        let pitch = w as usize * ch;
+        let pix = if dec.pitch == pitch {
+            dec.pixels
+        } else {
+            (0..h as usize).flat_map(|r| {
+                let s = r * dec.pitch;
+                dec.pixels[s..s+pitch].iter().copied()
+            }).collect()
+        };
+        Some((pix, w, h))
+    }
+}
+
+// Decodes a JP2K codestream tile to packed RGB/gray at resolution level `reduce`.
+fn decode_jp2k_tile(data: &[u8], spp: u32, src_jp2k_is_ycbcr: bool, reduce: u32) -> Option<(Vec<u8>, u32, u32)> {
+    let params = jpeg2k::DecodeParameters::default().reduce(reduce);
+    let img = jpeg2k::Image::from_bytes_with(data, params).ok()?;
+    let (mut pix, luma_w, luma_h) = super::jp2k_assemble_pixels(&img, spp as usize)?;
+    let color_space = img.color_space();
+    let needs_ycbcr_cvt = spp == 3 && (
+        matches!(color_space, jpeg2k::ColorSpace::SYCC)
+        || (src_jp2k_is_ycbcr && !matches!(color_space, jpeg2k::ColorSpace::SRGB))
+    );
+    if needs_ycbcr_cvt {
+        super::ycbcr_to_rgb(&mut pix);
+    }
+    Some((pix, luma_w as u32, luma_h as u32))
+}
+
+// ─── --roi reduced pyramid ────────────────────────────────────────────────────
+
+/// --roi: builds a 4x-reduced level from the tiles of the level above, which are
+/// pushed in tile-id order. Each output tile is a 4x4 block of input tiles decoded
+/// at 1/4 scale. Input tiles may be TIFF JPEG (abbreviated with `jpeg_tables`),
+/// full JPEG, or a JP2K codestream; missing tiles become white.
+struct Reducer {
+    in_cols:     u32,
+    out_grid:    (u32, u32),
+    tile:        (u32, u32),
+    spp:         u32,
+    quality:     u8,
+    jpeg_tables: Option<Vec<u8>>,
+    rgb_app14:   bool,
+    jp2k_ycbcr:  bool,
+    band:        Vec<Option<Vec<u8>>>,  // input tiles of the current 4-row band
+    band_row:    u32,                   // first input row of `band`
+    out:         Vec<(u32, Vec<u8>)>,   // encoded output tiles
+}
+
+impl Reducer {
+    fn new(in_grid: (u32, u32), tile: (u32, u32), spp: u32, quality: u8,
+           jpeg_tables: Option<Vec<u8>>, rgb_app14: bool, jp2k_ycbcr: bool) -> Reducer {
+        Reducer {
+            in_cols: in_grid.0,
+            out_grid: (in_grid.0.div_ceil(4), in_grid.1.div_ceil(4)),
+            tile, spp, quality, jpeg_tables, rgb_app14, jp2k_ycbcr,
+            band: vec![None; in_grid.0 as usize * 4],
+            band_row: 0,
+            out: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, id: u32, data: &[u8]) {
+        while id / self.in_cols >= self.band_row + 4 { self.flush_band(); }
+        self.band[(id - self.band_row * self.in_cols) as usize] = Some(data.to_vec());
+    }
+
+    fn flush_band(&mut self) {
+        let or_ = self.band_row / 4;
+        let row: Vec<(u32, Vec<u8>)> = (0..self.out_grid.0).into_par_iter()
+            .filter_map(|oc| Some((or_ * self.out_grid.0 + oc, self.encode_tile(oc)?)))
+            .collect();
+        self.out.extend(row);
+        self.band.iter_mut().for_each(|t| *t = None);
+        self.band_row += 4;
+    }
+
+    fn encode_tile(&self, oc: u32) -> Option<Vec<u8>> {
+        let ch = self.spp as usize;
+        let (tw, th) = (self.tile.0 as usize, self.tile.1 as usize);
+        let (sw, sh) = (tw / 4, th / 4);
+        let mut canvas = vec![255u8; tw * th * ch];
+        for (i, slot) in self.band.iter().enumerate() {
+            let (c, r) = (i as u32 % self.in_cols, i as u32 / self.in_cols);
+            if c / 4 != oc { continue; }
+            let Some(data) = slot else { continue; };
+            let decoded = if data.starts_with(&[0xFF, 0xD8]) {
+                decode_jpeg_tile(data, self.spp, self.jpeg_tables.as_deref(), self.rgb_app14, 2)
+            } else {
+                decode_jp2k_tile(data, self.spp, self.jp2k_ycbcr, 2)
+            };
+            let Some((pix, pw, ph)) = decoded else { continue; };
+            let (ox, oy) = ((c % 4) as usize * sw, r as usize * sh);
+            let w = (pw as usize).min(tw - ox);
+            for y in 0..(ph as usize).min(th - oy) {
+                let d = ((oy + y) * tw + ox) * ch;
+                let s = y * pw as usize * ch;
+                canvas[d..d + w * ch].copy_from_slice(&pix[s..s + w * ch]);
+            }
+        }
+        let (format, subsamp) = if ch == 1 {
+            (turbojpeg::PixelFormat::GRAY, turbojpeg::Subsamp::Gray)
+        } else {
+            (turbojpeg::PixelFormat::RGB, turbojpeg::Subsamp::Sub2x2)
+        };
+        turbojpeg::compress(turbojpeg::Image::<&[u8]> {
+            pixels: &canvas, width: tw, pitch: tw * ch, height: th, format,
+        }, self.quality as i32, subsamp).ok().map(|j| j.to_vec())
+    }
+
+    fn finish(mut self) -> Vec<(u32, Vec<u8>)> {
+        while self.band_row < self.out_grid.1 * 4 { self.flush_band(); }
+        self.out
+    }
+}
+
+/// --roi: number of 1/4-step levels below a cropped base of size `dim`.
+fn roi_reduced_levels(dim: (u32, u32)) -> u32 {
+    let mut n = 0;
+    while dim.0.max(dim.1).div_ceil(4u32.pow(n + 1)) >= MIN_PYRAMID_SIDE { n += 1; }
+    n
+}
+
+/// --roi: tiles per reduced level for a base of `base_grid` tiles.
+fn roi_reduced_tiles(base_grid: (u32, u32), n_levels: u32) -> u64 {
+    (1..=n_levels).map(|k| {
+        let d = 4u32.pow(k);
+        base_grid.0.div_ceil(d) as u64 * base_grid.1.div_ceil(d) as u64
+    }).sum()
+}
+
+/// --roi: crop of a level `grid` whose tiles each cover `footprint` pixels of a source
+/// level sized `level`; None (with a warning) if no annotation overlaps the slide.
+fn roi_crop_of(roi: &crate::roi::Roi, grid: (u32, u32), footprint: (u32, u32), level: (u32, u32),
+               base: (u32, u32), src_path: &str) -> Option<crate::roi::RoiCrop> {
+    let crop = crate::roi::RoiCrop::from_mask(&roi.tile_mask(grid, footprint, level, base), grid);
+    if crop.is_none() { eprintln!("  [warn ] --roi: no annotation overlaps {src_path}; skipping"); }
+    crop
+}
+
+/// --roi: writes the 1/4-step levels below the base, one reduced-image IFD each,
+/// starting from the reducer fed with the base tiles.
+unsafe fn write_reduced_levels(
+    dst_tiff: *mut crate::bindings::TIFF,
+    reducer: Reducer,
+    base_dim: (u32, u32),
+    base_mpp: (f64, f64),
+    n_levels: u32,
+    verbose: bool,
+    pb: &ProgressBar,
+) {
+    let (tw, th) = reducer.tile;
+    let (spp, quality) = (reducer.spp, reducer.quality);
+    let photometric = if spp == 1 { PHOTOMETRIC_MINISBLACK } else { PHOTOMETRIC_YCBCR };
+    let mut next = Some(reducer);
+    for k in 1..=n_levels {
+        let d = 4u32.pow(k);
+        let (w, h) = (base_dim.0.div_ceil(d), base_dim.1.div_ceil(d));
+        let Some(reducer) = next.take() else { break; };
+        let tiles = reducer.finish();
+        if verbose {
+            vlog(Some(pb), format!("  [roi  ] lv{}  {}x{}  1/{} of base  tile {}x{}", k, w, h, d, tw, th));
+        }
+        unsafe {
+            set_tiff_ifd_tags(dst_tiff, FILETYPE_REDUCEDIMAGE, w, h, tw, th,
+                COMPRESSION_JPEG, photometric, spp, base_mpp.0 * d as f64, base_mpp.1 * d as f64);
+            if spp == 3 { TIFFSetField(dst_tiff, TIFFTAG_YCBCRSUBSAMPLING, 2u32, 2u32); }
+        }
+        if k < n_levels {
+            let mut r = Reducer::new((w.div_ceil(tw), h.div_ceil(th)), (tw, th), spp, quality, None, false, false);
+            for (id, jpeg) in &tiles { r.push(*id, jpeg); }
+            next = Some(r);
+        }
+        let mut jpegtables_registered = false;
+        unsafe {
+            write_enc_chunk(dst_tiff, &tiles, &mut jpegtables_registered);
+            TIFFWriteDirectory(dst_tiff);
+        }
+        pb.inc(tiles.len() as u64);
+    }
 }
 
 // ─── Entry point for unified thinslide binary ─────────────────────────────────
@@ -365,7 +531,6 @@ fn process_file_icc_bake_only(
     src_levels: &[TiffLevel],
     ome_xml:    Option<&str>,
     pb:         &ProgressBar,
-    roi:        Option<&crate::roi::Roi>,
 ) {
     let out_path = if args.openslide {
         format!("{out_dir}/{out_stem}.tiff")
@@ -461,16 +626,6 @@ fn process_file_icc_bake_only(
         let pix_size = src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize;
         let tile_ids: Vec<u32> = (0..src_lv.n_tiles).collect();
 
-        // --roi: (per-tile flags, white tile) for tiles outside the annotations.
-        let roi_fill: Option<Arc<(Vec<bool>, Vec<u8>)>> = roi.map(|r| {
-            let grid = (src_lv.img_w.div_ceil(src_lv.tile_w), src_lv.img_h.div_ceil(src_lv.tile_h));
-            let mask = r.tile_mask(grid, (src_lv.tile_w, src_lv.tile_h),
-                (src_lv.img_w, src_lv.img_h), (base.img_w, base.img_h));
-            Arc::new((mask, crate::pipeline::encode::white_jpeg_tile(
-                out_tile_w, out_tile_h, out_spp, false, (2, 2), args.quality)))
-        });
-        let in_roi = |id: u32| roi_fill.as_ref().map_or(true, |f| f.0.get(id as usize).copied().unwrap_or(true));
-
         type BakeTile = (u32, Option<(Vec<u8>, bool, bool)>);
 
         let (raw_tx, raw_rx) = mpsc::sync_channel::<Vec<BakeTile>>(2);
@@ -483,15 +638,11 @@ fn process_file_icc_bake_only(
         let src_tile_w     = src_lv.tile_w;
         let src_tile_h     = src_lv.tile_h;
         let src_photometric = src_lv.photometric as u32;
-        let roi_fill_t     = roi_fill.clone();
 
         let compute_handle = std::thread::spawn(move || {
             for raw_chunk in raw_rx {
                 let mut encoded: EncChunk = raw_chunk.par_iter()
                     .filter_map(|(id, tile_opt)| {
-                        if let Some(f) = &roi_fill_t {
-                            if !f.0.get(*id as usize).copied().unwrap_or(true) { return Some((*id, f.1.clone())); }
-                        }
                         let (data, is_raw_jpeg, is_jp2k_tile) = tile_opt.as_ref()?;
                         let jpeg = bake_single_tile(
                             data, *is_raw_jpeg, *is_jp2k_tile, src_jp2k_is_ycbcr,
@@ -514,9 +665,7 @@ fn process_file_icc_bake_only(
         for chunk in tile_ids.chunks(chunk_size) {
             let raw_chunk: Vec<BakeTile> = chunk.iter()
                 .map(|&tile_num| {
-                    if !in_roi(tile_num) {
-                        (tile_num, None)
-                    } else if src_is_jp2k || src_is_jpeg {
+                    if src_is_jp2k || src_is_jpeg {
                         let mut buf = vec![0u8; raw_buf_size];
                         let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
                             buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
@@ -579,19 +728,29 @@ fn write_jp2k_svs_from_tiff(
     dst_path: &str,
     verbose: bool,
     pb: &ProgressBar,
-    roi: Option<&crate::roi::Roi>,
-    base_dim: (u32, u32),
+    roi_crop: Option<&crate::roi::RoiCrop>,
+    quality: u8,
 ) {
     if levels.is_empty() { return; }
+    // --roi: only the base is copied (cropped); the levels below are rebuilt from it.
+    let levels = if roi_crop.is_some() { &levels[..1] } else { levels };
     let base = &levels[0];
+    let level_dim = |lv: &TiffLevel| roi_crop.map_or((lv.img_w, lv.img_h),
+        |c| c.dim((lv.img_w, lv.img_h), (lv.tile_w, lv.tile_h)));
+    let (base_w, base_h) = level_dim(base);
+    let roi_levels = if roi_crop.is_some() { roi_reduced_levels((base_w, base_h)) } else { 0 };
 
     let img_desc = format!(
         "Aperio Image Library\n{}x{} ({} x {})\nMPP = {:.6}",
-        base.img_w, base.img_h, base.tile_w, base.tile_h, base.mpp_x
+        base_w, base_h, base.tile_w, base.tile_h, base.mpp_x
     );
 
-    let total_tiles: u64 = levels.iter().map(|lv| lv.n_tiles as u64).sum();
+    let total_tiles: u64 = match roi_crop {
+        Some(c) => (c.cols * c.rows) as u64 + roi_reduced_tiles((c.cols, c.rows), roi_levels),
+        None => levels.iter().map(|lv| lv.n_tiles as u64).sum(),
+    };
     pb.set_length(total_tiles);
+    let mut reducer: Option<Reducer> = None;
 
     let src_c   = CString::new(src_path).unwrap();
     let dst_c   = CString::new(dst_path).unwrap();
@@ -618,9 +777,10 @@ fn write_jp2k_svs_from_tiff(
             else { crate::source::tiff::COMPRESSION_APERIO_JP2_RGB };
 
         let subfile: u32 = if idx == 0 { 0 } else { FILETYPE_REDUCEDIMAGE };
+        let (lv_w, lv_h) = level_dim(lv);
         unsafe {
             set_tiff_ifd_tags(dst_tiff, subfile,
-                lv.img_w, lv.img_h, lv.tile_w, lv.tile_h,
+                lv_w, lv_h, lv.tile_w, lv.tile_h,
                 aperio_compr, lv.photometric as u32, lv.spp as u32,
                 lv.mpp_x, lv.mpp_y);
             if lv.photometric as u32 == PHOTOMETRIC_YCBCR {
@@ -635,39 +795,50 @@ fn write_jp2k_svs_from_tiff(
 
         if verbose {
             vlog(Some(pb), format!("  [pass ] lv{}  {}x{}  {:.4} µm/px  tile {}x{}  ({} tiles)",
-                idx, lv.img_w, lv.img_h, lv.mpp_x, lv.tile_w, lv.tile_h, lv.n_tiles));
+                idx, lv_w, lv_h, lv.mpp_x, lv.tile_w, lv.tile_h, lv.n_tiles));
         }
 
         // --roi: tiles outside the annotations get a white JP2K tile instead of a raw copy.
-        let roi_fill = roi.map(|r| {
-            let grid = (lv.img_w.div_ceil(lv.tile_w), lv.img_h.div_ceil(lv.tile_h));
-            let mask = r.tile_mask(grid, (lv.tile_w, lv.tile_h), (lv.img_w, lv.img_h), base_dim);
+        let roi_fill = roi_crop.map(|c| {
             let white = crate::pipeline::encode::white_jp2k_tile(lv.tile_w, lv.tile_h, lv.spp as u32,
                 aperio_compr == COMPRESSION_APERIO_JP2_YCBCR).expect("white JP2K tile encode failed");
-            (mask, white)
+            reducer = Some(Reducer::new((c.cols, c.rows), (lv.tile_w, lv.tile_h),
+                if lv.spp >= 3 { 3 } else { 1 }, quality, None, false,
+                lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR));
+            (c, white)
         });
 
         let raw_buf_size = (unsafe { TIFFTileSize(src_tiff) } as usize).max(1 << 17);
-        for tile_num in 0..lv.n_tiles {
-            if let Some((mask, white)) = &roi_fill {
-                if !mask.get(tile_num as usize).copied().unwrap_or(true) {
+        let n_tiles = roi_crop.map_or(lv.n_tiles, |c| c.cols * c.rows);
+        for tile_num in 0..n_tiles {
+            let mut src_tile = tile_num;
+            if let Some((crop, white)) = &roi_fill {
+                if !crop.mask[tile_num as usize] {
                     unsafe { TIFFWriteRawTile(dst_tiff, tile_num,
                         white.as_ptr() as *mut c_void, white.len() as i64); }
+                    if let Some(r) = reducer.as_mut() { r.push(tile_num, white); }
                     pb.inc(1);
                     continue;
                 }
+                src_tile = crop.full_id(tile_num);
             }
             let mut buf = vec![0u8; raw_buf_size];
-            let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
+            let n = unsafe { TIFFReadRawTile(src_tiff, src_tile,
                 buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
             if n > 0 {
                 unsafe { TIFFWriteRawTile(dst_tiff, tile_num,
                     buf.as_ptr() as *mut c_void, n); }
+                if let Some(r) = reducer.as_mut() { r.push(tile_num, &buf[..n as usize]); }
             }
             pb.inc(1);
         }
 
         unsafe { TIFFWriteDirectory(dst_tiff); }
+    }
+
+    if let Some(r) = reducer {
+        unsafe { write_reduced_levels(dst_tiff, r, (base_w, base_h),
+            (base.mpp_x, base.mpp_y), roi_levels, verbose, pb); }
     }
 
     unsafe { TIFFClose(dst_tiff); }
@@ -762,7 +933,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     }
 
     // Pure 1:1 ICC bake: plain --icc-bake, or --scale 20x already at native 20x.
-    if args.icc_bake && args.mpp().is_none() && !args.half() && !args.quarter() && (!args.mag_20x() || mag_factor == 1) {
+    // With --roi the crop path below handles the bake.
+    if roi.is_none() && args.icc_bake && args.mpp().is_none() && !args.half() && !args.quarter() && (!args.mag_20x() || mag_factor == 1) {
         let icc = icc_profile.as_deref().unwrap();
         let out_path = if args.openslide {
             format!("{out_dir}/{out_stem}.tiff")
@@ -773,14 +945,12 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             if args.verbose {
                 vlog(Some(pb), format!("  [icc  ] baking {} bytes → sRGB", icc.len()));
             }
-            process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb, roi);
+            process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb);
         } else {
             eprintln!("  [error] Invalid ICC profile in {src_path}; skipping.");
         }
         let detail = passthrough_detail(src_path, &out_path, &src_levels[0]);
-        let mut ops = vec!["ICC".to_string()];
-        if roi.is_some() { ops.push("ROI".to_string()); }
-        return (ops, detail);
+        return (vec!["ICC".to_string()], detail);
     }
 
     // Reaching here without --scale means --roi crop at full resolution.
@@ -823,9 +993,9 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                 eprintln!(
                     "  [warn ] requested MPP {:.4} µm/px ≤ source {:.4} µm/px (upscaling not supported); {}",
                     t, base.mpp_x,
-                    if args.icc_bake { "applying ICC bake at 1:1" } else { "skipping" }
+                    if args.icc_bake && roi.is_none() { "applying ICC bake at 1:1" } else { "skipping" }
                 );
-                if args.icc_bake {
+                if args.icc_bake && roi.is_none() {
                     let icc = icc_profile.as_deref().unwrap();
                     let out_path = if args.openslide {
                         format!("{out_dir}/{out_stem}.tiff")
@@ -833,7 +1003,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                         format!("{out_dir}/{out_stem}.ome.tiff")
                     };
                     if let Some(xform) = crate::build_icc_transform(icc) {
-                        process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb, roi);
+                        process_file_icc_bake_only(src_path, out_dir, out_stem, args, xform, &src_levels, ome_xml.as_deref(), pb);
                         let detail = passthrough_detail(src_path, &out_path, &src_levels[0]);
                         return (vec!["ICC".to_string()], detail);
                     } else {
@@ -883,8 +1053,19 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
     if roi.is_some() { ops.push("ROI".to_string()); }
 
     if let Some(skip) = jp2k_svs_skip {
+        let lv = &src_levels[skip];
+        let roi_crop = match roi {
+            None => None,
+            Some(r) => match roi_crop_of(r, (lv.img_w.div_ceil(lv.tile_w), lv.img_h.div_ceil(lv.tile_h)),
+                (lv.tile_w, lv.tile_h), (lv.img_w, lv.img_h), (src_levels[0].img_w, src_levels[0].img_h), src_path) {
+                None => return (Vec::new(), Default::default()),
+                c => c,
+            },
+        };
+        let out_dim = roi_crop.as_ref().map_or((lv.img_w, lv.img_h),
+            |c| c.dim((lv.img_w, lv.img_h), (lv.tile_w, lv.tile_h)));
         write_jp2k_svs_from_tiff(src_path, &src_levels[skip..], &tmp_path, args.verbose, pb,
-            roi, (src_levels[0].img_w, src_levels[0].img_h));
+            roi_crop.as_ref(), args.quality);
         std::fs::rename(&tmp_path, &out_path)
             .expect("Failed to rename tmp to output");
         let detail = crate::logger::ConversionDetail {
@@ -894,7 +1075,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             in_tile:  Some((src_levels[0].tile_w, src_levels[0].tile_h)),
             out_tile: Some((src_levels[skip].tile_w, src_levels[skip].tile_h)),
             in_dim:   Some((src_levels[0].img_w, src_levels[0].img_h)),
-            out_dim:  Some((src_levels[skip].img_w, src_levels[skip].img_h)),
+            out_dim:  Some(out_dim),
             in_mpp:   src_levels[0].mpp_x,
             out_mpp:  src_levels[skip].mpp_x,
         };
@@ -913,9 +1094,40 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return (Vec::new(), Default::default());
     }
 
+    // --roi: keep only the base level, cropped to the tiles touching an annotation;
+    // the levels below it are rebuilt from its tiles at 1/4 steps.
+    let roi_crop = match roi {
+        None => None,
+        Some(r) => {
+            output_levels.truncate(1);
+            let lv = &mut output_levels[0];
+            let src_lv = &src_levels[lv.src_idx];
+            let grid = (lv.out_img_w.div_ceil(lv.out_tile_w), lv.out_img_h.div_ceil(lv.out_tile_h));
+            // A passthrough tile is one source tile; a resampled one is built from 2x2.
+            let k = if lv.passthrough { 1 } else { 2 };
+            let Some(crop) = roi_crop_of(r, grid, (k * src_lv.tile_w, k * src_lv.tile_h),
+                (src_lv.img_w, src_lv.img_h), (src_levels[0].img_w, src_levels[0].img_h), src_path)
+            else {
+                return (Vec::new(), Default::default());
+            };
+            (lv.out_img_w, lv.out_img_h) = crop.dim((lv.out_img_w, lv.out_img_h), (lv.out_tile_w, lv.out_tile_h));
+            if args.verbose {
+                vlog(Some(pb), format!("  [roi  ] crop tiles {}x{} at ({}, {}) → {}x{}  {}/{} tiles inside annotations",
+                    crop.cols, crop.rows, crop.c0, crop.r0, lv.out_img_w, lv.out_img_h,
+                    crop.mask.iter().filter(|&&b| b).count(), crop.mask.len()));
+            }
+            Some(crop)
+        }
+    };
+    let roi_levels = if roi_crop.is_some() {
+        roi_reduced_levels((output_levels[0].out_img_w, output_levels[0].out_img_h))
+    } else { 0 };
+
     let total_tiles: u64 = output_levels.iter()
         .map(|lv| {
-            if lv.passthrough {
+            if let Some(c) = &roi_crop {
+                (c.cols * c.rows) as u64 + roi_reduced_tiles((c.cols, c.rows), roi_levels)
+            } else if lv.passthrough {
                 src_levels[lv.src_idx].n_tiles as u64
             } else {
                 let out_ntx = (lv.out_img_w + lv.out_tile_w - 1) / lv.out_tile_w;
@@ -994,13 +1206,15 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         return (Vec::new(), Default::default());
     }
 
-    let n_subifds = output_levels.len() - 1;
+    let n_subifds = output_levels.len() - 1 + roi_levels as usize;
     if ome && n_subifds > 0 {
         let zeros: Vec<u64> = vec![0u64; n_subifds];
         unsafe { TIFFSetField(dst_tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr()); }
     }
 
     let chunk_size = (rayon::current_num_threads() * 4).max(1);
+    // --roi: fed with the base level's tiles to build the 1/4-step levels.
+    let mut reducer: Option<Reducer> = None;
 
     for (lv_idx, lv_out) in output_levels.iter().enumerate() {
         let src_lv  = &src_levels[lv_out.src_idx];
@@ -1061,7 +1275,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             .max(src_lv.tile_w as usize * src_lv.tile_h as usize * src_lv.spp as usize)
             .max(1 << 17);
 
-        let n_tiles  = src_lv.n_tiles;
+        let n_tiles  = roi_crop.as_ref().map_or(src_lv.n_tiles, |c| c.cols * c.rows);
         let tile_ids: Vec<u32> = (0..n_tiles).collect();
 
         let pix_size    = src_lv.tile_w as usize
@@ -1095,24 +1309,26 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         if lv_out.passthrough {
             // --roi: tiles outside the annotations get a white tile matching the
             // source's photometric/subsampling instead of a raw copy.
-            let roi_fill = roi.map(|r| {
-                let grid = (src_lv.img_w.div_ceil(src_lv.tile_w), src_lv.img_h.div_ceil(src_lv.tile_h));
-                let mask = r.tile_mask(grid, (src_lv.tile_w, src_lv.tile_h),
-                    (src_lv.img_w, src_lv.img_h), (src_levels[0].img_w, src_levels[0].img_h));
+            let roi_fill = roi_crop.as_ref().map(|c| {
                 let white = crate::pipeline::encode::white_jpeg_tile(src_lv.tile_w, src_lv.tile_h, out_spp,
                     src_lv.photometric as u32 == PHOTOMETRIC_RGB, (src_subsamp_h, src_subsamp_v), args.quality);
-                (mask, white)
+                reducer = Some(Reducer::new((c.cols, c.rows), (src_lv.tile_w, src_lv.tile_h), out_spp, args.quality,
+                    crate::pipeline::jpegtables_ext::get_jpeg_tables(src_tiff, src_path),
+                    out_spp == 3 && src_lv.photometric as u32 == PHOTOMETRIC_RGB, false));
+                (c, white)
             });
             for chunk in tile_ids.chunks(chunk_size) {
                 let raw_chunk: Vec<(u32, Vec<u8>)> = chunk.iter()
                     .map(|&tile_num| {
-                        if let Some((mask, white)) = &roi_fill {
-                            if !mask.get(tile_num as usize).copied().unwrap_or(true) {
+                        let mut src_tile = tile_num;
+                        if let Some((crop, white)) = &roi_fill {
+                            if !crop.mask[tile_num as usize] {
                                 return (tile_num, white.clone());
                             }
+                            src_tile = crop.full_id(tile_num);
                         }
                         let mut buf = vec![0u8; raw_buf_size];
-                        let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
+                        let n = unsafe { TIFFReadRawTile(src_tiff, src_tile,
                             buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
                         if n > 0 { buf.truncate(n as usize); (tile_num, buf) }
                         else { (tile_num, Vec::new()) }
@@ -1122,6 +1338,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                     if !data.is_empty() {
                         unsafe { TIFFWriteRawTile(dst_tiff, tile_num,
                             data.as_ptr() as *mut c_void, data.len() as i64); }
+                        if let Some(r) = reducer.as_mut() { r.push(tile_num, &data); }
                     }
                     pb.inc(1);
                 }
@@ -1137,16 +1354,13 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             let out_nty = (lv_out.out_img_h + out_tile_h - 1) / out_tile_h;
             let out_tile_ids: Vec<u32> = (0..out_ntx * out_nty).collect();
 
-            // An output tile is built from the 2x2 source tiles below, so its
-            // footprint is a (2*tile_w x 2*tile_h) cell on the source level.
-            let roi_fill = roi.map(|r| {
-                let in_roi = r.tile_mask((out_ntx, out_nty), (2 * src_tile_w, 2 * src_tile_h),
-                    (src_lv.img_w, src_lv.img_h), (src_levels[0].img_w, src_levels[0].img_h));
-                if args.verbose {
-                    vlog(Some(pb), format!("  [roi  ] lv{}  {}/{} tiles inside annotations",
-                        lv_idx, in_roi.iter().filter(|&&b| b).count(), in_roi.len()));
-                }
-                (in_roi, crate::pipeline::encode::white_jpeg_tile(out_tile_w, out_tile_h, out_spp, false, (2, 2), args.quality))
+            // --roi: output tiles are numbered within the crop; (oc0, or0) maps
+            // them back onto the full grid of 2x2 source-tile cells.
+            let (oc0, or0) = roi_crop.as_ref().map_or((0, 0), |c| (c.c0, c.r0));
+            let roi_fill = roi_crop.as_ref().map(|c| {
+                reducer = Some(Reducer::new((c.cols, c.rows), (out_tile_w, out_tile_h), out_spp, args.quality,
+                    None, false, false));
+                (c.mask.clone(), crate::pipeline::encode::white_jpeg_tile(out_tile_w, out_tile_h, out_spp, false, (2, 2), args.quality))
             });
 
             let enc_params = Arc::new(EncodeParams {
@@ -1181,8 +1395,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             for chunk in out_tile_ids.chunks(chunk_size) {
                 let raw_chunk: RawChunk = chunk.iter()
                     .map(|&out_id| {
-                        let oc  = out_id % out_ntx;
-                        let or_ = out_id / out_ntx;
+                        let oc  = out_id % out_ntx + oc0;
+                        let or_ = out_id / out_ntx + or0;
                         let mut quads: RawQuad = [None, None, None, None];
                         // Outside --roi: skip source reads; encode_one_tile emits white.
                         if enc_params.roi_fill.as_ref().is_some_and(|(m, _)| !m[out_id as usize]) {
@@ -1236,6 +1450,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                 if let Some(prev) = pending_write.take() {
                     let n = prev.len() as u64;
                     unsafe { write_enc_chunk(dst_tiff, &prev, &mut jpegtables_registered); }
+                    if let Some(r) = reducer.as_mut() { for (id, t) in &prev { r.push(*id, t); } }
                     pb.inc(n);
                 }
 
@@ -1247,17 +1462,25 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
             if let Some(last) = pending_write.take() {
                 let n = last.len() as u64;
                 unsafe { write_enc_chunk(dst_tiff, &last, &mut jpegtables_registered); }
+                if let Some(r) = reducer.as_mut() { for (id, t) in &last { r.push(*id, t); } }
                 pb.inc(n);
             }
             for enc in enc_rx {
                 let n = enc.len() as u64;
                 unsafe { write_enc_chunk(dst_tiff, &enc, &mut jpegtables_registered); }
+                if let Some(r) = reducer.as_mut() { for (id, t) in &enc { r.push(*id, t); } }
                 pb.inc(n);
             }
             compute_handle.join().expect("compute thread panicked");
         }
 
         unsafe { TIFFWriteDirectory(dst_tiff); }
+    }
+
+    if let Some(r) = reducer {
+        let b = &output_levels[0];
+        unsafe { write_reduced_levels(dst_tiff, r, (b.out_img_w, b.out_img_h),
+            (b.actual_mpp_x, b.actual_mpp_y), roi_levels, args.verbose, pb); }
     }
 
     unsafe { TIFFClose(dst_tiff); }
