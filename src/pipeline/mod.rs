@@ -200,7 +200,8 @@ fn convert_one_series(
         sanitize_file_stem(series_id.as_str())
     };
 
-    let roi_raw_jp2k = roi_raw_group
+    // OpenSlide reads JP2K tiles only from SVS; OME-TIFF carries them as-is.
+    let roi_raw_jp2k = args.openslide && roi_raw_group
         .is_some_and(|g| is_jpeg2000(&map_transfer_syntax_to_compression(&g[0].transfer_syntax_uid)));
     let output_path = if roi_raw_jp2k {
         format!("{}/{}.svs", args.output_dir, file_stem)

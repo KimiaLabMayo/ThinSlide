@@ -722,6 +722,7 @@ fn process_file_icc_bake_only(
 
 // ─── JP2K SVS passthrough ─────────────────────────────────────────────────────
 
+/// With `ome_xml` the output is an OME-TIFF (reduced levels as SubIFDs) instead of an SVS.
 fn write_jp2k_svs_from_tiff(
     src_path: &str,
     levels: &[TiffLevel],
@@ -730,6 +731,7 @@ fn write_jp2k_svs_from_tiff(
     pb: &ProgressBar,
     roi_crop: Option<&crate::roi::RoiCrop>,
     quality: u8,
+    ome_xml: Option<String>,
 ) {
     if levels.is_empty() { return; }
     // --roi: only the base is copied (cropped); the levels below are rebuilt from it.
@@ -740,10 +742,11 @@ fn write_jp2k_svs_from_tiff(
     let (base_w, base_h) = level_dim(base);
     let roi_levels = if roi_crop.is_some() { roi_reduced_levels((base_w, base_h)) } else { 0 };
 
-    let img_desc = format!(
+    let ome = ome_xml.is_some();
+    let img_desc = ome_xml.unwrap_or_else(|| format!(
         "Aperio Image Library\n{}x{} ({} x {})\nMPP = {:.6}",
         base_w, base_h, base.tile_w, base.tile_h, base.mpp_x
-    );
+    ));
 
     let total_tiles: u64 = match roi_crop {
         Some(c) => (c.cols * c.rows) as u64 + roi_reduced_tiles((c.cols, c.rows), roi_levels),
@@ -767,6 +770,11 @@ fn write_jp2k_svs_from_tiff(
         eprintln!("  [error] Cannot create SVS: {dst_path}");
         unsafe { TIFFClose(src_tiff); }
         return;
+    }
+    let n_subifds = levels.len() - 1 + roi_levels as usize;
+    if ome && n_subifds > 0 {
+        let zeros: Vec<u64> = vec![0u64; n_subifds];
+        unsafe { TIFFSetField(dst_tiff, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr()); }
     }
 
     for (idx, lv) in levels.iter().enumerate() {
@@ -1030,7 +1038,9 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         None
     };
 
-    let out_path = if jp2k_svs_skip.is_some() {
+    // --roi without --openslide stays OME-TIFF, which carries the JP2K tiles as well.
+    let jp2k_ome = jp2k_svs_skip.is_some() && roi.is_some() && !args.openslide;
+    let out_path = if jp2k_svs_skip.is_some() && !jp2k_ome {
         format!("{out_dir}/{out_stem}.svs")
     } else if args.openslide {
         format!("{out_dir}/{out_stem}.tiff")
@@ -1064,8 +1074,14 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
         };
         let out_dim = roi_crop.as_ref().map_or((lv.img_w, lv.img_h),
             |c| c.dim((lv.img_w, lv.img_h), (lv.tile_w, lv.tile_h)));
+        let lv_ome_xml = jp2k_ome.then(|| match ome_xml {
+            Some(ref orig) => crate::pipeline::ome::update_ome_xml_for_output(
+                orig, out_dim.0, out_dim.1, lv.mpp_x, lv.mpp_y),
+            None => crate::pipeline::ome::generate_tiff_ome_xml(
+                out_stem, out_dim.0, out_dim.1, lv.mpp_x, lv.mpp_y, lv.spp as u32),
+        });
         write_jp2k_svs_from_tiff(src_path, &src_levels[skip..], &tmp_path, args.verbose, pb,
-            roi_crop.as_ref(), args.quality);
+            roi_crop.as_ref(), args.quality, lv_ome_xml);
         std::fs::rename(&tmp_path, &out_path)
             .expect("Failed to rename tmp to output");
         let detail = crate::logger::ConversionDetail {

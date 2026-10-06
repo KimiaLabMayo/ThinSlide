@@ -145,7 +145,8 @@ Annotations are [QuPath](https://qupath.github.io/) GeoJSON in level-0 pixel coo
   converted in full. The name is the file name without its extension for SVS / TIFF / VSI
   (e.g. `CMU-1.svs` → `CMU-1.geojson`), and the parent folder name for DICOM
   (e.g. `JP2K-33003-1/DCM_0.dcm` → `JP2K-33003-1.geojson`).
-- DICOM JPEG 2000 sources copied straight through are written as `.svs`, as for SVS input.
+- JPEG 2000 tiles copied straight through are kept in `.ome.tiff`; with `--openslide` they are
+  written as `.svs`, since OpenSlide reads JPEG 2000 only from SVS.
 
 ```sh
 thinslide /data/CMU-1.svs /data/output --roi /data/CMU-1.geojson

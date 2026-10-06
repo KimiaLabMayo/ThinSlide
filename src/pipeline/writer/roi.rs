@@ -22,7 +22,7 @@ use std::ffi::CString;
 use std::os::raw::c_void;
 use indicatif::ProgressBar;
 
-/// Writes the cropped `group` level (JPEG → TIFF/OME-TIFF, JPEG 2000 → SVS).
+/// Writes the cropped `group` level (OME-TIFF if `ome`; otherwise TIFF, or SVS for JPEG 2000).
 /// `base` is the level-0 instance the GeoJSON coordinates refer to. Returns the
 /// output size, or None (nothing written) if no annotation overlaps the slide.
 pub(crate) fn write_roi_passthrough(
@@ -55,8 +55,8 @@ pub(crate) fn write_roi_passthrough(
         .unwrap_or_default();
     let jp2k_has_ict_rct = matches!(photometric_interp.as_str(), "YBR_ICT" | "YBR_RCT" | "YBR_FULL" | "YBR_FULL_422");
     let spp: u32 = if matches!(color_space, ColorSpace::Grayscale) { 1 } else { 3 };
-    // Same compression/photometric mapping as write_svs / write_resampled_tiff passthrough.
-    let (compression, photometric) = if is_jp2 {
+    // Same compression/photometric mapping as write_svs (JP2K SVS) / write_ome_tiff passthrough.
+    let (compression, photometric) = if is_jp2 && !ome {
         if jp2k_has_ict_rct { (COMPRESSION_APERIO_JP2_YCBCR, PHOTOMETRIC_YCBCR as u32) }
         else if spp == 1 { (COMPRESSION_APERIO_JP2_RGB, PHOTOMETRIC_MINISBLACK as u32) }
         else { (COMPRESSION_APERIO_JP2_RGB, PHOTOMETRIC_RGB as u32) }
@@ -99,7 +99,7 @@ pub(crate) fn write_roi_passthrough(
     }
 
     let white = if is_jp2 {
-        white_jp2k_tile(tw, th, spp, compression == COMPRESSION_APERIO_JP2_YCBCR).expect("white JP2K tile encode failed")
+        white_jp2k_tile(tw, th, spp, jp2k_has_ict_rct).expect("white JP2K tile encode failed")
     } else {
         white_jpeg_tile(tw, th, spp, photometric == PHOTOMETRIC_RGB as u32, subsamp, quality)
     };
@@ -115,7 +115,7 @@ pub(crate) fn write_roi_passthrough(
     let tiff = unsafe { TIFFOpen(path_c.as_ptr(), w8_mode.as_ptr()) };
     assert!(!tiff.is_null(), "TIFFOpen failed: cannot create '{}'", output_path);
 
-    let image_desc = if is_jp2 {
+    let image_desc = if is_jp2 && !ome {
         let comp_desc = if compression == COMPRESSION_APERIO_JP2_YCBCR { "J2K/YCB" } else { "J2K/RGB" };
         let mag = if std::ptr::eq(meta, base) { meta.objective_power } else { None }
             .unwrap_or_else(|| if mpp_x > 0.0 { (10.0 / mpp_x).round() } else { 0.0 });
@@ -129,7 +129,7 @@ pub(crate) fn write_roi_passthrough(
         None
     };
     // SVS keeps every level as a top-level IFD; OME-TIFF stores them as SubIFDs.
-    if ome && !is_jp2 && roi_levels > 0 {
+    if ome && roi_levels > 0 {
         let zeros: Vec<u64> = vec![0u64; roi_levels as usize];
         unsafe { TIFFSetField(tiff, TIFFTAG_SUBIFD, roi_levels, zeros.as_ptr()); }
     }
