@@ -369,7 +369,7 @@ pub(crate) fn process_files(
         pb.set_style(bar_style.clone());
         pb.set_message(pb_msg.clone());
 
-        let roi = match args.roi.as_deref().map(|r| crate::roi::Roi::resolve(r, &src_stem)).transpose() {
+        let roi = match args.roi.as_deref().map(|r| crate::roi::Roi::resolve(r, &src_stem, &args.roi_id)).transpose() {
             Ok(r) => r.flatten(),
             Err(e) => {
                 stats.fail.fetch_add(1, Ordering::Relaxed);

@@ -161,7 +161,7 @@ fn convert_one_series(
         .and_then(|n| n.to_str())
         .unwrap_or(series_id.as_str())
         .to_string();
-    let roi = match args.roi.as_deref().map(|r| crate::roi::Roi::resolve(r, &parent_name)).transpose() {
+    let roi = match args.roi.as_deref().map(|r| crate::roi::Roi::resolve(r, &parent_name, &args.roi_id)).transpose() {
         Ok(r) => r.flatten(),
         Err(e) => {
             stats.fail.fetch_add(1, Ordering::Relaxed);
@@ -687,7 +687,7 @@ fn convert_vsi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgre
 
         // --roi: looked up by the unsanitized file stem, as for TIFF/SVS input.
         let raw_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
-        let roi = match args.roi.as_deref().map(|r| crate::roi::Roi::resolve(r, raw_stem)).transpose() {
+        let roi = match args.roi.as_deref().map(|r| crate::roi::Roi::resolve(r, raw_stem, &args.roi_id)).transpose() {
             Ok(r) => r.flatten(),
             Err(e) => {
                 stats.fail.fetch_add(1, Ordering::Relaxed);

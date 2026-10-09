@@ -19,16 +19,22 @@ pub struct Roi {
 }
 
 impl Roi {
-    pub fn load(path: &str) -> Result<Roi, String> {
+    /// `ids` selects Features by their top-level "id"; empty means all geometries.
+    pub fn load(path: &str, ids: &[String]) -> Result<Roi, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read '{}': {}", path, e))?;
-        Self::parse(&text)
+        Self::parse(&text, ids)
     }
 
-    pub fn parse(text: &str) -> Result<Roi, String> {
+    pub fn parse(text: &str, ids: &[String]) -> Result<Roi, String> {
         let v: Value = serde_json::from_str(text).map_err(|e| format!("invalid JSON: {}", e))?;
         let mut polygons = Vec::new();
-        collect(&v, &mut polygons)?;
+        let mut found = Vec::new();
+        collect(&v, (!ids.is_empty()).then_some(ids), &mut found, &mut polygons)?;
+        let missing: Vec<&str> = ids.iter().filter(|id| !found.contains(id)).map(String::as_str).collect();
+        if !missing.is_empty() {
+            return Err(format!("feature id(s) not found: {}", missing.join(", ")));
+        }
         if polygons.is_empty() {
             return Err("no Polygon/MultiPolygon geometry found".to_string());
         }
@@ -37,12 +43,12 @@ impl Roi {
 
     /// Resolves the ROI for one slide from the --roi argument: a .geojson file is used
     /// as-is; a directory is searched for `<stem>.geojson`. Ok(None) means no match.
-    pub fn resolve(roi_arg: &str, stem: &str) -> Result<Option<Roi>, String> {
+    pub fn resolve(roi_arg: &str, stem: &str, ids: &[String]) -> Result<Option<Roi>, String> {
         let p = std::path::Path::new(roi_arg);
-        if p.is_file() { return Self::load(roi_arg).map(Some); }
+        if p.is_file() { return Self::load(roi_arg, ids).map(Some); }
         let candidate = p.join(format!("{}.geojson", stem));
         if !candidate.is_file() { return Ok(None); }
-        Self::load(&candidate.to_string_lossy()).map(Some)
+        Self::load(&candidate.to_string_lossy(), ids).map(Some)
     }
 
     /// True if the closed rectangle [x0, x1] x [y0, y1] overlaps any annotation.
@@ -107,20 +113,33 @@ impl RoiCrop {
     }
 }
 
-fn collect(v: &Value, out: &mut Vec<Polygon>) -> Result<(), String> {
+// `ids`: Some = keep only geometries of Features whose "id" is listed (matched ids are
+// pushed to `found`); None = keep every geometry.
+fn collect(v: &Value, ids: Option<&[String]>, found: &mut Vec<String>, out: &mut Vec<Polygon>) -> Result<(), String> {
     match v {
         Value::Array(items) => {
-            for it in items { collect(it, out)?; }
+            for it in items { collect(it, ids, found, out)?; }
         }
         Value::Object(obj) => match obj.get("type").and_then(Value::as_str) {
             Some("FeatureCollection") => {
-                if let Some(fs) = obj.get("features") { collect(fs, out)?; }
+                if let Some(fs) = obj.get("features") { collect(fs, ids, found, out)?; }
             }
             Some("Feature") => {
-                if let Some(g) = obj.get("geometry") { collect(g, out)?; }
+                if let Some(ids) = ids {
+                    let fid = match obj.get("id") {
+                        Some(Value::String(s)) => s.clone(),
+                        Some(Value::Number(n)) => n.to_string(),
+                        _ => return Ok(()),
+                    };
+                    if !ids.contains(&fid) { return Ok(()); }
+                    found.push(fid);
+                }
+                if let Some(g) = obj.get("geometry") { collect(g, None, found, out)?; }
             }
+            // Bare geometries carry no Feature id.
+            Some(_) if ids.is_some() => {}
             Some("GeometryCollection") => {
-                if let Some(gs) = obj.get("geometries") { collect(gs, out)?; }
+                if let Some(gs) = obj.get("geometries") { collect(gs, None, found, out)?; }
             }
             Some("Polygon") => {
                 out.push(parse_polygon(obj.get("coordinates").unwrap_or(&Value::Null))?);
@@ -229,14 +248,14 @@ mod tests {
             format!("[{}]", feat),
             format!(r#"{{"type":"FeatureCollection","features":[{}]}}"#, feat),
         ] {
-            let roi = Roi::parse(&text).unwrap();
+            let roi = Roi::parse(&text, &[]).unwrap();
             assert!(roi.intersects_rect(150.0, 150.0, 160.0, 160.0), "{}", text);
         }
     }
 
     #[test]
     fn rect_inside_outside_and_crossing() {
-        let roi = Roi::parse(SQUARE).unwrap();
+        let roi = Roi::parse(SQUARE, &[]).unwrap();
         assert!(roi.intersects_rect(120.0, 120.0, 130.0, 130.0));   // fully inside
         assert!(roi.intersects_rect(0.0, 0.0, 1000.0, 1000.0));     // contains polygon
         assert!(roi.intersects_rect(190.0, 50.0, 300.0, 120.0));    // crosses corner
@@ -250,7 +269,7 @@ mod tests {
             [[[0,0],[0,100],[100,100],[100,0],[0,0]],[[20,20],[20,80],[80,80],[80,20],[20,20]]],
             [[[200,0],[200,100],[300,100],[300,90],[210,90],[210,0],[200,0]]]
         ]}"#;
-        let roi = Roi::parse(text).unwrap();
+        let roi = Roi::parse(text, &[]).unwrap();
         assert!(!roi.intersects_rect(40.0, 40.0, 60.0, 60.0));   // inside the hole
         assert!(roi.intersects_rect(5.0, 5.0, 10.0, 10.0));      // on the ring
         assert!(!roi.intersects_rect(250.0, 20.0, 260.0, 30.0)); // in L-shape's empty corner
@@ -273,8 +292,29 @@ mod tests {
 
     #[test]
     fn rejects_empty_and_invalid() {
-        assert!(Roi::parse(r#"{"type":"FeatureCollection","features":[]}"#).is_err());
-        assert!(Roi::parse(r#"{"type":"Point","coordinates":[1,2]}"#).is_err());
-        assert!(Roi::parse("not json").is_err());
+        assert!(Roi::parse(r#"{"type":"FeatureCollection","features":[]}"#, &[]).is_err());
+        assert!(Roi::parse(r#"{"type":"Point","coordinates":[1,2]}"#, &[]).is_err());
+        assert!(Roi::parse("not json", &[]).is_err());
+    }
+
+    #[test]
+    fn selects_features_by_id() {
+        let text = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","id":"section-0","geometry":{"type":"Polygon","coordinates":[[[0,0],[0,10],[10,10],[10,0],[0,0]]]}},
+            {"type":"Feature","id":"section-1","geometry":{"type":"Polygon","coordinates":[[[100,100],[100,110],[110,110],[110,100],[100,100]]]}},
+            {"type":"Feature","id":7,"geometry":{"type":"Polygon","coordinates":[[[200,200],[200,210],[210,210],[210,200],[200,200]]]}}
+        ]}"#;
+        let ids = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let roi = Roi::parse(text, &ids(&["section-1"])).unwrap();
+        assert!(!roi.intersects_rect(2.0, 2.0, 4.0, 4.0));
+        assert!(roi.intersects_rect(102.0, 102.0, 104.0, 104.0));
+        assert!(!roi.intersects_rect(202.0, 202.0, 204.0, 204.0));
+        let roi = Roi::parse(text, &ids(&["section-0", "7"])).unwrap();
+        assert!(roi.intersects_rect(2.0, 2.0, 4.0, 4.0));
+        assert!(roi.intersects_rect(202.0, 202.0, 204.0, 204.0));
+        let err = Roi::parse(text, &ids(&["section-0", "section-5"])).unwrap_err();
+        assert!(err.contains("section-5") && !err.contains("section-0"), "{}", err);
+        // A bare geometry has no id to match.
+        assert!(Roi::parse(SQUARE, &ids(&["section-0"])).is_err());
     }
 }

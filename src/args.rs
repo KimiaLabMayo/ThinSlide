@@ -67,6 +67,12 @@ pub struct Args {
     /// Applies to TIFF/SVS, DICOM and VSI input (not MRXS).
     #[arg(long, value_name = "GEOJSON|DIR", value_parser = parse_roi, verbatim_doc_comment)]
     pub roi: Option<String>,
+
+    /// Use only the GeoJSON Features whose top-level "id" matches (comma-separated,
+    /// e.g. section-0,section-1). Selected Features are cropped together into one output.
+    /// A slide whose GeoJSON lacks any listed id fails. Requires --roi.
+    #[arg(long, value_name = "ID[,ID...]", value_delimiter = ',', requires = "roi", verbatim_doc_comment)]
+    pub roi_id: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,7 +165,7 @@ fn parse_log_file(s: &str) -> Result<String, String> {
 fn parse_roi(s: &str) -> Result<String, String> {
     let p = Path::new(s);
     if p.is_file() {
-        crate::roi::Roi::load(s)?;
+        crate::roi::Roi::load(s, &[])?;
     } else if !p.is_dir() {
         return Err(format!("'{}' does not exist", s));
     }

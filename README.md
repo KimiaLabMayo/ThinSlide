@@ -147,10 +147,15 @@ Annotations are [QuPath](https://qupath.github.io/) GeoJSON in level-0 pixel coo
   (e.g. `JP2K-33003-1/DCM_0.dcm` → `JP2K-33003-1.geojson`).
 - JPEG 2000 tiles copied straight through are kept in `.ome.tiff`; with `--openslide` they are
   written as `.svs`, since OpenSlide reads JPEG 2000 only from SVS.
+- **`--roi-id <ID[,ID...]>`** — use only the features whose top-level `"id"` matches one of
+  the comma-separated IDs (e.g. `section-0` in a multi-section `sections.geojson`).
+  Multiple IDs are cropped together into one output. A slide whose GeoJSON lacks any listed
+  ID fails. Bare geometries (no feature) are ignored.
 
 ```sh
 thinslide /data/CMU-1.svs /data/output --roi /data/CMU-1.geojson
 thinslide /data/slides /data/output --roi /data/annotations --scale 20x
+thinslide /data/CMU-3.svs /data/output --roi /data/sections.geojson --roi-id section-0 --scale half
 ```
 
 ## PHI handling
