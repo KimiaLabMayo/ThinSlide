@@ -56,6 +56,23 @@ pub struct Args {
     /// Override the default log file path (parent directory must exist)
     #[arg(long, value_parser = parse_log_file)]
     pub log_file: Option<String>,
+
+    /// QuPath GeoJSON annotations (level-0 pixel coordinates). Only tiles touching an
+    /// annotation are kept; all other tiles are filled with white, and the output is
+    /// cropped to the bounding box of the kept tiles. Without --scale the slide is
+    /// cropped at full resolution.
+    ///   <file.geojson>  applied when the input holds a single slide
+    ///   <directory>     <name>.geojson is looked up per slide (file stem; parent folder
+    ///                   name for DICOM); slides without a match are converted in full
+    /// Applies to TIFF/SVS, DICOM and VSI input (not MRXS).
+    #[arg(long, value_name = "GEOJSON|DIR", value_parser = parse_roi, verbatim_doc_comment)]
+    pub roi: Option<String>,
+
+    /// Use only the GeoJSON Features whose top-level "id" matches (comma-separated,
+    /// e.g. section-0,section-1). Selected Features are cropped together into one output.
+    /// A slide whose GeoJSON lacks any listed id fails. Requires --roi.
+    #[arg(long, value_name = "ID[,ID...]", value_delimiter = ',', requires = "roi", verbatim_doc_comment)]
+    pub roi_id: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -141,6 +158,16 @@ fn parse_log_file(s: &str) -> Result<String, String> {
     let parent = p.parent().unwrap_or(Path::new("."));
     if !parent.as_os_str().is_empty() && !parent.exists() {
         return Err(format!("parent directory '{}' does not exist", parent.display()));
+    }
+    Ok(s.to_string())
+}
+
+fn parse_roi(s: &str) -> Result<String, String> {
+    let p = Path::new(s);
+    if p.is_file() {
+        crate::roi::Roi::load(s, &[])?;
+    } else if !p.is_dir() {
+        return Err(format!("'{}' does not exist", s));
     }
     Ok(s.to_string())
 }

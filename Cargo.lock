@@ -4528,7 +4528,7 @@ dependencies = [
 
 [[package]]
 name = "thinslide"
-version = "0.4.3"
+version = "0.5.0"
 dependencies = [
  "clap",
  "dicom",
@@ -4543,11 +4543,13 @@ dependencies = [
  "jpeg2k",
  "lcms2",
  "memmap2",
+ "openjp2",
  "pkg-config",
  "portable-pty",
  "rayon",
  "rfd",
  "serde",
+ "serde_json",
  "sysinfo",
  "tiff 0.11.3",
  "turbojpeg",

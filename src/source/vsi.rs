@@ -559,6 +559,7 @@ pub(crate) fn convert_vsi(
     quarter: bool,
     verbose: bool,
     pb: Option<&ProgressBar>,
+    roi: Option<&crate::roi::Roi>,
 ) -> Result<(), String> {
     let vp = Path::new(vsi_path);
     let vsi_bytes = std::fs::read(vp).map_err(|e| format!("read vsi: {e}"))?;
@@ -604,6 +605,8 @@ pub(crate) fn convert_vsi(
 
     let spp = ets.size_c as usize;
     let mut levels = build_levels(ets, meta);
+    // GeoJSON coordinates refer to the res-0 image.
+    let roi_base = (levels[0].img_w, levels[0].img_h);
     // CellSens stores a downsampling level for every 1/2 step (res 0,1,2,...),
     // which is wasteful: 1/4 steps suffice in practice. Keep only every 4th-scale
     // step, starting at a resolution index derived from the source's magnification
@@ -644,11 +647,35 @@ pub(crate) fn convert_vsi(
         ));
     }
 
+    // --roi: keep only the top output level, cropped to the tiles touching an
+    // annotation; the levels below it are rebuilt from its tiles at 1/4 steps.
+    let roi_crop = match roi {
+        None => None,
+        Some(r) => {
+            levels.truncate(1);
+            let lv = &mut levels[0];
+            let grid = (lv.img_w.div_ceil(ets.tile_w), lv.img_h.div_ceil(ets.tile_h));
+            let crop = crate::roi::RoiCrop::from_mask(
+                &r.tile_mask(grid, (ets.tile_w, ets.tile_h), (lv.img_w, lv.img_h), roi_base), grid)
+                .ok_or("--roi: no annotation overlaps the slide")?;
+            (lv.img_w, lv.img_h) = crop.dim((lv.img_w, lv.img_h), (ets.tile_w, ets.tile_h));
+            if verbose {
+                vlog(pb, format!("  [roi  ] crop tiles {}x{} at ({}, {}) → {}x{}  {}/{} tiles inside annotations",
+                    crop.cols, crop.rows, crop.c0, crop.r0, lv.img_w, lv.img_h,
+                    crop.mask.iter().filter(|&&b| b).count(), crop.mask.len()));
+            }
+            Some(crop)
+        }
+    };
+    let roi_levels = if roi_crop.is_some() {
+        crate::tiffds::roi_reduced_levels((levels[0].img_w, levels[0].img_h))
+    } else { 0 };
+
     let total_tiles: u64 = levels.iter().map(|lv| {
         let ntx = (lv.img_w + ets.tile_w - 1) / ets.tile_w;
         let nty = (lv.img_h + ets.tile_h - 1) / ets.tile_h;
         (ntx * nty) as u64
-    }).sum();
+    }).sum::<u64>() + roi_crop.as_ref().map_or(0, |c| crate::tiffds::roi_reduced_tiles((c.cols, c.rows), roi_levels));
     if let Some(p) = pb { p.set_length(total_tiles); }
 
     let ome = !openslide;
@@ -669,7 +696,7 @@ pub(crate) fn convert_vsi(
     let dst = unsafe { TIFFOpen(out_c.as_ptr(), w8_mode.as_ptr()) };
     if dst.is_null() { return Err(format!("cannot create {out_path}")); }
 
-    let n_subifds = levels.len().saturating_sub(1);
+    let n_subifds = levels.len().saturating_sub(1) + roi_levels as usize;
     if ome && n_subifds > 0 {
         let zeros: Vec<u64> = vec![0u64; n_subifds];
         unsafe { TIFFSetField(dst, TIFFTAG_SUBIFD, n_subifds as u32, zeros.as_ptr()); }
@@ -693,6 +720,17 @@ pub(crate) fn convert_vsi(
     } else {
         (2, 2)
     };
+
+    // --roi: white tile for cells outside the annotations, written as a
+    // self-contained stream so it never claims the level's JPEGTABLES, and the
+    // reducer fed with the top level's tiles to build the 1/4-step levels.
+    let (oc0, or0) = roi_crop.as_ref().map_or((0, 0), |c| (c.c0, c.r0));
+    let roi_white = roi_crop.as_ref().map(|_| crate::pipeline::encode::white_jpeg_tile(
+        ets.tile_w, ets.tile_h, spp as u32, false,
+        if jpeg_pass { (pass_subsamp.0 as u16, pass_subsamp.1 as u16) } else { (2, 2) }, quality));
+    let mut reducer = roi_crop.as_ref().map(|c| crate::tiffds::Reducer::new(
+        (c.cols, c.rows), (ets.tile_w, ets.tile_h), spp as u32, quality, None, false, false));
+    let in_roi = |id: u32| roi_crop.as_ref().is_none_or(|c| c.mask[id as usize]);
 
     for (lv_idx, lv) in levels.iter().enumerate() {
         let subfile = if lv_idx == 0 { 0u32 } else { FILETYPE_REDUCEDIMAGE };
@@ -725,18 +763,25 @@ pub(crate) fn convert_vsi(
             // handed, so pointing it at the mmap slice is safe.)
             let mut registered: Option<Vec<u8>> = None;
             for (n, &id) in ids.iter().enumerate() {
-                let tc = id % ntx;
-                let tr = id / ntx;
-                match index.get(&(lv.res, tc, tr))
-                    .and_then(|&i| chunk_bytes(ets, &ets.chunks[i]))
-                {
-                    Some(b) => unsafe {
-                        write_jpeg_tile(dst, id, b, &mut registered);
-                    },
-                    None => {
-                        let pixels = background_tile(ets, tw * th * spp, spp);
-                        if let Some(enc) = encode_tile(&pixels, tw, th, spp, quality) {
-                            unsafe { write_jpeg_tile(dst, id, &enc, &mut registered); }
+                let tc = id % ntx + oc0;
+                let tr = id / ntx + or0;
+                if let (false, Some(white)) = (in_roi(id), &roi_white) {
+                    unsafe { TIFFWriteRawTile(dst, id, white.as_ptr() as *mut c_void, white.len() as i64); }
+                    if let Some(r) = reducer.as_mut() { r.push(id, white); }
+                } else {
+                    match index.get(&(lv.res, tc, tr))
+                        .and_then(|&i| chunk_bytes(ets, &ets.chunks[i]))
+                    {
+                        Some(b) => {
+                            unsafe { write_jpeg_tile(dst, id, b, &mut registered); }
+                            if let Some(r) = reducer.as_mut() { r.push(id, b); }
+                        }
+                        None => {
+                            let pixels = background_tile(ets, tw * th * spp, spp);
+                            if let Some(enc) = encode_tile(&pixels, tw, th, spp, quality) {
+                                unsafe { write_jpeg_tile(dst, id, &enc, &mut registered); }
+                                if let Some(r) = reducer.as_mut() { r.push(id, &enc); }
+                            }
                         }
                     }
                 }
@@ -757,8 +802,9 @@ pub(crate) fn convert_vsi(
         } else {
             // Decode + re-encode every tile in parallel, then write in tile order.
             let mut encoded: Vec<(u32, Vec<u8>)> = ids.par_iter().filter_map(|&id| {
-                let tc = id % ntx;
-                let tr = id / ntx;
+                if let (false, Some(white)) = (in_roi(id), &roi_white) { return Some((id, white.clone())); }
+                let tc = id % ntx + oc0;
+                let tr = id / ntx + or0;
                 let chunk = index.get(&(lv.res, tc, tr)).map(|&i| &ets.chunks[i]);
                 let pixels = decode_tile(ets, chunk, spp);
                 encode_tile(&pixels, tw, th, spp, quality).map(|j| (id, j))
@@ -767,10 +813,16 @@ pub(crate) fn convert_vsi(
 
             let mut registered = false;
             unsafe { write_enc_chunk(dst, &encoded, &mut registered); }
+            if let Some(r) = reducer.as_mut() { for (id, t) in &encoded { r.push(*id, t); } }
             if let Some(p) = pb { p.inc(encoded.len() as u64); }
         }
 
         unsafe { TIFFWriteDirectory(dst); }
+    }
+
+    if let Some(r) = reducer {
+        unsafe { crate::tiffds::write_reduced_levels(dst, r, (levels[0].img_w, levels[0].img_h),
+            (levels[0].mpp_x, levels[0].mpp_y), roi_levels, verbose, pb); }
     }
 
     unsafe { TIFFClose(dst); }

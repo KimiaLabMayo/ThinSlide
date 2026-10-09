@@ -5,6 +5,7 @@
 - **Convert** — WSIs are fragmented. Consolidate them into clean TIFF/OME-TIFF.
 - **Downsample** — WSIs are heavy. Normalize 40x scans to 20x and save storage by ~75%. `--scale 20x`
 - **Standardize** — Colors are not portable. Bake ICC profiles into the pixels. `--icc-bake`
+- **Crop** - WSIs are huge. Keep only the annotated regions. `--roi <file.geojson|DIR>`
 
 ## Formats
 
@@ -24,7 +25,7 @@ source's original compression, and is readable by [OpenSlide](https://openslide.
 ¹ Experimental reader. 8-bit brightfield only.
   `--scale <number>` is not supported for VSI yet.
   
-² Skipped unless combined with `--scale` or `--icc-bake`.
+² Skipped unless combined with `--scale`, `--icc-bake` or `--roi`.
 
 ## Desktop app (no command)
 
@@ -73,72 +74,15 @@ thinslide /data/slides /data/output --scale 20x --icc-bake --quality 90 -j 4
 
 ### Installation
 
-Prebuilt binaries are attached to every [release](https://github.com/KimiaLabMayo/ThinSlide/releases/latest).
-Download the one for your platform, make it executable, and put it on your `PATH`:
-
-| Platform | Asset | Includes GUI | Dependencies |
-|----------|-------|:---:|---|
-| Linux x86_64 | `thinslide-linux-x86_64-musl` | — | none (static musl) |
-| macOS arm64 | `thinslide-macos-arm64` | ✓ | none (static) |
-| Windows x86_64 | `thinslide-windows-x86_64.exe` | ✓ | none (static) |
-
-```sh
-# Linux / macOS
-curl -L -o thinslide https://github.com/KimiaLabMayo/ThinSlide/releases/latest/download/thinslide-linux-x86_64-musl
-chmod +x thinslide
-sudo mv thinslide /usr/local/bin/
-```
-
-On Windows, download `thinslide-windows-x86_64.exe` and add its folder to `PATH`.
-
-#### From crates.io or source
-
-Requires a [Rust toolchain](https://rustup.rs) (edition 2024) and the **development**
-headers for [libtiff](http://www.libtiff.org/) and [Little CMS 2](https://www.littlecms.com/):
-
-```sh
-brew install libtiff little-cms2          # macOS
-sudo apt install libtiff-dev liblcms2-dev # Debian / Ubuntu
-sudo dnf install libtiff-devel lcms2-devel # Fedora / RHEL
-
-cargo install thinslide
-```
+See [doc/installation.md](doc/installation.md) for prebuilt binaries and build-from-source instructions.
 
 ## Advanced
 
-**`--scale <20x|half|quarter|number>`** — pick exactly one downsampling target:
-
-- **`20x`** — auto-detect from source MPP and normalize to 20x scan magnification.
-- **`half`** — halve both dimensions unconditionally, without reading source MPP.
-  Useful when the source has no resolution metadata (so `20x` would have to skip it).
-- **`quarter`** — quarter both dimensions unconditionally, without reading source MPP.
-  Same idea as `half`, but a 1/4-scale level is usually already precomputed in the
-  source pyramid (unlike 1/2), so this is typically faster.
-- **`<number>`** — downsample to an arbitrary resolution (µm/px) instead of normalizing
-  to 20x. Always resamples in full, so it is slower than `20x`/`half`/`quarter`.
-  Use `--kernel` to pick the resampling kernel.
-
-```sh
-thinslide /data/slides /data/output --scale half
-thinslide /data/slides /data/output --scale quarter
-thinslide /data/slides /data/output --scale 0.5 --kernel lanczos3
-```
+See [doc/advanced.md](doc/advanced.md) for full details on `--scale` and `--roi`.
 
 ## PHI handling
 
-- **All output formats** — DICOM tags that identify a patient (patient name, ID, birth date,
-  accession number, SeriesInstanceUID, etc.) are never copied into the output file's metadata.
-  Only non-identifying technical parameters are retained: image dimensions, tile size,
-  magnification (MPP), and compression. OME-TIFF additionally embeds the source `Manufacturer`
-  in its OME-XML.
-- **DICOM input — output filename** — by default the output filename is derived from the
-  source SeriesInstanceUID (not from the in-file metadata above). Use `--use-parent-name` to
-  name the output after the input folder instead if the UID should not appear in the filename.
-- **TIFF / OME-TIFF output** — the label and thumbnail images are dropped from the output.
-- **SVS output (`--openslide`)** — the label and thumbnail images are carried over from the
-  source DICOM as-is; DICOM PHI tags are still not carried over.
-- In all cases, any personal information that is visibly embedded in the tissue region itself
-  (as image content, not metadata) is not removed.
+See [doc/phi-handling.md](doc/phi-handling.md) for details.
 
 ## Acknowledgments
 

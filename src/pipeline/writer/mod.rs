@@ -4,11 +4,13 @@ pub(crate) mod flat;
 pub(crate) mod ome;
 pub(crate) mod svs;
 pub(crate) mod resampled;
+pub(crate) mod roi;
 
 pub(crate) use flat::write_flat_multipage_tiff;
 pub(crate) use ome::write_ome_tiff;
 pub(crate) use svs::write_svs;
 pub(crate) use resampled::write_resampled_tiff;
+pub(crate) use roi::write_roi_passthrough;
 
 use crate::bindings::{
     TIFF, TIFFSetField,
