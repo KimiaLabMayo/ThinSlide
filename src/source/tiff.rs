@@ -29,6 +29,16 @@ enum LevelNav {
     SubDir(u64),
 }
 
+/// One IFD of the main chain, in file order.
+#[derive(Clone)]
+pub(crate) enum MainIfd {
+    /// Full-resolution plane (one Z/C/T plane for OME-TIFF) with its SubIFD levels,
+    /// ordered like `TiffSource` levels (finest first).
+    Plane(Vec<TiffLevel>),
+    /// OME-TIFF only: IFD of another OME Image (label, macro, thumbnail), copied as-is.
+    Aux(u32),
+}
+
 #[derive(Clone)]
 pub(crate) struct TiffLevel {
     pub img_w:       u32,
@@ -50,18 +60,29 @@ pub struct TiffSource {
     level_info: Vec<LevelInfo>,
     icc:        Option<Vec<u8>>,
     pub ome_xml: Option<String>,
+    layout:     Vec<MainIfd>,
     metadata:   SlideMetadata,
 }
 
 impl TiffSource {
-    pub fn open(path: &str) -> Option<TiffSource> {
-        let path_c  = CString::new(path).ok()?;
-        let mode_c  = CString::new("r").ok()?;
+    /// Opens a pyramidal TIFF/SVS, or an OME-TIFF when IFD 0 carries OME-XML.
+    /// Errors name the reason the file cannot be processed.
+    pub fn open(path: &str) -> Result<TiffSource, String> {
+        let path_c  = CString::new(path).map_err(|e| e.to_string())?;
+        let mode_c  = CString::new("r").map_err(|e| e.to_string())?;
         let tiff = unsafe { TIFFOpen(path_c.as_ptr(), mode_c.as_ptr()) };
-        if tiff.is_null() { return None; }
-        let mut levels = collect_pyramid_levels(tiff);
+        if tiff.is_null() { return Err("cannot open".to_string()); }
+        let ome_xml = read_ome_xml_str(tiff);
+        if ome_xml.is_some() {
+            let spp = ifd0_samples_per_pixel(tiff);
+            if spp != 3 {
+                unsafe { TIFFClose(tiff); }
+                return Err(format!("non-RGB OME-TIFF (SamplesPerPixel={spp}) is not supported"));
+            }
+        }
+        // OME-TIFF planes are separate main IFDs, so only SubIFDs form the pyramid.
+        let mut levels = collect_pyramid_levels(tiff, 0, ome_xml.is_none());
         let icc     = read_icc_profile(tiff, &levels);
-        let ome_xml = read_ome_xml_str(tiff, &levels);
 
         // OME-XML mpp fallback when TIFF resolution tags are absent
         if !levels.is_empty() && levels[0].mpp_x <= 0.0 {
@@ -79,24 +100,31 @@ impl TiffSource {
             }
         }
 
+        let layout = match &ome_xml {
+            _ if levels.is_empty() => Err("no tiled pyramid found".to_string()),
+            Some(xml) => ome_layout(tiff, xml, path, &levels),
+            None => Ok(vec![MainIfd::Plane(levels.clone())]),
+        };
         unsafe { TIFFClose(tiff); }
-        if levels.is_empty() { return None; }
+        let layout = layout?;
         let name = std::path::Path::new(path)
             .file_stem().unwrap_or_default()
             .to_string_lossy().to_string();
         let level_info = levels.iter().map(level_to_info).collect();
-        Some(TiffSource {
+        Ok(TiffSource {
             path: path.to_string(),
             levels,
             level_info,
             icc,
             ome_xml,
+            layout,
             metadata: SlideMetadata { name },
         })
     }
 
-    pub(crate) fn into_parts(self) -> (Vec<TiffLevel>, Option<Vec<u8>>, Option<String>, SlideMetadata) {
-        (self.levels, self.icc, self.ome_xml, self.metadata)
+    /// Returns (levels of the first plane, ICC, OME-XML, main IFD layout, metadata).
+    pub(crate) fn into_parts(self) -> (Vec<TiffLevel>, Option<Vec<u8>>, Option<String>, Vec<MainIfd>, SlideMetadata) {
+        (self.levels, self.icc, self.ome_xml, self.layout, self.metadata)
     }
 }
 
@@ -122,10 +150,12 @@ pub(crate) unsafe fn navigate(tiff: *mut TIFF, idx: usize, levels: &[TiffLevel])
     }
 }
 
-fn collect_pyramid_levels(tiff: *mut TIFF) -> Vec<TiffLevel> {
+/// Pyramid rooted at main IFD `dir`: the IFD plus its SubIFDs, or (with `scan_chain`
+/// and no SubIFDs) every tiled IFD of the main chain.
+fn collect_pyramid_levels(tiff: *mut TIFF, dir: u32, scan_chain: bool) -> Vec<TiffLevel> {
     let mut levels = Vec::new();
 
-    unsafe { TIFFSetDirectory(tiff, 0); }
+    unsafe { TIFFSetDirectory(tiff, dir); }
     let Some(mut lv0) = read_level_meta(tiff) else { return levels; };
 
     let mut n_sub: u16 = 0;
@@ -143,22 +173,23 @@ fn collect_pyramid_levels(tiff: *mut TIFF) -> Vec<TiffLevel> {
         }
     }
 
-    lv0.nav = LevelNav::Dir(0);
+    lv0.nav = LevelNav::Dir(dir);
     levels.push(lv0);
 
     if has_subifds {
-        let offsets = unsafe { std::slice::from_raw_parts(sub_ptr, n_sub as usize) };
-        for &off in offsets {
+        // Copy: the array belongs to libtiff's current directory, which the loop replaces.
+        let offsets = unsafe { std::slice::from_raw_parts(sub_ptr, n_sub as usize) }.to_vec();
+        for off in offsets {
             if off == 0 { continue; }
             if unsafe { TIFFSetSubDirectory(tiff, off) } != 0 {
                 if let Some(mut lv) = read_level_meta(tiff) {
                     lv.nav = LevelNav::SubDir(off);
                     levels.push(lv);
                 }
-                unsafe { TIFFSetDirectory(tiff, 0); }
+                unsafe { TIFFSetDirectory(tiff, dir); }
             }
         }
-    } else {
+    } else if scan_chain {
         let n_dirs = unsafe { TIFFNumberOfDirectories(tiff) };
         for dir_idx in 1..n_dirs {
             unsafe { TIFFSetDirectory(tiff, dir_idx); }
@@ -257,9 +288,19 @@ fn parse_mpp_from_image_description(tiff: *mut TIFF) -> Option<f64> {
     None
 }
 
-fn read_ome_xml_str(tiff: *mut TIFF, levels: &[TiffLevel]) -> Option<String> {
-    if levels.is_empty() { return None; }
-    unsafe { navigate(tiff, 0, levels); }
+fn ifd0_samples_per_pixel(tiff: *mut TIFF) -> u16 {
+    let mut spp: u16 = 1;
+    unsafe {
+        TIFFSetDirectory(tiff, 0);
+        TIFFGetField(tiff, TIFFTAG_SAMPLESPERPIXEL, &mut spp as *mut u16);
+    }
+    spp
+}
+
+/// OME-XML of IFD 0, detected like tifffile `is_ome`: the description contains an
+/// <OME> root element and ends with its closing tag.
+fn read_ome_xml_str(tiff: *mut TIFF) -> Option<String> {
+    unsafe { TIFFSetDirectory(tiff, 0); }
     let mut desc_ptr: *const std::os::raw::c_char = std::ptr::null();
     let ok = unsafe {
         TIFFGetField(tiff, TIFFTAG_IMAGEDESCRIPTION,
@@ -267,11 +308,75 @@ fn read_ome_xml_str(tiff: *mut TIFF, levels: &[TiffLevel]) -> Option<String> {
     };
     if ok == 0 || desc_ptr.is_null() { return None; }
     let desc = unsafe { std::ffi::CStr::from_ptr(desc_ptr) }.to_string_lossy().to_string();
-    if desc.contains("openmicroscopy.org") || (desc.contains("<OME") && desc.contains("xmlns")) {
+    if desc.contains("<OME") && desc.trim_end().ends_with("OME>") {
         Some(desc)
     } else {
         None
     }
+}
+
+/// Classifies every main IFD of an OME-TIFF: the IFDs mapped by the first <Image>'s
+/// <TiffData> are its Z/C/T planes (each a SubIFD pyramid shaped like `plane0`);
+/// all others belong to other Images (label, macro, ...) and are kept as Aux.
+fn ome_layout(tiff: *mut TIFF, xml: &str, path: &str, plane0: &[TiffLevel]) -> Result<Vec<MainIfd>, String> {
+    if xml.contains("<BinaryOnly") {
+        return Err("BinaryOnly OME-TIFF (metadata in a companion file) is not supported".to_string());
+    }
+    let img_start = xml.find("<Image ").ok_or("OME-XML has no <Image>")?;
+    let img = &xml[img_start..];
+    let img = &img[..img.find("</Image>").unwrap_or(img.len())];
+    let pix = &img[img.find("<Pixels").ok_or("OME-XML <Image> has no <Pixels>")?..];
+    let pix_tag = &pix[..pix.find('>').unwrap_or(pix.len())];
+    let size = |name: &str| -> u32 {
+        extract_xml_attr(pix_tag, name).and_then(|v| v.parse().ok()).unwrap_or(1).max(1)
+    };
+    // SizeC counts samples, so an interleaved RGB plane (spp=3) is one plane for SizeC=3.
+    let n_planes = size("SizeZ") * size("SizeT") * size("SizeC").div_ceil(plane0[0].spp.max(1) as u32);
+
+    // Bio-Formats writes <UUID FileName="..."> even for single-file data; only reject
+    // TiffData that points into another file of a multi-file set.
+    let own_name = std::path::Path::new(path).file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let tags = |name: &'static str| img.match_indices(name)
+        .map(|(i, _)| &img[i..i + img[i..].find('>').unwrap_or(img.len() - i)]);
+    if tags("<UUID").any(|t| extract_xml_attr(t, "FileName").is_some_and(|f| f != own_name)) {
+        return Err("multi-file OME-TIFF (TiffData in another file) is not supported".to_string());
+    }
+
+    let mut plane_ifds = std::collections::BTreeSet::new();
+    for tag in tags("<TiffData") {
+        let attr = |name: &str| extract_xml_attr(tag, name).and_then(|v| v.parse::<u32>().ok());
+        let ifd = attr("IFD");
+        let count = attr("PlaneCount").unwrap_or(if ifd.is_some() { 1 } else { n_planes });
+        plane_ifds.extend(ifd.unwrap_or(0)..ifd.unwrap_or(0) + count);
+    }
+    if plane_ifds.is_empty() {
+        plane_ifds.extend(0..n_planes);
+    }
+
+    let n_dirs = unsafe { TIFFNumberOfDirectories(tiff) };
+    if !plane_ifds.contains(&0) {
+        return Err("IFD 0 is not a plane of the first OME <Image>".to_string());
+    }
+    if let Some(&ifd) = plane_ifds.iter().find(|&&i| i >= n_dirs) {
+        return Err(format!("OME <TiffData> refers to missing IFD {ifd}"));
+    }
+
+    (0..n_dirs).map(|dir| {
+        if !plane_ifds.contains(&dir) { return Ok(MainIfd::Aux(dir)); }
+        if dir == 0 { return Ok(MainIfd::Plane(plane0.to_vec())); }
+        let mut levels = collect_pyramid_levels(tiff, dir, false);
+        let same_shape = levels.len() == plane0.len() && levels.iter().zip(plane0).all(|(a, b)|
+            (a.img_w, a.img_h, a.tile_w, a.tile_h, a.compression, a.photometric, a.spp)
+                == (b.img_w, b.img_h, b.tile_w, b.tile_h, b.compression, b.photometric, b.spp));
+        if !same_shape {
+            return Err(format!("OME plane at IFD {dir} differs in pyramid shape or encoding from IFD 0"));
+        }
+        // Geometry is identical, so the resolution resolved for plane 0 applies.
+        for (lv, lv0) in levels.iter_mut().zip(plane0) {
+            (lv.mpp_x, lv.mpp_y) = (lv0.mpp_x, lv0.mpp_y);
+        }
+        Ok(MainIfd::Plane(levels))
+    }).collect()
 }
 
 /// Parse PhysicalSizeX/Y attributes from OME-XML and return (mpp_x, mpp_y) in µm.

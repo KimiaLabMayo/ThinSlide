@@ -112,22 +112,39 @@ fn replace_xml_attr(xml: &str, attr: &str, new_val: &str) -> String {
 }
 
 /// Update an existing OME-XML string with new output dimensions and physical size.
-/// Preserves all other metadata (Image name, Channel info, Instrument, etc.).
+/// Only the first <Pixels> (the pyramid image) is changed; all other metadata, including
+/// TiffData IFD numbers, is preserved since the output keeps the source main-IFD order.
+/// `pyramid` lists the (width, height) of every output level, base first; an existing
+/// Bio-Formats PyramidResolution annotation is rewritten to match its SubIFD levels.
 pub(crate) fn update_ome_xml_for_output(
     original: &str,
-    new_width: u32, new_height: u32,
+    pyramid: &[(u32, u32)],
     new_mpp_x: f64, new_mpp_y: f64,
 ) -> String {
-    let mut xml = original.to_string();
-    xml = replace_xml_attr(&xml, "SizeX",           &new_width.to_string());
-    xml = replace_xml_attr(&xml, "SizeY",           &new_height.to_string());
-    xml = replace_xml_attr(&xml, "PhysicalSizeX",   &format!("{new_mpp_x:.6}"));
-    xml = replace_xml_attr(&xml, "PhysicalSizeY",   &format!("{new_mpp_y:.6}"));
-    xml = replace_xml_attr(&xml, "PhysicalSizeXUnit", "µm");
-    xml = replace_xml_attr(&xml, "PhysicalSizeYUnit", "µm");
-    // Reset TiffData IFD to 0 (main image is always at IFD 0 in our output)
-    xml = replace_xml_attr(&xml, "IFD", "0");
-    xml
+    let Some(start) = original.find("<Pixels") else { return original.to_string(); };
+    let end = original[start..].find('>').map_or(original.len(), |e| start + e);
+    let (new_width, new_height) = pyramid[0];
+    let mut tag = original[start..end].to_string();
+    tag = replace_xml_attr(&tag, "SizeX",           &new_width.to_string());
+    tag = replace_xml_attr(&tag, "SizeY",           &new_height.to_string());
+    tag = replace_xml_attr(&tag, "PhysicalSizeX",   &format!("{new_mpp_x:.6}"));
+    tag = replace_xml_attr(&tag, "PhysicalSizeY",   &format!("{new_mpp_y:.6}"));
+    tag = replace_xml_attr(&tag, "PhysicalSizeXUnit", "µm");
+    tag = replace_xml_attr(&tag, "PhysicalSizeYUnit", "µm");
+    let xml = format!("{}{}{}", &original[..start], tag, &original[end..]);
+    replace_pyramid_resolution(&xml, &pyramid[1..])
+}
+
+/// Rewrite the <Value> of the "openmicroscopy.org/PyramidResolution" MapAnnotation with
+/// one `<M K="n">W H</M>` entry per reduced level; unchanged if there is none.
+fn replace_pyramid_resolution(xml: &str, reduced: &[(u32, u32)]) -> String {
+    let Some(ns) = xml.find("openmicroscopy.org/PyramidResolution") else { return xml.to_string(); };
+    let Some(v0) = xml[ns..].find("<Value>").map(|i| ns + i + "<Value>".len()) else { return xml.to_string(); };
+    let Some(v1) = xml[v0..].find("</Value>").map(|i| v0 + i) else { return xml.to_string(); };
+    let entries: String = reduced.iter().enumerate()
+        .map(|(i, (w, h))| format!("<M K=\"{}\">{} {}</M>", i + 1, w, h))
+        .collect();
+    format!("{}{}{}", &xml[..v0], entries, &xml[v1..])
 }
 
 /// Build an OME-XML string for a TIFF/SVS-derived pyramid (simpler form without DICOM UUID).
