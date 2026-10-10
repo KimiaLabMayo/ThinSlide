@@ -235,7 +235,7 @@ impl eframe::App for App {
             });
             for path in dropped {
                 let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-                let is_input_file = path.is_file() && matches!(ext.as_str(), "tiff" | "tif" | "svs");
+                let is_input_file = path.is_file() && matches!(ext.as_str(), "tiff" | "tif" | "svs" | "ndpi");
                 if path.is_dir() || is_input_file {
                     if self.input_dir.is_empty() {
                         self.input_dir = path.display().to_string();
@@ -247,7 +247,7 @@ impl eframe::App for App {
             if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
                 ui.colored_label(
                     egui::Color32::from_rgb(60, 140, 220),
-                    "↓  Drop a folder (or .tiff/.tif/.svs file) to set input path (or output path if input is already set)",
+                    "↓  Drop a folder (or .tiff/.tif/.svs/.ndpi file) to set input path (or output path if input is already set)",
                 );
             }
 

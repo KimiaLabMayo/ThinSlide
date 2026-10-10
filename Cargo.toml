@@ -1,6 +1,6 @@
 [package]
 name = "thinslide"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 authors = ["Wataru Uegami, MD, PhD"]
 license = "GPL-2.0-or-later"

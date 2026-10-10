@@ -2,6 +2,7 @@ pub mod tiff;
 pub mod dicom;
 pub mod vsi;
 pub mod mrxs;
+pub mod ndpi;
 
 #[derive(Clone)]
 pub struct LevelInfo {
