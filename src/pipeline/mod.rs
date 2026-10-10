@@ -489,6 +489,7 @@ pub fn run(args: Args) {
     let mut tiff_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut vsi_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut mrxs_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut ndpi_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut last_dir_count   = 0usize;
     let mut total_file_count = 0usize;
     for entry in WalkDir::new(&args.input_dir).follow_links(true).into_iter().filter_map(|e| e.ok()) {
@@ -520,6 +521,9 @@ pub fn run(args: Args) {
             "mrxs" => {
                 mrxs_paths.push(entry.path().to_owned());
             }
+            "ndpi" => {
+                ndpi_paths.push(entry.path().to_owned());
+            }
             _ => {}
         }
     }
@@ -533,7 +537,7 @@ pub fn run(args: Args) {
     let total_files = total_file_count as u64;
 
     if let Some(ref r) = args.roi {
-        let n_slides = dir_groups.len() + tiff_paths.len() + vsi_paths.len() + mrxs_paths.len();
+        let n_slides = dir_groups.len() + tiff_paths.len() + vsi_paths.len() + mrxs_paths.len() + ndpi_paths.len();
         if Path::new(r).is_file() && n_slides > 1 {
             eprintln!("[error] --roi <file.geojson> requires a single slide as input; \
                 pass a directory of <name>.geojson files for multiple slides");
@@ -645,6 +649,16 @@ pub fn run(args: Args) {
     if !mrxs_paths.is_empty() {
         mrxs_paths.sort();
         convert_mrxs_files(&mrxs_paths, &args, &mp, &logger, &stats);
+    }
+
+    if !ndpi_paths.is_empty() {
+        if args.scale.is_some() || args.roi.is_some() {
+            ndpi_paths.sort();
+            convert_ndpi_files(&ndpi_paths, &args, &mp, &logger, &stats);
+        } else {
+            eprintln!("  {} NDPI file(s) found; specify --scale or --roi to process them.",
+                ndpi_paths.len());
+        }
     }
 
     // Report after every format has been converted, not just DICOM.
@@ -841,5 +855,117 @@ fn convert_mrxs_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgr
                 pb.finish_and_clear();
             }
         }
+    }
+}
+
+// Transcode each Hamamatsu .ndpi slide (decode → re-encode) into a pyramidal TIFF.
+fn convert_ndpi_files(paths: &[std::path::PathBuf], args: &Args, mp: &MultiProgress,
+                      logger: &ConversionLogger, stats: &ConversionStats) {
+    use crate::source::ndpi::{convert_ndpi, Outcome};
+    let total = paths.len();
+    for (i, path) in paths.iter().enumerate() {
+        let idx = i + 1;
+        let src = path.to_string_lossy().to_string();
+        let stem = sanitize_file_stem(
+            path.file_stem().and_then(|s| s.to_str()).unwrap_or("image"));
+        let pb_msg = format!("({}/{}) {}", idx, total, stem);
+        let out_path = if args.openslide {
+            format!("{}/{}.tiff", args.output_dir, stem)
+        } else {
+            format!("{}/{}.ome.tiff", args.output_dir, stem)
+        };
+        if Path::new(&out_path).exists() {
+            if args.verbose { eprintln!("  [skip ] exists: {}", out_path); }
+            stats.skipped.fetch_add(1, Ordering::Relaxed);
+            logger.log_skip(idx, &stem);
+            continue;
+        }
+
+        let pb = mp.add(ProgressBar::new(0));
+        pb.set_style(ProgressStyle::with_template(
+            "  {msg:<52} [{bar:35.green/white}] {pos:>6}/{len} Tiles"
+        ).unwrap().progress_chars("=>-"));
+        pb.set_message(pb_msg.clone());
+
+        // --roi: looked up by the unsanitized file stem, as for TIFF/SVS input.
+        let raw_stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("image");
+        let roi = match args.roi.as_deref().map(|r| crate::roi::Roi::resolve(r, raw_stem, &args.roi_id)).transpose() {
+            Ok(r) => r.flatten(),
+            Err(e) => {
+                stats.fail.fetch_add(1, Ordering::Relaxed);
+                logger.log_fail(idx, &stem, &format!("--roi: {}", e));
+                pb.finish_and_clear();
+                continue;
+            }
+        };
+        if args.roi.is_some() && roi.is_none() && args.verbose {
+            crate::vlog(Some(&pb), format!("  [roi  ] no {raw_stem}.geojson; converting the whole slide"));
+        }
+
+        let start = std::time::Instant::now();
+        let tmp_path = format!("{}.tmp", out_path);
+        let conv_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            convert_ndpi(&src, &tmp_path, args, roi.as_ref(), Some(&pb))
+        }));
+        let fail = |reason: String| {
+            let _ = std::fs::remove_file(&tmp_path);
+            eprintln!("  [fail ] {}: {}", stem, reason);
+            stats.fail.fetch_add(1, Ordering::Relaxed);
+            logger.log_fail(idx, &stem, &reason);
+            pb.finish_and_clear();
+        };
+        let conv = match conv_result {
+            Ok(Ok(Outcome::Converted(c))) => c,
+            Ok(Ok(Outcome::Skipped(reason))) => {
+                if args.verbose { eprintln!("  [skip ] {}: {}", stem, reason); }
+                stats.skipped.fetch_add(1, Ordering::Relaxed);
+                logger.log_skip(idx, &stem);
+                pb.finish_and_clear();
+                continue;
+            }
+            Ok(Err(e)) => { fail(e); continue; }
+            Err(payload) => { fail(format!("panic: {}", ConversionLogger::panic_message(&*payload))); continue; }
+        };
+        if let Err(e) = std::fs::rename(&tmp_path, &out_path) {
+            fail(format!("rename failed: {}", e));
+            continue;
+        }
+
+        let elapsed_s = start.elapsed().as_millis() as f64 / 1000.0;
+        let in_b  = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+        let out_b = std::fs::metadata(&out_path).map(|m| m.len()).unwrap_or(0);
+        stats.ok.fetch_add(1, Ordering::Relaxed);
+        stats.in_bytes.fetch_add(in_b, Ordering::Relaxed);
+        stats.out_bytes.fetch_add(out_b, Ordering::Relaxed);
+        logger.log_ok(idx, &stem, elapsed_s, in_b, out_b, ConversionDetail {
+            input_path:  src.clone(),
+            output_path: out_path.clone(),
+            encoding:    "JPEG (NDPI)".to_string(),
+            in_tile:     None,
+            out_tile:    Some((512, 512)),
+            in_dim:      Some(conv.in_dim),
+            out_dim:     Some(conv.out_dim),
+            in_mpp:      conv.in_mpp,
+            out_mpp:     conv.out_mpp,
+        });
+
+        let mut ops: Vec<String> = Vec::new();
+        if args.quarter() {
+            ops.push("quarter".to_string());
+        } else if args.half() {
+            ops.push("half".to_string());
+        } else if args.mag_20x() {
+            ops.push("20x downsample".to_string());
+        } else if let Some(target) = args.mpp() {
+            ops.push(format!("mpp {:.4} downsample", target));
+        }
+        if args.icc_bake { ops.push("ICC".to_string()); }
+        if roi.is_some() { ops.push("ROI".to_string()); }
+
+        pb.set_style(ProgressStyle::with_template("  {msg}").unwrap());
+        pb.finish_with_message(format!(
+            "{} (ndpi){}  {} \u{2192} {}  ({:.2}s)",
+            pb_msg, crate::format_ops(&ops), crate::format_mb(in_b), crate::format_mb(out_b), elapsed_s
+        ));
     }
 }

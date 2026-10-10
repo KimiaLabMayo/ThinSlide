@@ -14,6 +14,7 @@
 | **DICOM** | 🔵  | 🟢  | 🟢 |
 | **SVS / TIFF** | —² | 🟢  | 🟢  |
 | **VSI** (CellSens)¹ | 🔵  | 🟢  | 🟢  |
+| **NDPI** (Hamamatsu)³ | —³ | 🟢  | 🟢  |
 
 **🔵 repackaging** — compressed tiles are copied straight through, at near-copy speed. No image quality change.
 
@@ -26,6 +27,10 @@ source's original compression, and is readable by [OpenSlide](https://openslide.
   `--scale <number>` is not supported for VSI yet.
   
 ² Skipped unless combined with `--scale`, `--icc-bake` or `--roi`.
+
+³ Always re-encoded (NDPI stores each level as one JPEG strip, so tiles cannot be copied).
+  Skipped unless combined with `--scale` or `--roi`; full-resolution output requires `--roi`.
+  Z-stacks: only the Z=0 (autofocus) plane is converted.
 
 ## Desktop app (no command)
 

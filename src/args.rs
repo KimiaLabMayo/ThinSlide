@@ -5,8 +5,8 @@ use clap::Parser;
 #[derive(Parser)]
 #[command(name = "thinslide", about = "Whole Slide Image Optimizer", version)]
 pub struct Args {
-    /// Input directory containing DICOM/VSI/MRXS files, or a direct path to a
-    /// single TIFF/SVS file (must exist)
+    /// Input directory containing DICOM/VSI/MRXS/NDPI files, or a direct path to a
+    /// single TIFF/SVS/NDPI file (must exist)
     #[arg(value_parser = parse_input_dir)]
     pub input_dir: String,
 
@@ -64,7 +64,7 @@ pub struct Args {
     ///   <file.geojson>  applied when the input holds a single slide
     ///   <directory>     <name>.geojson is looked up per slide (file stem; parent folder
     ///                   name for DICOM); slides without a match are converted in full
-    /// Applies to TIFF/SVS, DICOM and VSI input (not MRXS).
+    /// Applies to TIFF/SVS, DICOM, VSI and NDPI input (not MRXS).
     #[arg(long, value_name = "GEOJSON|DIR", value_parser = parse_roi, verbatim_doc_comment)]
     pub roi: Option<String>,
 
@@ -123,12 +123,12 @@ fn parse_input_dir(s: &str) -> Result<String, String> {
     if !p.exists() { return Err(format!("'{}' does not exist", s)); }
     if p.is_dir() { return Ok(s.to_string()); }
     // DICOM/VSI/MRXS are split across multiple files and need a directory, but a
-    // single TIFF/SVS file may be passed directly.
+    // single TIFF/SVS/NDPI file may be passed directly.
     let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    if matches!(ext.as_str(), "tiff" | "tif" | "svs") {
+    if matches!(ext.as_str(), "tiff" | "tif" | "svs" | "ndpi") {
         return Ok(s.to_string());
     }
-    Err(format!("'{}' is not a directory (only a .tiff/.tif/.svs file may be passed directly)", s))
+    Err(format!("'{}' is not a directory (only a .tiff/.tif/.svs/.ndpi file may be passed directly)", s))
 }
 
 fn parse_output_dir(s: &str) -> Result<String, String> {
