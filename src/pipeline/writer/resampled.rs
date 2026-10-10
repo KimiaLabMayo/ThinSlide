@@ -171,6 +171,9 @@ pub(crate) fn write_resampled_tiff(
         actual_mpp_x: f64,
         actual_mpp_y: f64,
         passthrough:  bool,
+        // Power-of-2 decode reduction from the chosen source group to this output level
+        // (0 when the source group already matches the target MPP).
+        decode_shift: u32,
     }
 
     let mut active_levels: Vec<LevelInfo> = groups.iter().enumerate().filter_map(|(i, _)| {
@@ -219,6 +222,18 @@ pub(crate) fn write_resampled_tiff(
             }
         }
 
+        // decode_shift is relative to the base level; derive the shift actually needed
+        // from the chosen group so a group already at the target MPP is not reduced again.
+        // Falls back to 0 (generic resample) when the ratio is not a power of 2.
+        let lv_shift: u32 = if decode_shift > 0 && !passthrough {
+            let ratio = target_lv_mpp_x / chosen_mpp_x;
+            let n = ratio.log2().round().max(0.0) as u32;
+            let pow = (1u32 << n) as f64;
+            if (ratio - pow).abs() / pow < 0.1 { n } else { 0 }
+        } else {
+            0
+        };
+
         let (out_img_w, out_img_h, out_tile_w, out_tile_h, actual_mpp_x, actual_mpp_y) =
             if passthrough {
                 // No scaling: output dimensions equal the source dimensions.
@@ -228,7 +243,7 @@ pub(crate) fn write_resampled_tiff(
                 // scaled decode both yield exactly ceil(tw/2^N) per quad; use that
                 // directly so the assembled canvas matches out_tile exactly — no
                 // correction resize needed.
-                let exact_pow2_decode = decode_shift > 0 && matches!(
+                let exact_pow2_decode = lv_shift > 0 && matches!(
                     map_transfer_syntax_to_compression(&chosen_meta.transfer_syntax_uid),
                     CompressionType::Jpeg2000Lossless | CompressionType::Jpeg2000
                     | CompressionType::Jpeg2000Part2MulticomponentLossless
@@ -236,7 +251,7 @@ pub(crate) fn write_resampled_tiff(
                     | CompressionType::JpegBaseline | CompressionType::JpegExtended
                 );
                 if exact_pow2_decode {
-                    let div = 1u32 << decode_shift;
+                    let div = 1u32 << lv_shift;
                     let nat_otw = ((chosen_tw + div - 1) / div).max(1);  // ceil(tw/div)
                     let nat_oth = ((chosen_th + div - 1) / div).max(1);
                     let scale_x = if chosen_tw > 0 { nat_otw as f64 / chosen_tw as f64 } else { 1.0 };
@@ -303,6 +318,7 @@ pub(crate) fn write_resampled_tiff(
             out_tile_w, out_tile_h,
             actual_mpp_x, actual_mpp_y,
             passthrough,
+            decode_shift: lv_shift,
         })
     }).collect();
 
@@ -707,7 +723,7 @@ pub(crate) fn write_resampled_tiff(
                 }
             }
 
-            write_level_tiles(tiff, lv, decode_shift, &mut reducer);
+            write_level_tiles(tiff, lv, lv.decode_shift, &mut reducer);
         }
 
         unsafe { TIFFWriteDirectory(tiff); }
