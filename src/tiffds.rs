@@ -50,6 +50,9 @@ struct OutputLevel {
     actual_mpp_y: f64,
     src_idx:      usize,
     passthrough:  bool,
+    // Power-of-2 decode reduction from the chosen source level to this output level
+    // (0 when the source level already matches the target MPP).
+    decode_shift: u32,
 }
 
 // ─── Pipeline types ───────────────────────────────────────────────────────────
@@ -1439,8 +1442,8 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                 src_is_jp2k && src_lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
 
             let n_reduce: u32 = if src_is_jp2k && !lv_out.passthrough {
-                if decode_shift > 0 {
-                    decode_shift  // out_tile was derived from ceil(src/2^decode_shift), exact
+                if lv_out.decode_shift > 0 {
+                    lv_out.decode_shift  // out_tile was derived from ceil(src/2^decode_shift), exact
                 } else {
                     let nat_otw = (lv_out.out_tile_w / 2).max(1);
                     let nat_oth = (lv_out.out_tile_h / 2).max(1);
@@ -1528,7 +1531,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                     src_jp2k_is_ycbcr,
                     src_photometric:   src_lv.photometric as u32,
                     n_reduce,
-                    decode_shift,
+                    decode_shift:      lv_out.decode_shift,
                     jpeg_tables:       jpeg_tables_arc.clone(),
                     icc_transform:     icc_transform_arc.clone(),
                     roi_fill,
@@ -1687,15 +1690,27 @@ fn compute_output_levels(
             && aligned
             && !icc_bake;
 
+        // decode_shift is relative to the base level; derive the shift actually needed
+        // from `best` so a source level already at the target MPP is not reduced again.
+        // Falls back to 0 (generic resample) when the ratio is not a power of 2.
+        let lv_shift: u32 = if decode_shift > 0 && !passthrough {
+            let ratio = target_lv_mpp_x / best.mpp_x;
+            let n = ratio.log2().round().max(0.0) as u32;
+            let pow = (1u32 << n) as f64;
+            if (ratio - pow).abs() / pow < 0.1 { n } else { 0 }
+        } else {
+            0
+        };
+
         let (out_img_w, out_img_h, out_tile_w, out_tile_h, actual_mpp_x, actual_mpp_y) =
             if passthrough {
                 (best.img_w, best.img_h, best.tile_w, best.tile_h, best.mpp_x, best.mpp_y)
-            } else if decode_shift > 0 && (is_jp2k(best.compression as u32)
+            } else if lv_shift > 0 && (is_jp2k(best.compression as u32)
                 || best.compression as u32 == COMPRESSION_JPEG) {
                 // JP2K DWT level-N and JPEG (turbojpeg) scaled decode both give
                 // exactly ceil(tw/2^N) per quad; use that directly so the assembled
                 // canvas matches out_tile exactly — no correction resize needed.
-                let div = 1u32 << decode_shift;
+                let div = 1u32 << lv_shift;
                 let nat_otw = ((best.tile_w + div - 1) / div).max(1);  // ceil(tw/div)
                 let nat_oth = ((best.tile_h + div - 1) / div).max(1);
                 let sx  = if best.tile_w > 0 { nat_otw as f64 / best.tile_w as f64 } else { 1.0 };
@@ -1745,6 +1760,7 @@ fn compute_output_levels(
             actual_mpp_x, actual_mpp_y,
             src_idx: best_idx,
             passthrough,
+            decode_shift: lv_shift,
         });
     }
 
