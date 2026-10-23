@@ -14,7 +14,7 @@ use crate::source::dicom::{
     frame_to_tile_indices, map_transfer_syntax_to_compression, is_jpeg2000,
 };
 use crate::source::tiff::{COMPRESSION_APERIO_JP2_YCBCR, COMPRESSION_APERIO_JP2_RGB};
-use crate::pipeline::encode::{split_jpeg_to_tables_and_tile, white_jpeg_tile, white_jp2k_tile};
+use crate::pipeline::encode::{split_jpeg_to_tables_and_tile, white_jpeg_tile, white_jp2k_tile, unwrap_jp2_to_codestream};
 use crate::roi::{Roi, RoiCrop};
 use crate::tiffds::{Reducer, roi_reduced_levels, roi_reduced_tiles, write_reduced_levels};
 use std::collections::BTreeMap;
@@ -94,7 +94,7 @@ pub(crate) fn write_roi_passthrough(
             let (c, r) = (full % grid.0, full / grid.0);
             if c < crop.c0 || r < crop.r0 || c >= crop.c0 + crop.cols || r >= crop.r0 + crop.rows { continue; }
             let id = (r - crop.r0) * crop.cols + (c - crop.c0);
-            if crop.mask[id as usize] { tiles.insert(id, frag.clone()); }
+            if crop.mask[id as usize] { tiles.insert(id, unwrap_jp2_to_codestream(frag).into_owned()); }
         }
     }
 
