@@ -148,6 +148,37 @@ pub(crate) fn white_jpeg_tile(w: u32, h: u32, spp: u32, rgb: bool, subsamp: (u16
     out
 }
 
+const JP2_SIGNATURE: [u8; 12] = [0, 0, 0, 0x0c, b'j', b'P', b' ', b' ', 0x0d, 0x0a, 0x87, 0x0a];
+
+/// Some DICOM frames are JP2-wrapped (ISO 15444-1 boxes) instead of raw J2K codestreams.
+/// Aperio SVS readers such as OpenSlide only accept raw codestreams, so strip the wrapper.
+/// Returns `data` unchanged (borrowed) unless it starts with the JP2 signature box and
+/// contains a well-formed `jp2c` box.
+pub(crate) fn unwrap_jp2_to_codestream(data: &[u8]) -> std::borrow::Cow<'_, [u8]> {
+    if !data.starts_with(&JP2_SIGNATURE) {
+        return std::borrow::Cow::Borrowed(data);
+    }
+    let mut pos = 0usize;
+    while pos + 8 <= data.len() {
+        let lbox = u32::from_be_bytes(data[pos..pos + 4].try_into().unwrap()) as u64;
+        let tbox = &data[pos + 4..pos + 8];
+        let (hdr, len) = match lbox {
+            0 => (8u64, (data.len() - pos) as u64),
+            1 => {
+                if pos + 16 > data.len() { break; }
+                (16, u64::from_be_bytes(data[pos + 8..pos + 16].try_into().unwrap()))
+            }
+            n => (8, n),
+        };
+        if len < hdr || pos as u64 + len > data.len() as u64 { break; }
+        if tbox == b"jp2c" {
+            return std::borrow::Cow::Borrowed(&data[pos + hdr as usize..pos + len as usize]);
+        }
+        pos += len as usize;
+    }
+    std::borrow::Cow::Borrowed(data)
+}
+
 /// Uniform white JPEG 2000 codestream (raw J2K, lossless) with `ncomp` full-resolution
 /// components: 255/128/128 for YCbCr sources, 255 in every component otherwise.
 pub(crate) fn white_jp2k_tile(w: u32, h: u32, ncomp: u32, ycbcr: bool) -> Option<Vec<u8>> {
@@ -338,6 +369,40 @@ mod tests {
             assert_eq!((img.width, img.height), (240, 240));
             assert!(img.pixels.iter().all(|&v| v >= 254), "spp={spp} rgb={rgb} sub={sub:?}");
         }
+    }
+
+    fn wrap_jp2(codestream: &[u8], xl: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&JP2_SIGNATURE);
+        out.extend_from_slice(&[0, 0, 0, 20, b'f', b't', b'y', b'p', b'j', b'p', b'2', b' ', 0, 0, 0, 0, b'j', b'p', b'2', b' ']);
+        if xl {
+            out.extend_from_slice(&[0, 0, 0, 1, b'j', b'p', b'2', b'c']);
+            out.extend_from_slice(&(codestream.len() as u64 + 16).to_be_bytes());
+        } else {
+            out.extend_from_slice(&(codestream.len() as u32 + 8).to_be_bytes());
+            out.extend_from_slice(b"jp2c");
+        }
+        out.extend_from_slice(codestream);
+        out
+    }
+
+    #[test]
+    fn unwrap_jp2_returns_raw_codestream() {
+        let j2k = white_jp2k_tile(64, 64, 3, true).unwrap();
+        for xl in [false, true] {
+            let wrapped = wrap_jp2(&j2k, xl);
+            assert_eq!(unwrap_jp2_to_codestream(&wrapped).as_ref(), j2k.as_slice(), "xl={xl}");
+        }
+    }
+
+    #[test]
+    fn unwrap_jp2_leaves_other_data_untouched() {
+        let j2k = white_jp2k_tile(64, 64, 3, false).unwrap();
+        assert!(matches!(unwrap_jp2_to_codestream(&j2k), std::borrow::Cow::Borrowed(_)));
+        let mut truncated = wrap_jp2(&j2k, false);
+        truncated.truncate(truncated.len() - 4);
+        assert_eq!(unwrap_jp2_to_codestream(&truncated).as_ref(), truncated.as_slice());
+        assert!(unwrap_jp2_to_codestream(&[]).is_empty());
     }
 
     #[test]
