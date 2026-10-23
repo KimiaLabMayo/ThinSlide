@@ -179,9 +179,62 @@ pub(crate) fn unwrap_jp2_to_codestream(data: &[u8]) -> std::borrow::Cow<'_, [u8]
     std::borrow::Cow::Borrowed(data)
 }
 
+fn is_jp2_wrapped(data: &[u8]) -> bool { data.starts_with(&JP2_SIGNATURE) }
+
+/// Prepare one DICOM JPEG 2000 frame for an Aperio SVS tile (raw J2K codestream).
+///
+/// Regular frames pass through untouched. JP2-wrapped frames come from a different encoder
+/// (RCT, colour space declared in the `colr` box, here sRGB), while the SVS level stores
+/// components as written (YCbCr when `ycbcr`). Stripping the wrapper alone would make
+/// OpenSlide read RGB samples as YCbCr (black becomes green), so decode the frame and
+/// re-encode it in the level's convention. Falls back to the bare codestream if that fails.
+pub(crate) fn normalize_jp2_tile(data: &[u8], ycbcr: bool) -> std::borrow::Cow<'_, [u8]> {
+    if !is_jp2_wrapped(data) {
+        return std::borrow::Cow::Borrowed(data);
+    }
+    match recode_wrapped_tile(data, ycbcr) {
+        Some(tile) => std::borrow::Cow::Owned(tile),
+        None => {
+            eprintln!("  [warn] JP2-wrapped tile could not be re-encoded; writing bare codestream");
+            unwrap_jp2_to_codestream(data)
+        }
+    }
+}
+
+fn recode_wrapped_tile(data: &[u8], ycbcr: bool) -> Option<Vec<u8>> {
+    let img = jpeg2k::Image::from_bytes_with(data, jpeg2k::DecodeParameters::default()).ok()?;
+    let (mut pix, w, h) = jp2k_assemble_pixels(&img, 3)?;
+    if img.components().len() != 3 || pix.len() != w * h * 3 { return None; }
+    // `pix` holds the components as decoded: YCbCr only when the box declares sYCC.
+    let src_is_ycc = matches!(img.color_space(), jpeg2k::ColorSpace::SYCC);
+    match (src_is_ycc, ycbcr) {
+        (false, true) => rgb_to_ycbcr(&mut pix),
+        (true, false) => ycbcr_to_rgb(&mut pix),
+        _ => {}
+    }
+    encode_j2k_raw(w as u32, h as u32, 3, |i, plane| {
+        for (dst, px) in plane.iter_mut().zip(pix.chunks_exact(3)) { *dst = px[i] as i32; }
+    })
+}
+
+pub(crate) fn rgb_to_ycbcr(pixels: &mut [u8]) {
+    for c in pixels.chunks_mut(3) {
+        let (r, g, b) = (c[0] as f32, c[1] as f32, c[2] as f32);
+        c[0] = (0.299 * r + 0.587 * g + 0.114 * b).round().clamp(0.0, 255.0) as u8;
+        c[1] = (128.0 - 0.168736 * r - 0.331264 * g + 0.5 * b).round().clamp(0.0, 255.0) as u8;
+        c[2] = (128.0 + 0.5 * r - 0.418688 * g - 0.081312 * b).round().clamp(0.0, 255.0) as u8;
+    }
+}
+
 /// Uniform white JPEG 2000 codestream (raw J2K, lossless) with `ncomp` full-resolution
 /// components: 255/128/128 for YCbCr sources, 255 in every component otherwise.
 pub(crate) fn white_jp2k_tile(w: u32, h: u32, ncomp: u32, ycbcr: bool) -> Option<Vec<u8>> {
+    encode_j2k_raw(w, h, ncomp, |i, comp| comp.fill(if ycbcr && i > 0 { 128 } else { 255 }))
+}
+
+/// JPEG 2000 codestream (raw J2K, lossless, no MCT) of `ncomp` full-resolution 8-bit
+/// components; `fill(i, plane)` writes component `i` (row-major, `w * h` samples).
+fn encode_j2k_raw(w: u32, h: u32, ncomp: u32, fill: impl Fn(usize, &mut [i32])) -> Option<Vec<u8>> {
     use openjp2::openjpeg::*;
 
     struct MemWriter { buf: Vec<u8>, pos: usize }
@@ -218,8 +271,7 @@ pub(crate) fn white_jp2k_tile(w: u32, h: u32, ncomp: u32, ycbcr: bool) -> Option
         (*image).y1 = h;
         for i in 0..ncomp as usize {
             let comp = &mut *(*image).comps.add(i);
-            let v = if ycbcr && i > 0 { 128 } else { 255 };
-            std::slice::from_raw_parts_mut(comp.data, (w * h) as usize).fill(v);
+            fill(i, std::slice::from_raw_parts_mut(comp.data, (w * h) as usize));
         }
 
         let mut params = std::mem::zeroed::<opj_cparameters_t>();
@@ -384,6 +436,63 @@ mod tests {
         }
         out.extend_from_slice(codestream);
         out
+    }
+
+    /// JP2 file with ihdr + colr (enumerated colour space `enum_cs`) around `codestream`.
+    fn wrap_jp2_with_header(codestream: &[u8], w: u32, h: u32, enum_cs: u32) -> Vec<u8> {
+        let mut ihdr = Vec::new();
+        ihdr.extend_from_slice(&h.to_be_bytes());
+        ihdr.extend_from_slice(&w.to_be_bytes());
+        ihdr.extend_from_slice(&[0, 3, 7, 7, 0, 0]);
+        let mut colr = vec![1, 0, 0];
+        colr.extend_from_slice(&enum_cs.to_be_bytes());
+        let bx = |t: &[u8; 4], body: &[u8]| {
+            let mut b = ((body.len() + 8) as u32).to_be_bytes().to_vec();
+            b.extend_from_slice(t);
+            b.extend_from_slice(body);
+            b
+        };
+        let jp2h = bx(b"jp2h", &[bx(b"ihdr", &ihdr), bx(b"colr", &colr)].concat());
+        let mut out = JP2_SIGNATURE.to_vec();
+        out.extend(bx(b"ftyp", b"jp2 \0\0\0\0jp2 "));
+        out.extend(jp2h);
+        out.extend(bx(b"jp2c", codestream));
+        out
+    }
+
+    fn decoded_planes(codestream: &[u8]) -> Vec<Vec<u8>> {
+        let img = jpeg2k::Image::from_bytes_with(codestream, jpeg2k::DecodeParameters::default()).unwrap();
+        img.components().iter().map(|c| c.data_u8().collect()).collect()
+    }
+
+    #[test]
+    fn normalize_recodes_wrapped_srgb_tile_to_level_convention() {
+        // Black RGB tile as written by the sRGB/RCT encoder (cf. CPTAC edge tiles).
+        let rgb = encode_j2k_raw(64, 64, 3, |_, p| p.fill(0)).unwrap();
+        let wrapped = wrap_jp2_with_header(&rgb, 64, 64, 16);
+        for (ycbcr, expect) in [(true, [0u8, 128, 128]), (false, [0, 0, 0])] {
+            let out = normalize_jp2_tile(&wrapped, ycbcr);
+            assert!(out.starts_with(&[0xFF, 0x4F]), "raw codestream expected");
+            for (plane, e) in decoded_planes(&out).iter().zip(expect) {
+                assert_eq!(plane.len(), 64 * 64);
+                assert!(plane.iter().all(|&v| v == e), "ycbcr={ycbcr}");
+            }
+        }
+    }
+
+    #[test]
+    fn normalize_leaves_raw_codestream_untouched() {
+        let j2k = white_jp2k_tile(64, 64, 3, true).unwrap();
+        assert!(matches!(normalize_jp2_tile(&j2k, true), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn rgb_ycbcr_roundtrip() {
+        let orig: Vec<u8> = vec![0, 0, 0, 255, 255, 255, 200, 30, 90, 10, 220, 40];
+        let mut px = orig.clone();
+        rgb_to_ycbcr(&mut px);
+        ycbcr_to_rgb(&mut px);
+        assert!(px.iter().zip(&orig).all(|(a, b)| (*a as i32 - *b as i32).abs() <= 2), "{px:?}");
     }
 
     #[test]
