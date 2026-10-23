@@ -23,7 +23,7 @@ use crate::source::dicom::{
     frame_to_tile_indices, map_transfer_syntax_to_compression, is_jpeg2000,
 };
 use crate::source::tiff::{COMPRESSION_APERIO_JP2_YCBCR, COMPRESSION_APERIO_JP2_RGB};
-use crate::pipeline::encode::{split_jpeg_to_tables_and_tile, unwrap_jp2_to_codestream};
+use crate::pipeline::encode::{split_jpeg_to_tables_and_tile, normalize_jp2_tile};
 use std::ffi::CString;
 use std::os::raw::c_void;
 use indicatif::ProgressBar;
@@ -122,8 +122,9 @@ unsafe fn write_svs_tiled_level(
         for (i, fragment) in fragments.iter().enumerate() {
             if fragment.is_empty() { continue; }
             let tile_num = tile_indices.get(i).copied().unwrap_or(i as u32);
-            // JP2-wrapped frames are not readable by OpenSlide; write the raw codestream.
-            let fragment = unwrap_jp2_to_codestream(fragment);
+            // JP2-wrapped frames are not readable by OpenSlide; write them as raw codestreams
+            // in this level's colour convention.
+            let fragment = normalize_jp2_tile(fragment, svs_compression == COMPRESSION_APERIO_JP2_YCBCR);
             let split = (out_compression == 7)
                 .then(|| split_jpeg_to_tables_and_tile(&fragment))
                 .flatten();
