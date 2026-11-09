@@ -2,7 +2,7 @@ use clap::Parser;
 use eframe::egui;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use thinslide::{Args, run, ensure_jpegtables_tag_registered};
-use std::{io::Read, path::PathBuf, sync::{Arc, Mutex, mpsc}, thread};
+use std::{io::Read, path::PathBuf, sync::{Arc, Mutex, mpsc}, thread, time::{Duration, Instant}};
 
 // ---------- VT100 terminal buffer -------------------------------------------
 
@@ -130,6 +130,10 @@ struct App {
     completion:      Option<String>,
     rx:              Option<mpsc::Receiver<Vec<u8>>>,
     kill_child:      Option<Arc<Mutex<Box<dyn portable_pty::Child + Send>>>>,
+    /// Set once the child process is observed to have exited, used as a
+    /// fallback for the Windows ConPTY case where the reader thread's
+    /// `read()` never returns EOF after the child is gone.
+    child_exited_at: Option<Instant>,
 }
 
 impl Default for App {
@@ -163,6 +167,7 @@ impl Default for App {
             completion:      None,
             rx:              None,
             kill_child:      None,
+            child_exited_at: None,
         }
     }
 }
@@ -213,9 +218,26 @@ impl eframe::App for App {
                     Err(mpsc::TryRecvError::Disconnected) => { done = true; break; }
                 }
             }
+            // Fallback for Windows: ConPTY can keep the output pipe open after
+            // the child process has already exited, so `reader.read()` never
+            // returns EOF and `done` above never becomes true. Poll the child
+            // directly and, once it has exited, give the PTY a short grace
+            // period to flush any trailing output before forcing completion.
+            if !done {
+                if let Some(child) = &self.kill_child {
+                    let exited = matches!(child.lock().unwrap().try_wait(), Ok(Some(_)));
+                    if exited {
+                        let since = *self.child_exited_at.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= Duration::from_millis(300) {
+                            done = true;
+                        }
+                    }
+                }
+            }
             if done {
                 self.running = false;
                 self.rx = None;
+                self.child_exited_at = None;
                 self.completion = Some(if let Some(c) = self.kill_child.take() {
                     let ok = c.lock().unwrap().wait()
                         .map(|s| s.success()).unwrap_or(false);
@@ -224,7 +246,7 @@ impl eframe::App for App {
                     "■  Stopped".to_string()
                 });
             } else {
-                ctx.request_repaint_after(std::time::Duration::from_millis(50));
+                ctx.request_repaint_after(Duration::from_millis(50));
             }
         }
 
@@ -376,6 +398,7 @@ impl App {
         self.term.clear();
         self.running = true;
         self.completion = None;
+        self.child_exited_at = None;
 
         let thinslide_gui = std::env::current_exe()
             .unwrap_or_else(|_| PathBuf::from("thinslide-gui"));
