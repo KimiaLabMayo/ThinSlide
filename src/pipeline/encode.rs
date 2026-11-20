@@ -319,7 +319,9 @@ pub(crate) fn compose_and_encode(
         .fold((1u32, 1u32), |(mw, mh), (w, h)| (mw.max(w), mh.max(h)));
     let canvas_w = slot_w * 2;
     let canvas_h = slot_h * 2;
-    let mut canvas = vec![0u8; canvas_w as usize * canvas_h as usize * ch];
+    // Missing quadrants (edge tiles beyond the source tile grid) stay at this
+    // initial value; white matches the slide background instead of rendering black.
+    let mut canvas = vec![255u8; canvas_w as usize * canvas_h as usize * ch];
 
     for qi in 0..4usize {
         let Some((pixels, pw, ph)) = &decoded[qi] else { continue; };
