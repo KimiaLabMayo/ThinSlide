@@ -57,14 +57,19 @@ struct OutputLevel {
 
 // ─── Pipeline types ───────────────────────────────────────────────────────────
 
-type RawQuad  = [Option<(Vec<u8>, bool)>; 4];
+// A source quadrant is either a compressed fragment this level's codec must decode,
+// or already-decoded pixels at an explicit size (a plain-codec tile read, or a tile
+// substituted from a finer pyramid level when this level's own tile is missing).
+enum QuadSrc {
+    Encoded(Vec<u8>),
+    Decoded(Vec<u8>, u32, u32),
+}
+type RawQuad  = [Option<QuadSrc>; 4];
 type RawChunk = Vec<(u32, RawQuad)>;
 type EncChunk = Vec<(u32, Vec<u8>)>;
 
 struct EncodeParams {
     quality:           u8,
-    src_tile_w:        u32,
-    src_tile_h:        u32,
     out_tile_w:        u32,
     out_tile_h:        u32,
     spp:               u32,
@@ -86,15 +91,14 @@ fn encode_one_tile(out_id: u32, quads: &RawQuad, p: &EncodeParams) -> Option<(u3
         if !in_roi[out_id as usize] { return Some((out_id, white.clone())); }
     }
     let decoded: [Option<(Vec<u8>, u32, u32)>; 4] = std::array::from_fn(|qi| {
-        let (data, is_raw_decode) = quads[qi].as_ref()?;
-        if *is_raw_decode && p.src_is_jpeg {
-            let inject_app14 = p.spp == 3 && p.src_photometric == PHOTOMETRIC_RGB;
-            decode_jpeg_tile(data, p.spp, p.jpeg_tables.as_deref().map(|v| v.as_slice()),
-                inject_app14, p.decode_shift)
-        } else if *is_raw_decode {
-            decode_jp2k_tile(data, p.spp, p.src_jp2k_is_ycbcr, p.n_reduce)
-        } else {
-            Some((data.clone(), p.src_tile_w, p.src_tile_h))
+        match quads[qi].as_ref()? {
+            QuadSrc::Encoded(data) if p.src_is_jpeg => {
+                let inject_app14 = p.spp == 3 && p.src_photometric == PHOTOMETRIC_RGB;
+                decode_jpeg_tile(data, p.spp, p.jpeg_tables.as_deref().map(|v| v.as_slice()),
+                    inject_app14, p.decode_shift)
+            }
+            QuadSrc::Encoded(data) => decode_jp2k_tile(data, p.spp, p.src_jp2k_is_ycbcr, p.n_reduce),
+            QuadSrc::Decoded(data, w, h) => Some((data.clone(), *w, *h)),
         }
     });
 
@@ -172,6 +176,132 @@ fn decode_jp2k_tile(data: &[u8], spp: u32, src_jp2k_is_ycbcr: bool, reduce: u32)
         super::ycbcr_to_rgb(&mut pix);
     }
     Some((pix, luma_w as u32, luma_h as u32))
+}
+
+/// Reads the pixel rectangle `rect` (x0, y0, w, h, in `levels[level_idx]`'s pixel
+/// space) and resizes it to `(want_w, want_h)`. Used to substitute a tile that is
+/// missing/zero-byte at the level being resampled, by reading the same area from a
+/// finer (higher-magnification) source level instead. Returns `None` (nothing
+/// substituted) if any tile overlapping `rect` at `level_idx` is itself missing or
+/// out of that level's grid — this function does not recurse; the caller tries
+/// progressively finer levels itself. Always restores `src_tiff`'s current
+/// directory to `restore_idx` before returning, on every path.
+fn try_read_region_downsampled(
+    src_tiff: *mut TIFF,
+    src_path: &str,
+    levels: &[TiffLevel],
+    level_idx: usize,
+    rect: (u32, u32, u32, u32),
+    spp: u32,
+    want_w: u32,
+    want_h: u32,
+    restore_idx: usize,
+) -> Option<Vec<u8>> {
+    let (rx0, ry0, rw, rh) = rect;
+    if rw == 0 || rh == 0 { return None; }
+
+    unsafe { navigate(src_tiff, level_idx, levels); }
+    let restore = || unsafe { navigate(src_tiff, restore_idx, levels); };
+
+    let lv = &levels[level_idx];
+    let tile_w = lv.tile_w.max(1);
+    let tile_h = lv.tile_h.max(1);
+    let ntx = (lv.img_w + tile_w - 1) / tile_w;
+    let nty = (lv.img_h + tile_h - 1) / tile_h;
+
+    let c0 = rx0 / tile_w;
+    let c1 = (rx0 + rw - 1) / tile_w;
+    let r0 = ry0 / tile_h;
+    let r1 = (ry0 + rh - 1) / tile_h;
+    if c1 >= ntx || r1 >= nty { restore(); return None; }
+
+    let is_jp2k_lv = is_jp2k(lv.compression as u32);
+    let is_jpeg_lv = lv.compression as u32 == COMPRESSION_JPEG;
+    let jp2k_ycbcr_lv = is_jp2k_lv && lv.compression as u32 == COMPRESSION_APERIO_JP2_YCBCR;
+    let inject_app14 = spp == 3 && lv.photometric as u32 == PHOTOMETRIC_RGB;
+    let jpeg_tables = if is_jpeg_lv {
+        crate::pipeline::jpegtables_ext::get_jpeg_tables(src_tiff, src_path)
+    } else {
+        None
+    };
+
+    let ch = spp as usize;
+    // Buffer sizing uses this level's own SamplesPerPixel (matches how the main
+    // pipeline sizes `raw_buf_size`/`pix_size` for the level actually being read);
+    // `spp` (the caller's target channel count) only governs decode/canvas layout.
+    let lv_ch = lv.spp.max(1) as usize;
+    let raw_buf_size = (unsafe { TIFFTileSize(src_tiff) } as usize)
+        .max(tile_w as usize * tile_h as usize * lv_ch)
+        .max(1 << 17);
+    let pix_size = tile_w as usize * tile_h as usize * lv_ch;
+
+    let mut canvas = vec![0u8; rw as usize * rh as usize * ch];
+
+    for row in r0..=r1 {
+        for col in c0..=c1 {
+            let tile_num = row * ntx + col;
+
+            let decoded: Option<(Vec<u8>, u32, u32)> = if is_jp2k_lv {
+                let mut buf = vec![0u8; raw_buf_size];
+                let n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
+                    buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
+                if n > 0 {
+                    buf.truncate(n as usize);
+                    decode_jp2k_tile(&buf, spp, jp2k_ycbcr_lv, 0)
+                } else {
+                    None
+                }
+            } else if is_jpeg_lv {
+                let mut raw_buf = vec![0u8; raw_buf_size];
+                let raw_n = unsafe { TIFFReadRawTile(src_tiff, tile_num,
+                    raw_buf.as_mut_ptr() as *mut c_void, raw_buf.len() as i64) };
+                if raw_n > 2 && raw_buf[0] == 0xFF && raw_buf[1] == 0xD8 {
+                    raw_buf.truncate(raw_n as usize);
+                    decode_jpeg_tile(&raw_buf, spp, jpeg_tables.as_deref(), inject_app14, 0)
+                } else {
+                    let mut pix_buf = vec![0u8; pix_size];
+                    let n = unsafe { TIFFReadEncodedTile(src_tiff, tile_num,
+                        pix_buf.as_mut_ptr() as *mut c_void, pix_buf.len() as i64) };
+                    if n > 0 { Some((pix_buf, tile_w, tile_h)) } else { None }
+                }
+            } else {
+                let mut buf = vec![0u8; pix_size];
+                let n = unsafe { TIFFReadEncodedTile(src_tiff, tile_num,
+                    buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
+                if n > 0 { Some((buf, tile_w, tile_h)) } else { None }
+            };
+
+            let Some((pixels, pw, ph)) = decoded else { restore(); return None; };
+
+            // Clamp this tile's overlap with `rect` and copy it into `canvas`.
+            let tile_x0 = col * tile_w;
+            let tile_y0 = row * tile_h;
+            let src_x0 = rx0.max(tile_x0) - tile_x0;
+            let src_y0 = ry0.max(tile_y0) - tile_y0;
+            let dst_x0 = tile_x0.max(rx0) - rx0;
+            let dst_y0 = tile_y0.max(ry0) - ry0;
+            let cw = pw.saturating_sub(src_x0).min(rw.saturating_sub(dst_x0));
+            let chh = ph.saturating_sub(src_y0).min(rh.saturating_sub(dst_y0));
+            for y in 0..chh as usize {
+                let s = ((src_y0 as usize + y) * pw as usize + src_x0 as usize) * ch;
+                let d = ((dst_y0 as usize + y) * rw as usize + dst_x0 as usize) * ch;
+                canvas[d..d + cw as usize * ch].copy_from_slice(&pixels[s..s + cw as usize * ch]);
+            }
+        }
+    }
+
+    restore();
+
+    if rw == want_w && rh == want_h {
+        return Some(canvas);
+    }
+    let fpt = if spp == 1 { fir::PixelType::U8 } else { fir::PixelType::U8x3 };
+    let src_fir = fir::images::Image::from_vec_u8(rw, rh, canvas, fpt).ok()?;
+    let mut dst_fir = fir::images::Image::new(want_w, want_h, fpt);
+    let resize_opts = fir::ResizeOptions::new()
+        .resize_alg(fir::ResizeAlg::Convolution(fir::FilterType::Lanczos3));
+    fir::Resizer::new().resize(&src_fir, &mut dst_fir, &resize_opts).ok()?;
+    Some(dst_fir.into_vec())
 }
 
 // ─── --roi reduced pyramid ────────────────────────────────────────────────────
@@ -1520,8 +1650,6 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
 
                 let enc_params = Arc::new(EncodeParams {
                     quality:           args.quality,
-                    src_tile_w,
-                    src_tile_h,
                     out_tile_w,
                     out_tile_h,
                     spp:               out_spp,
@@ -1570,7 +1698,7 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                                         buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
                                     if n > 0 {
                                         buf.truncate(n as usize);
-                                        quads[qi] = Some((buf, true));
+                                        quads[qi] = Some(QuadSrc::Encoded(buf));
                                     }
                                 } else if src_is_jpeg {
                                     let mut raw_buf = vec![0u8; raw_buf_size];
@@ -1581,19 +1709,51 @@ fn process_file(src_path: &str, out_dir: &str, out_stem: &str, args: &crate::Arg
                                         && raw_buf[0] == 0xFF && raw_buf[1] == 0xD8
                                     {
                                         raw_buf.truncate(raw_n as usize);
-                                        quads[qi] = Some((raw_buf, true));
+                                        quads[qi] = Some(QuadSrc::Encoded(raw_buf));
                                     } else {
                                         let mut pix_buf = vec![0u8; pix_size];
                                         let n = unsafe { TIFFReadEncodedTile(src_tiff, tile_num,
                                             pix_buf.as_mut_ptr() as *mut c_void,
                                             pix_buf.len() as i64) };
-                                        if n > 0 { quads[qi] = Some((pix_buf, false)); }
+                                        if n > 0 { quads[qi] = Some(QuadSrc::Decoded(pix_buf, src_tile_w, src_tile_h)); }
                                     }
                                 } else {
                                     let mut buf = vec![0u8; pix_size];
                                     let n = unsafe { TIFFReadEncodedTile(src_tiff, tile_num,
                                         buf.as_mut_ptr() as *mut c_void, buf.len() as i64) };
-                                    if n > 0 { quads[qi] = Some((buf, false)); }
+                                    if n > 0 { quads[qi] = Some(QuadSrc::Decoded(buf, src_tile_w, src_tile_h)); }
+                                }
+
+                                // The tile exists in this level's grid but could not be
+                                // read (e.g. a zero-byte "blank" tile the source encoder
+                                // omitted) — substitute the same area from the nearest
+                                // finer source level instead of leaving it for the
+                                // compose step's flat white fill.
+                                if quads[qi].is_none() {
+                                    let x0 = sc * src_tile_w;
+                                    let y0 = sr * src_tile_h;
+                                    let w  = src_tile_w.min(src_lv.img_w.saturating_sub(x0));
+                                    let h  = src_tile_h.min(src_lv.img_h.saturating_sub(y0));
+                                    let want_w = (w >> lv_out.decode_shift).max(1);
+                                    let want_h = (h >> lv_out.decode_shift).max(1);
+                                    for finer_idx in (0..lv_out.src_idx).rev() {
+                                        let finer = &src_levels[finer_idx];
+                                        let scale_x = finer.img_w as f64 / src_lv.img_w as f64;
+                                        let scale_y = finer.img_h as f64 / src_lv.img_h as f64;
+                                        let rect = (
+                                            (x0 as f64 * scale_x).round() as u32,
+                                            (y0 as f64 * scale_y).round() as u32,
+                                            ((w as f64 * scale_x).round() as u32).max(1),
+                                            ((h as f64 * scale_y).round() as u32).max(1),
+                                        );
+                                        if let Some(buf) = try_read_region_downsampled(
+                                            src_tiff, src_path, plane_levels, finer_idx, rect,
+                                            out_spp, want_w, want_h, lv_out.src_idx,
+                                        ) {
+                                            quads[qi] = Some(QuadSrc::Decoded(buf, want_w, want_h));
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                             (out_id, quads)
